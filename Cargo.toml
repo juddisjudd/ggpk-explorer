@@ -1,7 +1,17 @@
 [package]
 name = "ggpk-explorer"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
+
+[package.metadata.deb]
+maintainer = "JuddIsJudd <juddisjudd@example.com>"
+copyright = "2024, JuddIsJudd"
+license-file = ["LICENSE", "4"]
+depends = "$auto"
+assets = [
+    ["target/release/ggpk-explorer", "usr/bin/", "755"],
+    ["assets/icon-256x256.png", "usr/share/icons/hicolor/256x256/apps/ggpk-explorer.png", "644"],
+]
 
 [dependencies]
 eframe = "0.29"

@@ -25,7 +25,7 @@ jobs:
             asset_name: ggpk-explorer-windows.exe
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
@@ -52,35 +52,57 @@ jobs:
         run: |
           cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
 
+      - name: Package Linux (Deb & AppImage)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Install cargo-deb
+          cargo install cargo-deb
+          cargo deb
+          cp target/debian/*.deb ./ggpk-explorer-linux.deb
+          
+          # AppImage
+          sudo apt-get install -y fuse file
+          wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy-x86_64.AppImage
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir -e target/release/ggpk-explorer -i assets/icon-256x256.png -d assets/ggpk-explorer.desktop --output appimage
+          mv GGPK_Explorer*.AppImage ggpk-explorer-linux.AppImage
+
       - name: Upload Binary
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}
+          name: artifacts-${{ matrix.os }}
+          path: |
+             ${{ matrix.asset_name }}
+             ggpk-explorer-linux.deb
+             ggpk-explorer-linux.AppImage
 
   create_release:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
-      - name: Download Linux Artifact
-        uses: actions/download-artifact@v3
+      - name: Download Linux Artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: ggpk-explorer-linux
+          name: artifacts-ubuntu-latest
+          path: linux-artifacts
 
-      - name: Download Windows Artifact
-        uses: actions/download-artifact@v3
+      - name: Download Windows Artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: ggpk-explorer-windows.exe
+          name: artifacts-windows-latest
+          path: windows-artifacts
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            ggpk-explorer-linux
-            ggpk-explorer-windows.exe
+            linux-artifacts/ggpk-explorer-linux
+            linux-artifacts/ggpk-explorer-linux.deb
+            linux-artifacts/ggpk-explorer-linux.AppImage
+            windows-artifacts/ggpk-explorer-windows.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

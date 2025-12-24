@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=GGPK Explorer
+Comment=Explore Path of Exile GGPK files
+Exec=ggpk-explorer
+Icon=ggpk-explorer
+Categories=Utility;Game;
+Terminal=false
