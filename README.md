@@ -2,6 +2,8 @@
 
 A high-performance GGPK and PoE 2 Bundle explorer written in Rust.
 
+<img width="1920" height="1079" alt="ggpk-explorer_Ti8U2Nh2kG" src="https://github.com/user-attachments/assets/112c14e5-6425-4a81-8293-afdb1fb45d15" />
+
 ## Features
 
 - **GGPK & Bundle Support**: Browse standard PoE 1 GGPK files and newer PoE 2 Bundle formats.
