@@ -23,7 +23,7 @@ impl Default for TreeView {
 
 pub enum TreeViewAction {
     None,
-    Select(crate::ui::app::FileSelection),
+    Select,
     ExportBundleFolder(Vec<u64>, String),
 }
 
@@ -105,7 +105,7 @@ impl TreeView {
 
             if ui.button(label).clicked() {
                  *selected_file = Some(crate::ui::app::FileSelection::BundleFile(hash));
-                 *action = TreeViewAction::Select(crate::ui::app::FileSelection::BundleFile(hash));
+                 *action = TreeViewAction::Select;
             }
         } else {
             let id = ui.make_persistent_id(&node.name).with(&node.children.len()); 

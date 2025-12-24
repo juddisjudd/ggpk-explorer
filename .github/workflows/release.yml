@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary_name: ggpk-explorer
+            asset_name: ggpk-explorer-linux
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary_name: ggpk-explorer.exe
+            asset_name: ggpk-explorer-windows.exe
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libudev-dev pkg-config libx11-dev libx11-xcb-dev libfontenc-dev libice-dev libsm-dev libxau-dev libxaw7-dev libxcomposite-dev libxcursor-dev libxdamage-dev libxext-dev libxfixes-dev libxi-dev libxinerama-dev libxkbfile-dev libxmu-dev libxmuu-dev libxpm-dev libxrandr-dev libxrender-dev libxres-dev libxss-dev libxt-dev libxtst-dev libxv-dev libxvmc-dev libxf86vm-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libwayland-dev libxkbcommon-dev libssl-dev
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Build Release
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+
+      - name: Rename Artifact
+        shell: bash
+        run: |
+          cp target/${{ matrix.target }}/release/${{ matrix.binary_name }} ${{ matrix.asset_name }}
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  create_release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ggpk-explorer-linux
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ggpk-explorer-windows.exe
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            ggpk-explorer-linux
+            ggpk-explorer-windows.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

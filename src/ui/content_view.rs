@@ -22,7 +22,7 @@ pub struct ContentView {
     pub last_error: Option<String>,
     pub failed_loads: std::collections::HashSet<u64>,
     pub zoom_level: f32,
-    pub bundle_path_cache: std::collections::HashMap<String, String>, // Deprecated, kept for now to avoid breaking other fields matching
+
     pub cdn_loader: Option<crate::bundles::cdn::CdnBundleLoader>,
 }
 
@@ -37,7 +37,7 @@ impl Default for ContentView {
             last_error: None,
             failed_loads: std::collections::HashSet::new(),
             zoom_level: 1.0,
-            bundle_path_cache: std::collections::HashMap::new(),
+
             cdn_loader: None,
         }
     }

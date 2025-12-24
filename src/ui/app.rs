@@ -14,7 +14,7 @@ pub enum FileSelection {
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 use std::thread;
-use chrono::TimeZone;
+
 
 pub struct ExplorerApp {
     reader: Option<Arc<GgpkReader>>,
@@ -337,11 +337,17 @@ impl eframe::App for ExplorerApp {
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if self.is_loading {
-                    ui.spinner();
-                    ui.label("Mounting/Loading...");
-                }
-                ui.label(&self.status_msg);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                     ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                     ui.separator();
+                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if self.is_loading {
+                            ui.spinner();
+                            ui.label("Mounting/Loading...");
+                        }
+                        ui.label(&self.status_msg);
+                     });
+                });
             });
         });
 
@@ -356,7 +362,7 @@ impl eframe::App for ExplorerApp {
                  let action = self.tree_view.show(ui, &mut self.selected_file, self.content_view.dat_viewer.schema.as_ref());
                  match action {
                      crate::ui::tree_view::TreeViewAction::None => {},
-                     crate::ui::tree_view::TreeViewAction::Select(_) => {}, // Handled by mut ref
+                     crate::ui::tree_view::TreeViewAction::Select => {}, // Handled by mut ref
                      crate::ui::tree_view::TreeViewAction::ExportBundleFolder(hashes, _folder_name) => {
                          if let Some(target_dir) = rfd::FileDialog::new().set_directory("/").pick_folder() {
                              // Clone necessary data for thread/loop
