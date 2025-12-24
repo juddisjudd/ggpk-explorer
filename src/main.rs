@@ -7,6 +7,7 @@ pub mod bundles;
 mod ui;
 pub mod settings;
 pub mod cli; // New CLI module
+pub mod update;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();

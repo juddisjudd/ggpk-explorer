@@ -1,6 +1,6 @@
 [package]
 name = "ggpk-explorer"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2021"
 
 [package.metadata.deb]
@@ -35,6 +35,8 @@ libc = "0.2"
 walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 hound = "3.5.1"
+semver = "1.0"
+open = "5"
 
 [build-dependencies]
 cc = "1.2"

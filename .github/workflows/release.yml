@@ -84,6 +84,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            windows-artifacts/ggpk-explorer-windows.exe
+            windows-artifacts/ggpk-explorer.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

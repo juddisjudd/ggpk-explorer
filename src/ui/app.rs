@@ -34,6 +34,7 @@ pub struct ExplorerApp {
     pub settings_window: crate::ui::settings_window::SettingsWindow,
     pub export_window: crate::ui::export_window::ExportWindow,
     pub show_about: bool,
+    pub update_state: crate::update::UpdateState,
 }
 
 impl ExplorerApp {
@@ -88,17 +89,18 @@ impl ExplorerApp {
             reader: None,
             tree_view: TreeView::default(),
             content_view,
-            status_msg: "Ready".to_string(),
+            status_msg: "Ready".into(),
             selected_file: None,
             is_poe2: false,
             bundle_index: None,
             load_rx: None,
             schema_update_rx: None,
             is_loading: false,
-            settings,
+            settings: settings.clone(),
             settings_window: crate::ui::settings_window::SettingsWindow::new(),
             export_window: crate::ui::export_window::ExportWindow::new(),
             show_about: false,
+            update_state: crate::update::UpdateState::new(),
         };
 
         // Auto-load if path exists
@@ -246,6 +248,7 @@ impl ExplorerApp {
 
 impl eframe::App for ExplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_state.poll();
         // Poll loader
         if self.is_loading {
              if let Some(rx) = &self.load_rx {
@@ -313,6 +316,16 @@ impl eframe::App for ExplorerApp {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                      ui.label(format!("v{}", env!("CARGO_PKG_VERSION")));
+                     
+                     if let Some(ver) = &self.update_state.latest_version {
+                          ui.separator();
+                          if ui.link(egui::RichText::new(format!("Update Available: v{}", ver)).color(egui::Color32::GREEN).strong()).clicked() {
+                              if let Some(url) = &self.update_state.release_url {
+                                  let _ = open::that(url);
+                              }
+                          }
+                     }
+                     
                      ui.separator();
                      ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         if self.is_loading {

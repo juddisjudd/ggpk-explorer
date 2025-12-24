@@ -35,6 +35,7 @@ fn main() {
         .define("BUN_BUILD_DLL", "1")
         .define("OOZ_BUILD_DLL", "1") // Prevents kraken.cpp from defining main()
         .flag("/EHsc")
+        .warnings(false) // Suppress warnings intentionally to avoid MSVC treating them as errors if configured that way, or just to clean output
         .include(&ooz_path)
         .include(ooz_path.join("simde"));
 
