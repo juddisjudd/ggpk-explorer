@@ -148,13 +148,14 @@ impl ExplorerApp {
                     let mut found_bundle_index = false;
 
                     // 1. Try to load from cache
-                    let cache_path = std::path::Path::new("bundles2.cache");
+                    // 1. Try to load from cache
+                    let cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.cache");
                     let mut loaded_from_cache = false;
 
                     if cache_path.exists() {
                          eprintln!("Found cache file, attempting to load...");
                          let start_cache = std::time::Instant::now();
-                         match crate::bundles::index::Index::load_from_cache(cache_path) {
+                         match crate::bundles::index::Index::load_from_cache(&cache_path) {
                              Ok(index) => {
                                  println!("Index::load_from_cache took {:?}", start_cache.elapsed());
                                  bundle_index = Some(index);
