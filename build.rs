@@ -2,11 +2,27 @@
 use std::path::PathBuf;
 
 fn main() {
-    let ooz_path = PathBuf::from(r"s:\_projects_\_poe2_\ooz");
+    // 1. Try env var
+    // 2. Try local 'ooz' subdirectory (Git Submodule)
+    // 3. Try sibling directory
+    // 4. Hardcoded fallback
+    let ooz_path = std::env::var("OOZ_PATH").map(PathBuf::from).unwrap_or_else(|_| {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let local = PathBuf::from(manifest).join("ooz");
+        
+        if local.exists() {
+            local
+        } else if PathBuf::from("../ooz").exists() {
+             PathBuf::from("../ooz")
+        } else {
+             PathBuf::from(r"s:\_projects_\_poe2_\ooz")
+        }
+    });
 
     if !ooz_path.exists() {
         println!("cargo:warning=ooz directory not found at {:?}", ooz_path);
-        return;
+        // We panic here because build cannot proceed without ooz
+        panic!("ooz directory not found");
     }
 
     println!("cargo:rerun-if-changed={}", ooz_path.display());

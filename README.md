@@ -20,11 +20,20 @@ A high-performance GGPK and PoE 2 Bundle explorer written in Rust.
 
 ## Building and Running
 
-Ensure you have Rust installed.
+This project uses Oodle for decompression, which requires the `ooz` library.
 
-```bash
-cargo run --release
-```
+1. Clone the repository with submodules:
+   ```bash
+   git clone --recursive https://github.com/juddisjudd/ggpk-explorer.git
+   ```
+   Or if already cloned:
+   ```bash
+   git submodule update --init --recursive
+   ```
+2. Build and Run:
+   ```bash
+   cargo run --release
+   ```
 
 ## Credits
 
