@@ -4,3 +4,4 @@
 *.bin
 *.log
 RELEASE_PROCESS.md
+/examples

@@ -153,16 +153,23 @@ fn get_column_size(col: &Column, is_64bit: bool) -> usize {
         "long" | "u64" | "i64" => 8,
         "ulong" => 8,
         "ref|string" | "string" => if is_64bit { 8 } else { 4 },
-        t if t.starts_with("ref|") => if is_64bit { 8 } else { 4 }, // Generic ref size
-        "foreign_row" => if is_64bit { 16 } else { 8 }, // Key(8)+Ptr(8) or Key(4)+Ptr(4)? Usually 16/8 is safe guess for complex foreign keys
+        t if t.starts_with("ref|") || t == "row" => if is_64bit { 8 } else { 4 }, // Generic ref size
+        "foreign_row" | "foreignrow" => if is_64bit { 16 } else { 8 }, // Key(8)+Ptr(8) or Key(4)+Ptr(4)? Usually 16/8 is safe guess for complex foreign keys
         _ => 4,
     }
 }
 
 fn read_column_value(cursor: &mut Cursor<&[u8]>, col: &Column, file_data: &[u8], var_data_offset: u64, is_64bit: bool) -> io::Result<DatValue> {
     if col.array {
-        let count = if is_64bit { read_u64(cursor)? } else { read_u32(cursor)? as u64 };
-        let offset = if is_64bit { read_u64(cursor)? } else { read_u32(cursor)? as u64 };
+        let (count, offset) = if is_64bit {
+             let c = read_u32(cursor)? as u64;
+             let _ = read_u32(cursor)?; // padding
+             let o = read_u32(cursor)? as u64;
+             let _ = read_u32(cursor)?; // padding
+             (c, o)
+        } else {
+             (read_u32(cursor)? as u64, read_u32(cursor)? as u64)
+        };
         return Ok(DatValue::List(count as usize, offset));
     }
 
@@ -204,7 +211,16 @@ fn read_column_value(cursor: &mut Cursor<&[u8]>, col: &Column, file_data: &[u8],
              Ok(DatValue::Long(read_u64(cursor)?))
         },
         "string" | "ref|string" => {
-             let offset_val = if is_64bit { read_u64(cursor)? } else { read_u32(cursor)? as u64 };
+             let offset_val = if is_64bit {
+                 let v = read_u32(cursor)? as u64;
+                 let _ = read_u32(cursor)?; // padding/flags?
+                 v
+             } else {
+                 read_u32(cursor)? as u64
+             };
+             if offset_val == 0 {
+                 return Ok(DatValue::String("".to_string()));
+             }
              let abs_offset = var_data_offset + offset_val;
              if (abs_offset as usize) < file_data.len() {
                  let s = read_string_at(file_data, abs_offset as usize);
@@ -213,26 +229,27 @@ fn read_column_value(cursor: &mut Cursor<&[u8]>, col: &Column, file_data: &[u8],
                  Ok(DatValue::String("".to_string()))
              }
         },
-        "foreign_row" => {
+        "foreign_row" | "foreignrow" => {
              let idx = if is_64bit {
-                 let v = read_u64(cursor)?;
-                 let _ = read_u64(cursor)?; // Skip 2nd part
+                 let v = read_u32(cursor)? as u64;
+                 let _ = read_u32(cursor)?; // padding
+                 let _ = read_u64(cursor)?; // unknown 2nd part (8 bytes)
                  v
              } else {
                  read_u32(cursor)? as u64
-                 // Skip? usually 4 bytes?
-                 // Wait, foreign_row in 32 bit is 8 bytes key? or 4?
-                 // Let's assume 8 bytes total for struct.
-                 // let _ = read_u32(cursor)?; 
-                 // v
              };
-             // Actually, foreign_row implementation varies.
-             // But existing code had logic for it.
+             // Existing 32-bit logic was just read_u32.
              Ok(DatValue::ForeignRow(idx as usize))
         },
-        t if t.starts_with("ref|") => {
+        t if t.starts_with("ref|") || t == "row" => {
              // Generic ref
-             let val = if is_64bit { read_u64(cursor)? } else { read_u32(cursor)? as u64 };
+             let val = if is_64bit {
+                  let v = read_u32(cursor)? as u64;
+                  let _ = read_u32(cursor)?; // padding
+                  v
+             } else {
+                  read_u32(cursor)? as u64
+             };
              Ok(DatValue::ForeignRow(val as usize)) // Treat as foreign row index
         },
         _ => {
