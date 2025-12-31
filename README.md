@@ -6,19 +6,35 @@ A high-performance GGPK and PoE 2 Bundle explorer written in Rust.
 
 ## Features
 
-- **GGPK & Bundle Support**: Browse standard PoE 1 GGPK files and newer PoE 2 Bundle formats.
-- **Dynamic Content Loading**: Access remote bundles via standard CDN or local cache.
-- **Advanced DAT Viewer**:
-    - View game data in a tabular format.
-    - Automatic schema application for column naming.
-    - Correct handling of array columns and references.
-    - JSON export for selected data files.
-- **Media Preview**:
-    - Preview textures (DDS, converted to WebP for display).
-    - Play audio files (OGG/WAV).
-- **Settings & Updates**:
-    - Configurable PoE 2 Patch Version with auto-detect.
-    - Automatic schema updates from remote source.
+### Core Explorer
+- **Hybrid Support**: Seamlessly browse PoE 1 GGPK files and PoE 2 Bundle formats.
+- **CDN Fallback**: Automatically fetches missing bundles from the official CDN when not found locally.
+- **Advanced Search**:
+    - Fast, background-threaded search.
+    - Category filtering (Texture, Audio, Text, Data, etc.).
+    - Smart result expansion with "Load More" for large datasets.
+
+### specialized Viewers
+- **DAT Viewer**:
+    - Full schema support for PoE 1 & 2.
+    - Cross-referencing and foreign key resolution.
+    - JSON export.
+- **Code & Text**:
+    - Syntax highlighting for Shaders (`.hlsl`, `.fx`, `.vshader`, `.pshader`).
+    - Auto-detection for standard text formats (`.txt`, `.xml`, `.ini`, `.csv`).
+- **Media**:
+    - **Textures**: DDS support with Zoom/Pan controls.
+    - **Audio**: Built-in OGG player with volume control.
+- **Data Formats**:
+    - **CSD**: Specialized viewer for Client String Data with language filtering and JSON export.
+    - **PSG**: Tree-view visualization for PSG files.
+    - **JSON**: Interactive, collapsible tree viewer.
+    - **Hex Viewer**: Responsive, adaptive layout for raw binary inspection.
+
+### UI & UX
+- **Multilingual Support**: Built-in font fallback for CJK (Chinese, Japanese, Korean) and Thai characters.
+- **Export Tools**: Right-click to export individual files or entire folders to disk.
+- **Theme**: Dark, VSCode-like aesthetic.
 
 ## Building and Running
 
