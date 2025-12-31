@@ -4,7 +4,8 @@ A high-performance GGPK and PoE 2 Bundle explorer written in Rust.
 
 [![GitHub Downloads (all assets, latest release)](https://img.shields.io/github/downloads/juddisjudd/ggpk-explorer/latest/total)](https://github.com/juddisjudd/ggpk-explorer/releases) [![GitHub Release](https://img.shields.io/github/v/release/juddisjudd/ggpk-explorer)](https://github.com/juddisjudd/ggpk-explorer/releases) [![Release](https://github.com/juddisjudd/ggpk-explorer/actions/workflows/release.yml/badge.svg)](https://github.com/juddisjudd/ggpk-explorer/actions/workflows/release.yml)
 
-<img width="1920" height="1079" alt="ggpk-explorer_Ti8U2Nh2kG" src="https://github.com/user-attachments/assets/112c14e5-6425-4a81-8293-afdb1fb45d15" />
+<img width="1920" height="1048" alt="ggpk-explorer_qIeUwJtYDk" src="https://github.com/user-attachments/assets/8ae3841d-2e35-4465-97d1-d7fbf3349bf0" />
+
 
 ## Features
 
