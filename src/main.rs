@@ -8,6 +8,7 @@ mod ui;
 pub mod settings;
 pub mod cli;
 pub mod update;
+pub mod export;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
