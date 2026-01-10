@@ -32,8 +32,10 @@ pub struct ContentView {
     pub cdn_loader: Option<crate::bundles::cdn::CdnBundleLoader>,
     pub audio_volume: f32,
     
+    pub texture_loader: Option<crate::ui::texture_loader::TextureLoader>,
     // (hashes, name_for_title)
     pub export_requested: Option<(Vec<u64>, String, Option<crate::ui::export_window::ExportSettings>)>,
+    pub selection_requested: Option<crate::ui::app::FileSelection>,
 }
 
 impl Default for ContentView {
@@ -53,13 +55,15 @@ impl Default for ContentView {
 
             cdn_loader: None,
             audio_volume: 0.5,
+            texture_loader: Some(crate::ui::texture_loader::TextureLoader::new()),
             export_requested: None,
+            selection_requested: None,
         }
     }
 }
 
 use crate::ui::app::FileSelection;
-use crate::bundles::index::Index;
+
 
 impl ContentView {
     pub fn set_cdn_loader(&mut self, loader: crate::bundles::cdn::CdnBundleLoader) {
@@ -76,15 +80,20 @@ impl ContentView {
         self.dat_viewer.set_schema(schema, created_at);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, reader: &GgpkReader, selection: Option<FileSelection>, is_poe2: bool, bundle_index: &Option<Index>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, reader: std::sync::Arc<crate::ggpk::reader::GgpkReader>, selection: Option<FileSelection>, is_poe2: bool, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>) {
         if let Some(selection) = selection {
             match selection {
                 FileSelection::GgpkOffset(offset) => {
-                    self.show_ggpk_file(ui, reader, offset, is_poe2);
+                    self.show_ggpk_file(ui, &reader, offset, is_poe2);
+                },
+                FileSelection::Folder(hashes, name) => {
+                     self.show_folder_grid(ui, reader, bundle_index, hashes, name);
                 },
                 FileSelection::BundleFile(hash) => {
                     if let Some(index) = bundle_index {
                         if let Some(file_info) = index.files.get(&hash) {
+
+
                              // Auto-load logic
                              let mut perform_load = false;
                              
@@ -137,7 +146,7 @@ impl ContentView {
 
                              // Perform Auto-Load if needed
                              if perform_load {
-                                 self.load_bundled_content(ui.ctx(), reader, index, file_info, hash);
+                                 self.load_bundled_content(ui.ctx(), &reader, index, file_info, hash);
                              }
 
                              // Display Content
@@ -215,7 +224,7 @@ impl ContentView {
                                           }
                                       } else if file_info.path.ends_with(".ogg") {
                                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                                self.show_audio_player(ui, reader, index, file_info, hash);
+                                                self.show_audio_player(ui, &reader, index, file_info, hash);
                                            });
                                       } else if is_text_file(&file_info.path) {
                                            egui::ScrollArea::vertical().show(ui, |ui| {
@@ -277,13 +286,150 @@ impl ContentView {
         }
     }
 
-    fn show_audio_player(&mut self, ui: &mut egui::Ui, reader: &GgpkReader, index: &Index, file_info: &crate::bundles::index::FileInfo, hash: u64) {
+    fn show_folder_grid(&mut self, ui: &mut egui::Ui, reader: std::sync::Arc<crate::ggpk::reader::GgpkReader>, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>, hashes: Vec<u64>, name: String) {
+        ui.heading(format!("Folder: {}", name));
+        ui.separator();
+        
+        // Filter for DDS files
+        // TODO: This filtering happens every frame. For really large folders, we should cache this result.
+        // For now, it's likely fast enough (linear scan of u64s).
+        let dds_files: Vec<u64> = if let Some(idx) = bundle_index {
+            hashes.into_iter().filter(|h| {
+                if let Some(info) = idx.files.get(h) {
+                    info.path.ends_with(".dds")
+                } else {
+                    false
+                }
+            }).collect()
+        } else {
+            Vec::new()
+        };
+
+        if dds_files.is_empty() {
+             ui.label("No images found in this folder.");
+             return;
+        }
+
+        ui.horizontal(|ui| {
+            ui.label(format!("Found {} images.", dds_files.len()));
+             if ui.button("Clear Texture Cache").clicked() {
+                 self.texture_cache.clear();
+             }
+        });
+        ui.separator();
+
+        // Ensure loader exists
+        if self.texture_loader.is_none() {
+            self.texture_loader = Some(crate::ui::texture_loader::TextureLoader::new());
+        }
+        
+        // Poll loader
+        // We poll up to X items per frame to avoid choking if many return at once
+        if let Some(loader) = &mut self.texture_loader {
+            let mut updates = 0;
+            while let Some((hash, image)) = loader.poll() {
+                // Create texture
+                let texture = ui.ctx().load_texture(
+                    format!("thumb_{}", hash),
+                    image,
+                    egui::TextureOptions::default()
+                );
+                self.texture_cache.insert(hash, texture);
+                updates += 1;
+                if updates > 50 { break; } 
+            }
+             if updates > 0 {
+                 ui.ctx().request_repaint();
+             }
+        }
+
+        // Layout Constants
+        let thumbnail_size = 128.0;
+        let padding = 8.0;
+        let item_width = thumbnail_size + padding;
+        let item_height = thumbnail_size + 30.0 + padding; // Space for label
+        
+        let available_width = ui.available_width();
+        let cols = (available_width / item_width).floor().max(1.0) as usize;
+        let rows = (dds_files.len() + cols - 1) / cols;
+
+        egui::ScrollArea::vertical().show_rows(ui, item_height, rows, |ui, row_range| {
+             let reader_arc = reader.clone(); 
+             
+             // We manually implement the grid layout for the visible rows
+             for row in row_range {
+                 ui.horizontal(|ui| {
+                     for col in 0..cols {
+                         let index = row * cols + col;
+                         if index >= dds_files.len() {
+                             break;
+                         }
+                         
+                         let hash = dds_files[index];
+                         
+                         // Allocate item space
+                         let (rect, _response) = ui.allocate_exact_size(egui::vec2(thumbnail_size, item_height), egui::Sense::hover());
+                         
+                         // Render Item inside rect
+                         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
+                             ui.vertical_centered(|ui| {
+                                 // 1. Texture / Placeholder
+                                 if let Some(texture) = self.texture_cache.get(&hash) {
+                                      // Scale to fit
+                                      let mut size = texture.size_vec2();
+                                      let scale = (thumbnail_size / size.x).min(thumbnail_size / size.y).min(1.0);
+                                      size *= scale;
+                                      
+                                      if ui.add(egui::Image::new(texture).fit_to_exact_size(size).sense(egui::Sense::click())).clicked() {
+                                          self.selection_requested = Some(crate::ui::app::FileSelection::BundleFile(hash));
+                                      }
+                                 } else {
+                                     // Placeholder
+                                     let (p_rect, _) = ui.allocate_exact_size(egui::vec2(thumbnail_size, thumbnail_size), egui::Sense::hover());
+                                     ui.painter().rect_filled(p_rect, 4.0, egui::Color32::from_gray(30));
+                                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(p_rect), |ui| {
+                                         ui.centered_and_justified(|ui| ui.spinner());
+                                     });
+                                     
+                                     // Request Load (Lazy Loading)
+                                     if let Some(idx) = bundle_index {
+                                         if let Some(info) = idx.files.get(&hash) {
+                                             if let Some(loader) = &mut self.texture_loader {
+                                                 if !loader.is_loading(hash) {
+                                                     loader.request(hash, info.path.clone(), reader_arc.clone(), idx.clone(), info);
+                                                 }
+                                             }
+                                         }
+                                     }
+                                 }
+                                 
+                                 // 2. Label
+                                 if let Some(idx) = bundle_index {
+                                      if let Some(info) = idx.files.get(&hash) {
+                                          let name = std::path::Path::new(&info.path).file_name().unwrap_or_default().to_string_lossy();
+                                          ui.label(egui::RichText::new(name).small().weak()).on_hover_text(&info.path);
+                                      }
+                                 }
+                             });
+                         });
+                         
+                         // Spacing between columns
+                         ui.add_space(padding);
+                     }
+                 });
+                 // Spacing between rows
+                 ui.add_space(padding);
+             }
+        });
+    }
+
+    fn show_audio_player(&mut self, ui: &mut egui::Ui, reader: &GgpkReader, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
         ui.group(|ui| {
             ui.heading("Audio Player");
             
             ui.horizontal(|ui| {
                 if ui.button("▶ Play").clicked() {
-                    self.load_bundled_content(ui.ctx(), reader, index, file_info, hash);
+                    self.load_bundled_content(ui.ctx(), &reader, index, file_info, hash);
                 }
                 
                 if ui.button("⏹ Stop").clicked() {
@@ -408,7 +554,7 @@ impl ContentView {
         }
     }
 
-    pub fn load_bundled_content(&mut self, ctx: &egui::Context, reader: &GgpkReader, index: &crate::bundles::index::Index, file_info: &crate::bundles::index::FileInfo, hash: u64) {
+    pub fn load_bundled_content(&mut self, ctx: &egui::Context, reader: &GgpkReader, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
          // Reset previous state
          self.dat_viewer.reader = None;
          self.dat_viewer.error_msg = None;

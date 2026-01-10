@@ -7,6 +7,7 @@ pub mod settings_window;
 pub mod export_window;
 pub mod json_viewer;
 pub mod syntax;
+pub mod texture_loader;
 
 fn load_icon() -> eframe::egui::IconData {
     let (icon_rgba, icon_width, icon_height) = {

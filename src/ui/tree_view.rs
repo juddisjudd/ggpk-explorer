@@ -439,6 +439,13 @@ impl TreeView {
                      }
                 });
             
+            if response.header_response.clicked() {
+                let mut hashes = Vec::new();
+                self.collect_immediate_files(node, &mut hashes);
+                *selected_file = Some(crate::ui::app::FileSelection::Folder(hashes, node.name.clone()));
+                *action = TreeViewAction::Select;
+            }
+
             response.header_response.context_menu(|ui| {
                 if ui.button("Export Folder...").clicked() {
                     let mut hashes = Vec::new();
@@ -448,6 +455,15 @@ impl TreeView {
                 }
             });
         }
+    }
+
+    fn collect_immediate_files(&self, node: &BundleNode, hashes: &mut Vec<u64>) {
+        for child in node.children.values() {
+            if let Some(h) = child.file_hash {
+                hashes.push(h);
+            }
+        }
+        // sort by name?
     }
 
     fn collect_hashes(&self, node: &BundleNode, hashes: &mut Vec<u64>) {

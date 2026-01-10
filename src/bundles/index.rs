@@ -32,6 +32,14 @@ pub struct Index {
     pub files: HashMap<u64, FileInfo>,
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HashAlgorithm {
+    Murmur64A,
+    Fnv1a,
+    Unknown,
+}
+
 impl Index {
     pub fn read(data: &[u8]) -> io::Result<Self> {
         let mut cursor = Cursor::new(data);
@@ -85,10 +93,29 @@ impl Index {
         let directory_bundle_data = &data[current_pos..];
         
 
+        let hash_algo = if let Some(first_dir) = directories.first() {
+             match first_dir.path_hash {
+                 0xF42A94E69CFF42FE => {
+                     println!("Index::read: Detected Hash Algorithm: Murmur64A");
+                     HashAlgorithm::Murmur64A
+                 },
+                 0x07E47507B4A92E53 => {
+                     println!("Index::read: Detected Hash Algorithm: FNV1a");
+                     HashAlgorithm::Fnv1a
+                 },
+                 other => {
+                     println!("Index::read: Unknown Hash Algorithm root hash: {:X}. Defaulting to fallback.", other);
+                     HashAlgorithm::Unknown
+                 },
+             }
+        } else {
+             HashAlgorithm::Unknown
+        };
+
         let mut dir_cursor = Cursor::new(directory_bundle_data);
         if let Ok(bundle) = crate::bundles::bundle::Bundle::read_header(&mut dir_cursor) {
              if let Ok(dir_data) = bundle.decompress(&mut dir_cursor) {
-                 Self::parse_paths(&directories, &dir_data, &mut files_map);
+                 Self::parse_paths(&directories, &dir_data, &mut files_map, hash_algo);
              } else {
                  println!("Failed to decompress directory bundle");
              }
@@ -116,11 +143,9 @@ impl Index {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
-    fn parse_paths(directories: &[DirectoryInfo], dir_data: &[u8], files: &mut HashMap<u64, FileInfo>) {
+    fn parse_paths(directories: &[DirectoryInfo], dir_data: &[u8], files: &mut HashMap<u64, FileInfo>, hash_algo: HashAlgorithm) {
         if dir_data.is_empty() { return; }
 
-
-            
         for d in directories {
             if d.offset as usize >= dir_data.len() { continue; }
             let start = d.offset as usize;
@@ -170,40 +195,76 @@ impl Index {
                 ptr += str_len + 1; // +1 for null
 
                 if base {
-                    // In 'base' mode, we are building directory prefixes.
-                    // We must push to temp.
                     if idx < temp.len() {
-                         // If we built upon an existing one, update or push?
-                         // LibBundle3 does `temp.Add(path)` always.
-                         // But if we used idx to reference it...
-                         // Actually LibBundle3 implementation:
-                         // var path = (offset < temp.Count) ? temp[offset] + str : str;
-                         // if (base) temp.Add(path);
                          temp.push(full_path_bytes);
                     } else {
-                         // If idx >= temp.len, it means we are starting a fresh root in the stack?
-                         // Or maybe `s_bytes` is the whole thing.
                          temp.push(full_path_bytes);
                     }
                 } else {
                     // File Mode
-                    // Try to match hashes
-                    let lower_bytes = full_path_bytes.to_ascii_lowercase();
-                    
-                    // Try Murmur64A (PoE 2)
-                    let hash_murmur = murmur_hash64a(&full_path_bytes);
-                    let hash_murmur_lower = murmur_hash64a(&lower_bytes);
-                    
-                    // Try FNV (PoE 1/Older)
-                    let hash_fnv = fnv1a64(&full_path_bytes);
-                    let hash_fnv_lower = fnv1a64(&lower_bytes);
+                    let path_str = String::from_utf8_lossy(&full_path_bytes).to_string();
 
-
-
-                    if let Some(f) = files.get_mut(&hash_murmur) { f.path = String::from_utf8_lossy(&full_path_bytes).to_string(); }
-                    else if let Some(f) = files.get_mut(&hash_murmur_lower) { f.path = String::from_utf8_lossy(&full_path_bytes).to_string(); }
-                    else if let Some(f) = files.get_mut(&hash_fnv) { f.path = String::from_utf8_lossy(&full_path_bytes).to_string(); }
-                    else if let Some(f) = files.get_mut(&hash_fnv_lower) { f.path = String::from_utf8_lossy(&full_path_bytes).to_string(); }
+                    match hash_algo {
+                        HashAlgorithm::Murmur64A => {
+                             let hash = murmur_hash64a(&full_path_bytes);
+                             if let Some(f) = files.get_mut(&hash) { 
+                                 f.path = path_str;
+                             }
+                        },
+                        HashAlgorithm::Fnv1a => {
+                             // FNV1a usually expects lowercase in old GGPK? 
+                             // LibGGPK3 says: "NameHash(utf8Name) ... utf8Name must be lowercased unless it comes from ggpk before patch 3.21.2"
+                             // But wait, older GGPK (FNV) used various casing?
+                             // Actually LibGGPK3 code:
+                             // case 0x07E47507B4A92E53: return FNV1a64Hash(utf8Name);
+                             // AND NameHash(name) calls name.ToLowerInvariant() first if directory hash matches recent Murmur magic.
+                             // Wait, if it is FNV (else branch), it allocates stackalloc byte[name.Length] ... NO, it uses original casing?
+                             
+                             // LibGGPK3 logic:
+                             // If root_hash == MURMUR_MAGIC: lower case it, then hash.
+                             // Else: use original name to hash?
+                             
+                             // Let's look at `NameHash(scoped ReadOnlySpan<char> name)` in Index.cs again.
+                             /*
+                                if (_Directories[0].PathHash == 0xF42A94E69CFF42FEul) { // Murmur
+                                    name.ToLowerInvariant(span);
+                                    return MurmurHash64A(...);
+                                } else {
+                                    return NameHash(utf8... original); -> which uses FNV1a64Hash
+                                }
+                             */
+                             
+                             // So for FNV, we try original casing?
+                             // But my previous code tried all 4 combinations.
+                             // Let's try Original first, then Lower?
+                             // Optimization: Only compute FNV.
+                             
+                             let hash = fnv1a64(&full_path_bytes);
+                             if let Some(f) = files.get_mut(&hash) {
+                                 f.path = path_str.clone();
+                             } else {
+                                 // Fallback to lower?
+                                 let lower_bytes = full_path_bytes.to_ascii_lowercase();
+                                 let hash_lower = fnv1a64(&lower_bytes);
+                                 if let Some(f) = files.get_mut(&hash_lower) {
+                                     f.path = path_str;
+                                 }
+                             }
+                        },
+                        HashAlgorithm::Unknown => {
+                            // Fallback to trying everything (old slow behavior)
+                            let lower_bytes = full_path_bytes.to_ascii_lowercase();
+                            let hash_murmur = murmur_hash64a(&full_path_bytes);
+                            let hash_murmur_lower = murmur_hash64a(&lower_bytes);
+                            let hash_fnv = fnv1a64(&full_path_bytes);
+                            let hash_fnv_lower = fnv1a64(&lower_bytes);
+                            
+                            if let Some(f) = files.get_mut(&hash_murmur) { f.path = path_str; }
+                            else if let Some(f) = files.get_mut(&hash_murmur_lower) { f.path = path_str; }
+                            else if let Some(f) = files.get_mut(&hash_fnv) { f.path = path_str; }
+                            else if let Some(f) = files.get_mut(&hash_fnv_lower) { f.path = path_str; }
+                        }
+                    }
                 }
             }
         }

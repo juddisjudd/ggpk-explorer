@@ -68,4 +68,45 @@ impl AppSettings {
             let _ = std::fs::write(path, content);
         }
     }
+
+    pub fn get_cache_size() -> u64 {
+        let dir = Self::get_app_data_dir();
+        let cache_dir = dir.join("cache");
+        let cache_file = dir.join("bundles2.cache");
+        let mut size = 0;
+
+        if cache_dir.exists() {
+             for entry in walkdir::WalkDir::new(&cache_dir).into_iter().filter_map(|e| e.ok()) {
+                 if let Ok(metadata) = entry.metadata() {
+                     if metadata.is_file() {
+                         size += metadata.len();
+                     }
+                 }
+             }
+        }
+
+        if cache_file.exists() {
+             if let Ok(metadata) = std::fs::metadata(&cache_file) {
+                 size += metadata.len();
+             }
+        }
+        
+        size
+    }
+
+    pub fn clear_cache() -> std::io::Result<()> {
+        let dir = Self::get_app_data_dir();
+        let cache_dir = dir.join("cache");
+        let cache_file = dir.join("bundles2.cache");
+
+        if cache_dir.exists() {
+            std::fs::remove_dir_all(&cache_dir)?;
+            std::fs::create_dir_all(&cache_dir)?;
+        }
+        
+        if cache_file.exists() {
+            std::fs::remove_file(&cache_file)?;
+        }
+        Ok(())
+    }
 }

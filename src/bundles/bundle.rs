@@ -11,6 +11,7 @@ pub struct Bundle {
     pub uncompressed_size2: u64,
     pub total_payload_size2: u64,
     pub block_count: u32,
+    pub chunk_size: u32,
     pub block_sizes: Vec<u32>,
     pub data_offset: u64,
 }
@@ -29,7 +30,8 @@ impl Bundle {
         let uncompressed_size2 = LittleEndian::read_u64(&header[20..28]);
         let total_payload_size2 = LittleEndian::read_u64(&header[28..36]);
         let block_count = LittleEndian::read_u32(&header[36..40]);
-        // unk28 at 40..60 (5 * u32)
+        let chunk_size = LittleEndian::read_u32(&header[40..44]);
+        // unk28 at 44..60
 
         let mut block_sizes = Vec::with_capacity(block_count as usize);
         let mut block_sizes_buf = vec![0u8; (block_count * 4) as usize];
@@ -50,6 +52,7 @@ impl Bundle {
             uncompressed_size2,
             total_payload_size2,
             block_count,
+            chunk_size,
             block_sizes,
             data_offset,
         })
@@ -67,9 +70,9 @@ impl Bundle {
             reader.read_exact(&mut compressed_data)?;
             
             // Determine decompressed size for this block
-            // Usually 256KB (262144), except last one.
+            // Usually 256KB, except last one.
             let remaining = self.uncompressed_size as usize - output_offset;
-            let dst_len = std::cmp::min(remaining, 262144);
+            let dst_len = std::cmp::min(remaining, self.chunk_size as usize);
             
             let ret = unsafe {
                 Ooz_Decompress(

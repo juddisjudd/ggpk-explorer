@@ -16,7 +16,7 @@ pub enum ExportStatus {
 pub fn run_export(
     hashes: Vec<u64>,
     reader: Arc<GgpkReader>,
-    bundle_index: Option<BundleIndex>,
+    bundle_index: Option<Arc<BundleIndex>>,
     settings: ExportSettings,
     target_dir: PathBuf,
     cdn_loader: Option<crate::bundles::cdn::CdnBundleLoader>,
@@ -37,7 +37,7 @@ pub fn run_export(
             match export_single_file(
                 *hash, 
                 &reader, 
-                bundle_index.as_ref(), 
+                bundle_index.as_deref(), 
                 &settings, 
                 &target_dir, 
                 &cdn_loader, 
@@ -208,6 +208,11 @@ fn export_single_file(
     
     // File Extension Handling
     let filename_display = path_str.to_string();
+
+    // Skip .header files as per user request
+    if path_str.ends_with(".header") {
+        return Ok(format!("Skipped header: {}", filename_display));
+    }
     
     if path_str.ends_with(".dds") {
         match settings.texture_format {

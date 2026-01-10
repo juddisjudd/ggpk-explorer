@@ -10,6 +10,9 @@ pub struct SettingsWindow {
     fetch_status_msg: Option<String>,
     pub request_update_schema: bool,
     pub schema_status_msg: Option<String>,
+    pub cache_size_str: String,
+    pub cache_status_msg: Option<String>,
+    pub cache_calc_rx: Option<Receiver<u64>>,
 }
 
 impl Default for SettingsWindow {
@@ -21,6 +24,9 @@ impl Default for SettingsWindow {
             fetch_status_msg: None,
             request_update_schema: false,
             schema_status_msg: None,
+            cache_size_str: "Unknown".to_string(),
+            cache_status_msg: None,
+            cache_calc_rx: None,
         }
     }
 }
@@ -32,6 +38,15 @@ impl SettingsWindow {
 
     pub fn open(&mut self) {
         self.open = true;
+        self.cache_status_msg = None;
+        self.cache_size_str = "Calculating...".to_string();
+        
+        let (tx, rx) = channel();
+        self.cache_calc_rx = Some(rx);
+        thread::spawn(move || {
+            let size = AppSettings::get_cache_size();
+            let _ = tx.send(size);
+        });
     }
 
     pub fn show(&mut self, ctx: &egui::Context, settings: &mut AppSettings, schema_date: Option<&str>) {
@@ -167,6 +182,47 @@ impl SettingsWindow {
                         ui.label(msg);
                     }
                 });
+
+                ui.separator();
+                ui.heading("Cache");
+
+                // Poll cache calc
+                if let Some(rx) = &self.cache_calc_rx {
+                    if let Ok(size) = rx.try_recv() {
+                        self.cache_calc_rx = None;
+                        // Format bytes
+                        const KB: u64 = 1024;
+                        const MB: u64 = KB * 1024;
+                        const GB: u64 = MB * 1024;
+                        
+                        self.cache_size_str = if size > GB {
+                            format!("{:.2} GB", size as f64 / GB as f64)
+                        } else if size > MB {
+                            format!("{:.2} MB", size as f64 / MB as f64)
+                        } else {
+                            format!("{} Bytes", size)
+                        };
+                    }
+                }
+
+                ui.horizontal(|ui| {
+                     ui.label(format!("Current Cache Size: {}", self.cache_size_str));
+                     
+                     if ui.button("Clear Cache").clicked() {
+                         match AppSettings::clear_cache() {
+                             Ok(_) => {
+                                 self.cache_status_msg = Some("Cache Cleared!".to_string());
+                                 self.cache_size_str = "0 Bytes".to_string();
+                             },
+                             Err(e) => {
+                                 self.cache_status_msg = Some(format!("Error: {}", e));
+                             }
+                         }
+                     }
+                });
+                if let Some(msg) = &self.cache_status_msg {
+                    ui.label(msg);
+                }
 
                 ui.separator();
 

@@ -5,10 +5,11 @@ use crate::ui::content_view::ContentView;
 use rfd::FileDialog;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum FileSelection {
     GgpkOffset(u64),
     BundleFile(u64),
+    Folder(Vec<u64>, String),
 }
 
 use std::path::PathBuf;
@@ -23,10 +24,10 @@ pub struct ExplorerApp {
     pub status_msg: String,
     pub selected_file: Option<FileSelection>,
     pub is_poe2: bool,
-    pub bundle_index: Option<crate::bundles::index::Index>,
+    pub bundle_index: Option<Arc<crate::bundles::index::Index>>,
     
 
-    load_rx: Option<Receiver<Result<(Arc<GgpkReader>, Option<crate::bundles::index::Index>, bool, PathBuf, String, TreeView), String>>>,
+    load_rx: Option<Receiver<Result<(Arc<GgpkReader>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String>>>,
     pub schema_update_rx: Option<Receiver<Result<String, String>>>,
     pub export_status_rx: Option<Receiver<crate::export::ExportStatus>>,
     is_loading: bool,
@@ -138,7 +139,7 @@ impl ExplorerApp {
             
             thread::spawn(move || {
                 let start_total = std::time::Instant::now();
-                let result = (|| -> Result<(Arc<GgpkReader>, Option<crate::bundles::index::Index>, bool, PathBuf, String, TreeView), String> {
+                let result = (|| -> Result<(Arc<GgpkReader>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String> {
                     let start_open = std::time::Instant::now();
                     let reader_inner = GgpkReader::open(&path_clone)
                         .map_err(|e| format!("Failed to open GGPK: {}", e))?;
@@ -160,7 +161,7 @@ impl ExplorerApp {
                          match crate::bundles::index::Index::load_from_cache(&cache_path) {
                              Ok(index) => {
                                  println!("Index::load_from_cache took {:?}", start_cache.elapsed());
-                                 bundle_index = Some(index);
+                                 bundle_index = Some(Arc::new(index));
                                  extra_status = " (Cached)".to_string();
                                  found_bundle_index = true;
                                  loaded_from_cache = true;
@@ -201,7 +202,7 @@ impl ExplorerApp {
                                                                     println!("Cache saved successfully.");
                                                                 }
                                                                 
-                                                                bundle_index = Some(index);
+                                                                bundle_index = Some(Arc::new(index));
                                                                 extra_status = " (Bundled)".to_string();
                                                                 found_bundle_index = true;
                                                             },
@@ -418,7 +419,7 @@ impl eframe::App for ExplorerApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
              if let Some(reader) = &self.reader {
-                 self.content_view.show(ui, reader, self.selected_file, self.is_poe2, &self.bundle_index);
+                 self.content_view.show(ui, reader.clone(), self.selected_file.clone(), self.is_poe2, &self.bundle_index);
              } else {
                  ui.centered_and_justified(|ui| {
                      if self.is_loading {
@@ -440,6 +441,10 @@ impl eframe::App for ExplorerApp {
              if let Some(s) = settings {
                  self.export_window.settings = s;
              }
+        }
+        
+        if let Some(selection) = self.content_view.selection_requested.take() {
+            self.selected_file = Some(selection);
         }
 
         // Poll Export Status
