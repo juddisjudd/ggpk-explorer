@@ -1,4 +1,5 @@
 use eframe::egui;
+use crate::ui::components::modal_section;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TextureFormat {
@@ -78,98 +79,99 @@ impl ExportWindow {
         self.confirmed = false;
         self.target_name = name.to_string();
         self.is_folder = is_folder;
-
-        if !is_folder {
-            self.settings.recursive = false;
-        } else {
-            self.settings.recursive = true;
-        }
+        self.settings.recursive = is_folder;
     }
-    
+
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
         let mut open = self.open;
         if !open { return false; }
-        
+
         let mut confirmed_now = false;
         let mut should_close = false;
-        
-        egui::Window::new("Export Options")
+
+        let is_dds = self.target_name.ends_with(".dds");
+        let is_ogg = self.target_name.ends_with(".ogg");
+        let is_dat = self.target_name.contains(".dat");
+        let is_psg = self.target_name.ends_with(".psg");
+        let show_all = self.is_folder;
+
+        egui::Window::new("Export")
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .default_width(360.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.heading(format!("Exporting: {}", self.target_name));
-                ui.separator();
-                
-                let is_dds = self.target_name.ends_with(".dds");
-                let is_ogg = self.target_name.ends_with(".ogg");
-                let is_dat = self.target_name.contains(".dat");
-                
-                let show_all = self.is_folder;
-                
+                ui.spacing_mut().item_spacing.y = 5.0;
+
+                ui.label(
+                    egui::RichText::new(&self.target_name)
+                        .size(13.0)
+                        .monospace()
+                        .color(egui::Color32::from_rgb(228, 228, 231)),
+                );
+
                 if show_all || is_dds {
-                    ui.heading("Texture Options");
+                    ui.separator();
+                    modal_section(ui, "TEXTURE");
                     ui.horizontal(|ui| {
-                        ui.radio_value(&mut self.settings.texture_format, TextureFormat::OriginalDds, "Original (DDS)");
-                        ui.radio_value(&mut self.settings.texture_format, TextureFormat::WebP, "Convert to WebP");
-                        ui.radio_value(&mut self.settings.texture_format, TextureFormat::Png, "Convert to PNG");
+                        ui.radio_value(&mut self.settings.texture_format, TextureFormat::OriginalDds, "DDS");
+                        ui.radio_value(&mut self.settings.texture_format, TextureFormat::WebP, "WebP");
+                        ui.radio_value(&mut self.settings.texture_format, TextureFormat::Png, "PNG");
                     });
-                    ui.add_space(8.0);
-                }
-                
-                if show_all || is_ogg {
-                    ui.heading("Audio Options");
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut self.settings.audio_format, AudioFormat::Original, "Original (OGG/WAV)");
-                        ui.radio_value(&mut self.settings.audio_format, AudioFormat::Wav, "Convert to WAV");
-                    });
-                    ui.add_space(8.0);
-                }
-                
-                if show_all || is_dat {
-                    ui.heading("Data Options (.dat)");
-                    ui.horizontal(|ui| {
-                        ui.radio_value(&mut self.settings.data_format, DataFormat::Original, "Original");
-                        ui.radio_value(&mut self.settings.data_format, DataFormat::Json, "Convert to JSON");
-                    });
-                     ui.add_space(8.0);
                 }
 
-                if show_all || self.target_name.ends_with(".psg") {
-                    ui.heading("PSG Options");
+                if show_all || is_ogg {
+                    ui.separator();
+                    modal_section(ui, "AUDIO");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.settings.audio_format, AudioFormat::Original, "OGG / WAV");
+                        ui.radio_value(&mut self.settings.audio_format, AudioFormat::Wav, "WAV");
+                    });
+                }
+
+                if show_all || is_dat {
+                    ui.separator();
+                    modal_section(ui, "DATA");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.settings.data_format, DataFormat::Original, "Original");
+                        ui.radio_value(&mut self.settings.data_format, DataFormat::Json, "JSON");
+                    });
+                }
+
+                if show_all || is_psg {
+                    ui.separator();
+                    modal_section(ui, "PSG");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.psg_format, PsgFormat::Original, "Original");
-                        ui.radio_value(&mut self.settings.psg_format, PsgFormat::Json, "Convert to JSON");
+                        ui.radio_value(&mut self.settings.psg_format, PsgFormat::Json, "JSON");
                     });
-                     ui.add_space(8.0);
                 }
 
                 if self.is_folder {
                     ui.separator();
-                    ui.checkbox(&mut self.settings.recursive, "Recursive Export (Include subfolders)");
-                    ui.add_space(8.0);
-                }
-                
-
-                if !show_all && !is_dds && !is_ogg && !is_dat && !self.target_name.ends_with(".psg") {
-                     ui.label("Ready to export file.");
-                     ui.add_space(8.0);
+                    modal_section(ui, "OPTIONS");
+                    ui.checkbox(&mut self.settings.recursive, "Include subfolders");
                 }
 
+                ui.add_space(6.0);
                 ui.separator();
+                ui.add_space(2.0);
+
                 ui.horizontal(|ui| {
-                    if ui.button("Export").clicked() {
-                        self.confirmed = true;
-                        confirmed_now = true;
-                        should_close = true;
-                    }
                     if ui.button("Cancel").clicked() {
                         should_close = true;
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Export").clicked() {
+                            self.confirmed = true;
+                            confirmed_now = true;
+                            should_close = true;
+                        }
+                    });
                 });
             });
-            
+
         if should_close {
             open = false;
         }

@@ -9,6 +9,8 @@ pub mod settings;
 pub mod cli;
 pub mod update;
 pub mod export;
+pub mod parsers;
+pub mod adapters;
 
 fn main() -> eframe::Result<()> {
     env_logger::init();

@@ -7,7 +7,16 @@ pub mod settings_window;
 pub mod export_window;
 pub mod json_viewer;
 pub mod syntax;
-pub mod texture_loader;
+pub mod chrome;
+pub mod psg_viewer;
+pub mod sidebar;
+pub mod status_bar;
+pub mod theme;
+pub mod text_config_viewer;
+pub mod graphics_viewer;
+pub mod skeletal_viewer;
+pub mod components;
+pub mod command_palette;
 
 fn load_icon() -> eframe::egui::IconData {
     let (icon_rgba, icon_width, icon_height) = {
@@ -87,8 +96,10 @@ pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
+            .with_min_inner_size([640.0, 480.0])
             .with_title("GGPK Explorer")
-            .with_decorations(true)
+            .with_decorations(false)
+            .with_resizable(true)
             .with_icon(load_icon()),
         ..Default::default()
     };
@@ -97,6 +108,7 @@ pub fn run() -> eframe::Result<()> {
         "GGPK Explorer",
         options,
         Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             configure_cjk_fonts(&cc.egui_ctx);
             Ok(Box::new(app::ExplorerApp::new(cc)))
         }),

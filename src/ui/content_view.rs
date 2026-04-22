@@ -11,7 +11,24 @@ use std::collections::HashMap;
 use crate::ui::dat_viewer::DatViewer;
 use crate::dat::csd::{self};
 use crate::dat::psg::{self};
+use crate::ui::graphics_viewer::GraphicsViewer;
 use crate::ui::json_viewer::JsonTreeViewer;
+use crate::ui::skeletal_viewer::SkeletalViewer;
+use crate::ui::text_config_viewer::TextConfigViewer;
+use egui_extras::{Column, TableBuilder};
+use std::collections::BTreeMap;
+
+struct ImageViewState {
+    zoom: f32,
+    pan: egui::Vec2,
+    needs_fit: bool,
+}
+
+impl ImageViewState {
+    fn new() -> Self {
+        Self { zoom: 1.0, pan: egui::Vec2::ZERO, needs_fit: true }
+    }
+}
 
 pub struct ContentView {
     texture_cache: HashMap<u64, egui::TextureHandle>,
@@ -20,22 +37,24 @@ pub struct ContentView {
     pub csd_language_filter: Option<String>,
     pub json_cache: HashMap<u64, serde_json::Value>,
     pub dat_viewer: DatViewer,
-    // rodio::OutputStream does not implement Default, so we can't derive it.
-    // We also can't easily store OutputStream in a struct that needs to be Default/Clone usually, 
-    // but here we just need to initialize it.
     audio_stream_handle: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
     audio_sink: Option<rodio::Sink>,
     pub last_error: Option<String>,
     pub failed_loads: std::collections::HashSet<u64>,
-    pub zoom_level: f32,
+    image_view_states: HashMap<u64, ImageViewState>,
 
     pub cdn_loader: Option<crate::bundles::cdn::CdnBundleLoader>,
     pub audio_volume: f32,
-    
-    pub texture_loader: Option<crate::ui::texture_loader::TextureLoader>,
-    // (hashes, name_for_title)
+
     pub export_requested: Option<(Vec<u64>, String, Option<crate::ui::export_window::ExportSettings>)>,
     pub selection_requested: Option<crate::ui::app::FileSelection>,
+
+    pub psg_cache: HashMap<u64, crate::dat::psg::PsgFile>,
+    pub psg_viewer_state: HashMap<u64, crate::ui::psg_viewer::PsgViewerState>,
+    folder_children_cache: HashMap<String, Vec<(String, String, Vec<u64>)>>,
+    folder_cache_index_size: usize,
+
+    pub parsed_content_cache: HashMap<u64, crate::parsers::ParsedContent>,
 }
 
 impl Default for ContentView {
@@ -51,13 +70,18 @@ impl Default for ContentView {
             audio_sink: None,
             last_error: None,
             failed_loads: std::collections::HashSet::new(),
-            zoom_level: 1.0,
+            image_view_states: HashMap::new(),
 
             cdn_loader: None,
             audio_volume: 0.5,
-            texture_loader: Some(crate::ui::texture_loader::TextureLoader::new()),
             export_requested: None,
             selection_requested: None,
+            
+            psg_cache: HashMap::new(),
+            psg_viewer_state: HashMap::new(),
+            folder_children_cache: HashMap::new(),
+            folder_cache_index_size: 0,
+            parsed_content_cache: HashMap::new(),
         }
     }
 }
@@ -86,8 +110,8 @@ impl ContentView {
                 FileSelection::GgpkOffset(offset) => {
                     self.show_ggpk_file(ui, &reader, offset, is_poe2);
                 },
-                FileSelection::Folder(hashes, name) => {
-                     self.show_folder_grid(ui, reader, bundle_index, hashes, name);
+                 FileSelection::Folder { hashes, name, path } => {
+                     self.show_folder_list(ui, bundle_index, hashes, name, path);
                 },
                 FileSelection::BundleFile(hash) => {
                     if let Some(index) = bundle_index {
@@ -101,24 +125,28 @@ impl ContentView {
                                  if !self.texture_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
+                             } else if file_info.path.ends_with(".png") || file_info.path.ends_with(".jpg") || file_info.path.ends_with(".jpeg") || file_info.path.ends_with(".webp") {
+                                 if !self.texture_cache.contains_key(&hash) {
+                                     perform_load = true;
+                                 }
                              } else if file_info.path.ends_with(".dat") || file_info.path.ends_with(".dat64") || file_info.path.ends_with(".datc64") || file_info.path.ends_with(".datl") || file_info.path.ends_with(".datl64") {
                                  if self.dat_viewer.loaded_filename() != Some(file_info.path.as_str()) {
                                      perform_load = true;
                                  }
                              } else if file_info.path.ends_with(".csd") {
-                                 if !self.csd_cache.contains_key(&hash) {
+                                 if !self.csd_cache.contains_key(&hash) && !self.raw_data_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
                              } else if file_info.path.ends_with(".psg") {
-                                 if !self.json_cache.contains_key(&hash) {
+                                 if !self.psg_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
                              } else if file_info.path.ends_with(".json") {
-                                 if !self.json_cache.contains_key(&hash) {
+                                 if !self.json_cache.contains_key(&hash) && !self.raw_data_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
-                             } else if file_info.path.ends_with(".ogg") {
-                                 // Audio auto load?
+                             } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") {
+                                 // Audio: play on demand, no auto-load needed
                              } else if is_text_file(&file_info.path) {
                                  if !self.raw_data_cache.contains_key(&hash) && file_info.file_size < 2 * 1024 * 1024 { // Auto load text < 2MB
                                      perform_load = true;
@@ -134,7 +162,6 @@ impl ContentView {
                                  perform_load = false;
                              }
                              
-                             // Header with Context Menu
                              let label = egui::RichText::new(&file_info.path).heading();
                              let response = ui.label(label);
                              response.context_menu(|ui| {
@@ -143,14 +170,17 @@ impl ContentView {
                                      ui.close_menu();
                                  }
                              });
+                             ui.add_space(4.0);
+                             ui.horizontal_wrapped(|ui| {
+                                 crate::ui::components::badge(ui, file_kind_label(&file_info.path));
+                                 crate::ui::components::badge(ui, &format_file_size(file_info.file_size as u64));
+                                 crate::ui::components::badge(ui, &format!("{:016x}", hash));
+                             });
+                             ui.separator();
 
-                             // Perform Auto-Load if needed
                              if perform_load {
                                  self.load_bundled_content(ui.ctx(), &reader, index, file_info, hash);
                              }
-
-                             // Display Content
-                             ui.separator();
                              
                              if file_info.path.ends_with(".dat") || file_info.path.ends_with(".dat64") || file_info.path.ends_with(".datc64") || file_info.path.ends_with(".datl") || file_info.path.ends_with(".datl64") {
                                   // DatViewer handles its own scrolling via TableBuilder
@@ -170,7 +200,39 @@ impl ContentView {
                                   }
                              } else if file_info.path.ends_with(".csd") {
                                  self.show_csd(ui, hash);
-                             } else if file_info.path.ends_with(".json") || file_info.path.ends_with(".psg") {
+                            } else if file_info.path.ends_with(".psg") {
+                                 if let Some(psg_file) = self.psg_cache.get(&hash) {
+                                     let state = self.psg_viewer_state.entry(hash).or_default();
+                                     let show_graph = state.show_graph;
+                                     let mut viewer = crate::ui::psg_viewer::PsgViewer::new(state, psg_file);
+                                     
+                                     if show_graph {
+                                         viewer.show(ui);
+                                     } else {
+                                         // Still show the toggle button from the viewer
+                                         viewer.show(ui); 
+                                         // And show JSON below
+                                         if let Some(json) = self.json_cache.get(&hash) {
+                                             crate::ui::json_viewer::JsonTreeViewer::show(ui, json);
+                                         } else {
+                                             ui.label("JSON representation not available.");
+                                         }
+                                     }
+                                } else if let Some(json) = self.json_cache.get(&hash) {
+                                    // Fallback if PSG struct missing but JSON exists
+                                    crate::ui::json_viewer::JsonTreeViewer::show(ui, json);
+                                } else {
+                                    if let Some(err) = &self.last_error {
+                                        ui.colored_label(egui::Color32::RED, err);
+                                    }
+                                    if self.failed_loads.contains(&hash) {
+                                        ui.colored_label(egui::Color32::RED, "Failed to load PSG.");
+                                    } else {
+                                         ui.spinner();
+                                         ui.label("Loading PSG...");
+                                    }
+                                }
+                            } else if file_info.path.ends_with(".json") {
                                  if let Some(job) = self.json_cache.get(&hash) {
                                      egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                                          JsonTreeViewer::show(ui, job);
@@ -180,52 +242,164 @@ impl ContentView {
                                  } else {
                                       ui.label("Loading JSON...");
                                  }
-                             } else {
+                            } else {
                                  // For other content, use ScrollArea
-                                      if file_info.path.ends_with(".dds") {
-                                          if let Some(texture) = self.texture_cache.get(&hash) {
-                                               // Static Controls
-                                               ui.horizontal(|ui| {
-                                                    if ui.button("-").clicked() {
-                                                        self.zoom_level = (self.zoom_level - 0.1).max(0.1);
-                                                    }
-                                                    ui.add(egui::Slider::new(&mut self.zoom_level, 0.1..=5.0).text("Zoom"));
-                                                    if ui.button("+").clicked() {
-                                                        self.zoom_level = (self.zoom_level + 0.1).min(5.0);
-                                                    }
-                                                    if ui.button("Fits Window").clicked() {
-                                                         let available_width = ui.available_width();
-                                                         let size = texture.size_vec2();
-                                                         if size.x > 0.0 {
-                                                             self.zoom_level = (available_width / size.x).min(1.0);
-                                                         }
-                                                    }
-                                                    if ui.button("Reset (100%)").clicked() {
-                                                        self.zoom_level = 1.0;
-                                                    }
-                                               });
-                                               
-                                               ui.separator();
+                                      if file_info.path.ends_with(".dds") || file_info.path.ends_with(".png") || file_info.path.ends_with(".jpg") || file_info.path.ends_with(".jpeg") || file_info.path.ends_with(".webp") {
+                                          let texture_info = self.texture_cache.get(&hash)
+                                              .map(|t| (t.id(), t.size_vec2()));
+                                          if let Some((texture_id, texture_size)) = texture_info {
+                                              let state = self.image_view_states
+                                                  .entry(hash)
+                                                  .or_insert_with(ImageViewState::new);
 
-                                               egui::ScrollArea::both().show(ui, |ui| {
-                                                  ui.vertical_centered(|ui| {
-                                                      let size = texture.size_vec2() * self.zoom_level;
-                                                      ui.add(egui::Image::new(texture).fit_to_exact_size(size));
+                                              // Controls bar
+                                              ui.horizontal(|ui| {
+                                                  if ui.small_button("−").clicked() {
+                                                      state.zoom = (state.zoom / 1.25).max(0.05);
+                                                  }
+                                                  ui.add_space(4.0);
+                                                  ui.label(
+                                                      egui::RichText::new(format!("{:.0}%", state.zoom * 100.0))
+                                                          .size(11.5)
+                                                          .monospace()
+                                                          .color(egui::Color32::from_rgb(161, 161, 170)),
+                                                  );
+                                                  ui.add_space(4.0);
+                                                  if ui.small_button("+").clicked() {
+                                                      state.zoom = (state.zoom * 1.25).min(10.0);
+                                                  }
+                                                  ui.add_space(8.0);
+                                                  if ui.small_button("Fit").clicked() {
+                                                      state.needs_fit = true;
+                                                  }
+                                                  if ui.small_button("1:1").clicked() {
+                                                      state.zoom = 1.0;
+                                                      state.pan = egui::Vec2::ZERO;
+                                                  }
+                                                  ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                      ui.label(
+                                                          egui::RichText::new(format!(
+                                                              "{}×{}",
+                                                              texture_size.x as u32,
+                                                              texture_size.y as u32
+                                                          ))
+                                                          .size(11.0)
+                                                          .color(egui::Color32::from_rgb(113, 113, 122)),
+                                                      );
                                                   });
-                                               });
-                                          } else {
-                                              egui::ScrollArea::vertical().show(ui, |ui| {
-                                                 if self.failed_loads.contains(&hash) {
-                                                      ui.label(format!("Failed to load image. Error: {}", self.last_error.as_deref().unwrap_or("Unknown")));
-                                                 } else {
-                                                      ui.label("Loading image...");
-                                                 }
                                               });
+                                              ui.separator();
+
+                                              // Canvas — full remaining area
+                                              let canvas_size = ui.available_size();
+                                              let (canvas_rect, response) = ui.allocate_exact_size(
+                                                  canvas_size,
+                                                  egui::Sense::click_and_drag(),
+                                              );
+
+                                              // Auto-fit on first show
+                                              if state.needs_fit && canvas_size.x > 1.0 && canvas_size.y > 1.0 {
+                                                  state.zoom = (canvas_size.x / texture_size.x)
+                                                      .min(canvas_size.y / texture_size.y)
+                                                      .min(1.0)
+                                                      .max(0.05);
+                                                  state.pan = egui::Vec2::ZERO;
+                                                  state.needs_fit = false;
+                                              }
+
+                                              // Scroll-wheel zoom toward cursor
+                                              if response.hovered() {
+                                                  let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                                                  if scroll != 0.0 {
+                                                      let old_zoom = state.zoom;
+                                                      let factor = if scroll > 0.0 { 1.12 } else { 1.0 / 1.12 };
+                                                      let new_zoom = (old_zoom * factor).clamp(0.05, 10.0);
+                                                      if let Some(cursor) = ui.input(|i| i.pointer.latest_pos()) {
+                                                          let c = egui::vec2(
+                                                              cursor.x - canvas_rect.center().x,
+                                                              cursor.y - canvas_rect.center().y,
+                                                          );
+                                                          state.pan = c - (c - state.pan) * (new_zoom / old_zoom);
+                                                      }
+                                                      state.zoom = new_zoom;
+                                                  }
+                                              }
+
+                                              // Drag to pan
+                                              if response.dragged_by(egui::PointerButton::Primary) {
+                                                  state.pan += response.drag_delta();
+                                              }
+
+                                              // Cursor feedback
+                                              if response.hovered() {
+                                                  if response.dragged() {
+                                                      ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                                  } else {
+                                                      ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                                                  }
+                                              }
+
+                                              // Clamp pan so image can't be dragged fully offscreen
+                                              let scaled = texture_size * state.zoom;
+                                              let half_excess = ((scaled - canvas_size) * 0.5).max(egui::Vec2::ZERO);
+                                              let max_pan = half_excess + canvas_size * 0.4;
+                                              state.pan = state.pan.clamp(-max_pan, max_pan);
+
+                                              // Draw clipped to canvas
+                                              let painter = ui.painter().with_clip_rect(canvas_rect);
+                                              painter.image(
+                                                  texture_id,
+                                                  egui::Rect::from_center_size(canvas_rect.center() + state.pan, scaled),
+                                                  egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                                  egui::Color32::WHITE,
+                                              );
+                                          } else if self.failed_loads.contains(&hash) {
+                                              ui.centered_and_justified(|ui| {
+                                                  ui.label(
+                                                      egui::RichText::new(format!(
+                                                          "Failed to load image: {}",
+                                                          self.last_error.as_deref().unwrap_or("Unknown error")
+                                                      ))
+                                                      .color(egui::Color32::from_rgb(239, 68, 68)),
+                                                  );
+                                              });
+                                          } else {
+                                              ui.centered_and_justified(|ui| { ui.spinner(); });
                                           }
-                                      } else if file_info.path.ends_with(".ogg") {
-                                           egui::ScrollArea::vertical().show(ui, |ui| {
-                                                self.show_audio_player(ui, &reader, index, file_info, hash);
-                                           });
+                                      } else if file_info.path.ends_with(".psg") {
+                if let Some(psg_file) = self.psg_cache.get(&hash) {
+                     let state = self.psg_viewer_state.entry(hash).or_default();
+                     let show_graph = state.show_graph;
+                     let mut viewer = crate::ui::psg_viewer::PsgViewer::new(state, psg_file);
+                     
+                     if show_graph {
+                         viewer.show(ui);
+                     } else {
+                         // Still show the toggle button from the viewer
+                         viewer.show(ui); // It handles the "Switch Back" button internally via state check
+                         
+                         // And show JSON below
+                         if let Some(json) = self.json_cache.get(&hash) {
+                             crate::ui::json_viewer::JsonTreeViewer::show(ui, json);
+                         } else {
+                             ui.label("JSON representation not available.");
+                         }
+                     }
+                } else if let Some(json) = self.json_cache.get(&hash) {
+                    crate::ui::json_viewer::JsonTreeViewer::show(ui, json);
+                } else {
+                    if let Some(err) = &self.last_error {
+                        ui.colored_label(egui::Color32::RED, err);
+                    }
+                    if self.failed_loads.contains(&hash) {
+                        ui.colored_label(egui::Color32::RED, "Failed to load PSG.");
+                    } else {
+                         ui.spinner();
+                         ui.label("Loading PSG...");
+                    }
+                }
+            } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") {
+                                           self.show_audio_player(ui, &reader, index, file_info, hash);
                                       } else if is_text_file(&file_info.path) {
                                            egui::ScrollArea::vertical().show(ui, |ui| {
                                                 if let Some(data) = self.raw_data_cache.get(&hash) {
@@ -281,202 +455,369 @@ impl ContentView {
             }
         } else {
             ui.centered_and_justified(|ui| {
-                ui.label("Select a file to view content.");
+                crate::ui::components::card(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading("Select a file to view content");
+                        ui.add_space(6.0);
+                        ui.label("Use the tree, command palette, or folder browser to inspect assets, data tables, textures, audio, and parsed formats.");
+                    });
+                });
             });
         }
     }
 
-    fn show_folder_grid(&mut self, ui: &mut egui::Ui, reader: std::sync::Arc<crate::ggpk::reader::GgpkReader>, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>, hashes: Vec<u64>, name: String) {
-        ui.heading(format!("Folder: {}", name));
+    fn show_folder_list(&mut self, ui: &mut egui::Ui, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>, hashes: Vec<u64>, name: String, path: String) {
+        ui.label(
+            egui::RichText::new(&path)
+                .heading()
+                .color(egui::Color32::from_rgb(236, 236, 240)),
+        );
+        ui.add_space(4.0);
+        if let Some(index) = bundle_index {
+            if self.folder_cache_index_size != index.files.len() {
+                self.folder_children_cache.clear();
+                self.folder_cache_index_size = index.files.len();
+            }
+        }
+
+        let subfolders = bundle_index
+            .as_ref()
+            .map(|index| self.cached_immediate_subfolders(index, &path))
+            .unwrap_or_default();
+        let total_entries = subfolders.len() + hashes.len();
+        ui.label(
+            egui::RichText::new(format!("ENTRIES · {}", total_entries))
+                .monospace()
+                .size(10.5)
+                .color(egui::Color32::from_rgb(113, 113, 122)),
+        );
         ui.separator();
-        
-        // Filter for DDS files
-        // TODO: This filtering happens every frame. For really large folders, we should cache this result.
-        // For now, it's likely fast enough (linear scan of u64s).
-        let dds_files: Vec<u64> = if let Some(idx) = bundle_index {
-            hashes.into_iter().filter(|h| {
-                if let Some(info) = idx.files.get(h) {
-                    info.path.ends_with(".dds")
-                } else {
-                    false
+
+        if subfolders.is_empty() && hashes.is_empty() {
+            ui.add_space(16.0);
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} has no direct file entries.", name))
+                        .color(egui::Color32::from_rgb(126, 126, 134)),
+                );
+            });
+            return;
+        }
+
+        let mut files = Vec::new();
+        if let Some(index) = bundle_index {
+            for hash in hashes {
+                if let Some(file) = index.files.get(&hash) {
+                    files.push((hash, file));
                 }
-            }).collect()
+            }
+        }
+        files.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+
+        TableBuilder::new(ui)
+            .striped(false)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::exact(28.0))
+            .column(Column::remainder().at_least(240.0))
+            .column(Column::exact(84.0))
+            .column(Column::exact(88.0))
+            .column(Column::exact(132.0))
+            .header(24.0, |mut header| {
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("").size(10.5));
+                });
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("NAME").monospace().size(10.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                });
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("TYPE").monospace().size(10.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                });
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("SIZE").monospace().size(10.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                });
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("HASH").monospace().size(10.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                });
+            })
+            .body(|body| {
+                let total_rows = subfolders.len() + files.len();
+                body.rows(22.0, total_rows, |mut row| {
+                    let row_index = row.index();
+
+                    if row_index < subfolders.len() {
+                        let (folder_name, folder_path, child_hashes) = &subfolders[row_index];
+
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new("▸")
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(egui::Color32::from_rgb(113, 113, 122)),
+                            );
+                        });
+
+                        row.col(|ui| {
+                            let response = ui.selectable_label(
+                                false,
+                                egui::RichText::new(folder_name).monospace().size(11.5),
+                            );
+                            if response.clicked() {
+                                self.selection_requested = Some(crate::ui::app::FileSelection::Folder {
+                                    hashes: child_hashes.clone(),
+                                    name: folder_name.clone(),
+                                    path: folder_path.clone(),
+                                });
+                            }
+                            response.on_hover_text(folder_path);
+                        });
+
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new("FOLDER")
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(egui::Color32::from_rgb(161, 161, 170)),
+                            );
+                        });
+
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{} files", child_hashes.len()))
+                                    .size(10.8)
+                                    .color(egui::Color32::from_rgb(161, 161, 170)),
+                            );
+                        });
+
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new("—")
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(egui::Color32::from_rgb(113, 113, 122)),
+                            );
+                        });
+                    } else {
+                        let file_index = row_index - subfolders.len();
+                        let (hash, file_info) = files[file_index];
+
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new("·")
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(egui::Color32::from_rgb(113, 113, 122)),
+                            );
+                        });
+
+                        row.col(|ui| {
+                            let name_text = display_name_from_path(&file_info.path);
+                            let response = ui.selectable_label(
+                                false,
+                                egui::RichText::new(name_text).monospace().size(11.5),
+                            );
+                            if response.clicked() {
+                                self.selection_requested = Some(crate::ui::app::FileSelection::BundleFile(hash));
+                            }
+                            response.on_hover_text(&file_info.path);
+                        });
+
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new(file_kind_label(&file_info.path).to_uppercase())
+                                    .monospace()
+                                    .size(10.0)
+                                    .color(egui::Color32::from_rgb(120, 170, 210)),
+                            );
+                        });
+
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new(format_file_size(file_info.file_size as u64))
+                                    .size(10.8)
+                                    .color(egui::Color32::from_rgb(161, 161, 170)),
+                            );
+                        });
+
+                        row.col(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("{:08x}", hash as u32))
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(egui::Color32::from_rgb(161, 161, 170)),
+                            );
+                        });
+                    }
+                });
+            });
+    }
+
+    fn cached_immediate_subfolders(&mut self, index: &crate::bundles::index::Index, path: &str) -> Vec<(String, String, Vec<u64>)> {
+        if let Some(cached) = self.folder_children_cache.get(path) {
+            return cached.clone();
+        }
+
+        let computed = Self::build_immediate_subfolders(index, path);
+        self.folder_children_cache.insert(path.to_string(), computed.clone());
+        computed
+    }
+
+    fn build_immediate_subfolders(index: &crate::bundles::index::Index, path: &str) -> Vec<(String, String, Vec<u64>)> {
+        let prefix = if path.is_empty() {
+            String::new()
         } else {
-            Vec::new()
+            format!("{}/", path)
         };
 
-        if dds_files.is_empty() {
-             ui.label("No images found in this folder.");
-             return;
-        }
-
-        ui.horizontal(|ui| {
-            ui.label(format!("Found {} images.", dds_files.len()));
-             if ui.button("Clear Texture Cache").clicked() {
-                 self.texture_cache.clear();
-             }
-        });
-        ui.separator();
-
-        // Ensure loader exists
-        if self.texture_loader.is_none() {
-            self.texture_loader = Some(crate::ui::texture_loader::TextureLoader::new());
-        }
-        
-        // Poll loader
-        // We poll up to X items per frame to avoid choking if many return at once
-        if let Some(loader) = &mut self.texture_loader {
-            let mut updates = 0;
-            while let Some((hash, image)) = loader.poll() {
-                // Create texture
-                let texture = ui.ctx().load_texture(
-                    format!("thumb_{}", hash),
-                    image,
-                    egui::TextureOptions::default()
-                );
-                self.texture_cache.insert(hash, texture);
-                updates += 1;
-                if updates > 50 { break; } 
+        let mut by_folder: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for (hash, file) in &index.files {
+            if !file.path.starts_with(&prefix) {
+                continue;
             }
-             if updates > 0 {
-                 ui.ctx().request_repaint();
-             }
+
+            let remainder = &file.path[prefix.len()..];
+            if let Some((segment, tail)) = remainder.split_once('/') {
+                if segment.is_empty() {
+                    continue;
+                }
+
+                let folder_path = format!("{}{}", prefix, segment);
+                let entry = by_folder.entry(folder_path).or_default();
+
+                if !tail.contains('/') {
+                    entry.push(*hash);
+                }
+            }
         }
 
-        // Layout Constants
-        let thumbnail_size = 128.0;
-        let padding = 8.0;
-        let item_width = thumbnail_size + padding;
-        let item_height = thumbnail_size + 30.0 + padding; // Space for label
-        
-        let available_width = ui.available_width();
-        let cols = (available_width / item_width).floor().max(1.0) as usize;
-        let rows = (dds_files.len() + cols - 1) / cols;
+        let mut rows = Vec::with_capacity(by_folder.len());
+        for (folder_path, mut direct_hashes) in by_folder {
+            direct_hashes.sort_by(|a, b| {
+                let path_a = index.files.get(a).map(|file| file.path.as_str()).unwrap_or("");
+                let path_b = index.files.get(b).map(|file| file.path.as_str()).unwrap_or("");
+                path_a.cmp(path_b)
+            });
 
-        egui::ScrollArea::vertical().show_rows(ui, item_height, rows, |ui, row_range| {
-             let reader_arc = reader.clone(); 
-             
-             // We manually implement the grid layout for the visible rows
-             for row in row_range {
-                 ui.horizontal(|ui| {
-                     for col in 0..cols {
-                         let index = row * cols + col;
-                         if index >= dds_files.len() {
-                             break;
-                         }
-                         
-                         let hash = dds_files[index];
-                         
-                         // Allocate item space
-                         let (rect, _response) = ui.allocate_exact_size(egui::vec2(thumbnail_size, item_height), egui::Sense::hover());
-                         
-                         // Render Item inside rect
-                         ui.allocate_new_ui(egui::UiBuilder::new().max_rect(rect), |ui| {
-                             ui.vertical_centered(|ui| {
-                                 // 1. Texture / Placeholder
-                                 if let Some(texture) = self.texture_cache.get(&hash) {
-                                      // Scale to fit
-                                      let mut size = texture.size_vec2();
-                                      let scale = (thumbnail_size / size.x).min(thumbnail_size / size.y).min(1.0);
-                                      size *= scale;
-                                      
-                                      if ui.add(egui::Image::new(texture).fit_to_exact_size(size).sense(egui::Sense::click())).clicked() {
-                                          self.selection_requested = Some(crate::ui::app::FileSelection::BundleFile(hash));
-                                      }
-                                 } else {
-                                     // Placeholder
-                                     let (p_rect, _) = ui.allocate_exact_size(egui::vec2(thumbnail_size, thumbnail_size), egui::Sense::hover());
-                                     ui.painter().rect_filled(p_rect, 4.0, egui::Color32::from_gray(30));
-                                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(p_rect), |ui| {
-                                         ui.centered_and_justified(|ui| ui.spinner());
-                                     });
-                                     
-                                     // Request Load (Lazy Loading)
-                                     if let Some(idx) = bundle_index {
-                                         if let Some(info) = idx.files.get(&hash) {
-                                             if let Some(loader) = &mut self.texture_loader {
-                                                 if !loader.is_loading(hash) {
-                                                     loader.request(hash, info.path.clone(), reader_arc.clone(), idx.clone(), info);
-                                                 }
-                                             }
-                                         }
-                                     }
-                                 }
-                                 
-                                 // 2. Label
-                                 if let Some(idx) = bundle_index {
-                                      if let Some(info) = idx.files.get(&hash) {
-                                          let name = std::path::Path::new(&info.path).file_name().unwrap_or_default().to_string_lossy();
-                                          ui.label(egui::RichText::new(name).small().weak()).on_hover_text(&info.path);
-                                      }
-                                 }
-                             });
-                         });
-                         
-                         // Spacing between columns
-                         ui.add_space(padding);
-                     }
-                 });
-                 // Spacing between rows
-                 ui.add_space(padding);
-             }
-        });
+            let folder_name = folder_path.rsplit('/').next().unwrap_or(&folder_path).to_string();
+            rows.push((folder_name, folder_path, direct_hashes));
+        }
+
+        rows
     }
 
     fn show_audio_player(&mut self, ui: &mut egui::Ui, reader: &GgpkReader, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
-        ui.group(|ui| {
-            ui.heading("Audio Player");
-            
-            ui.horizontal(|ui| {
-                if ui.button("▶ Play").clicked() {
-                    self.load_bundled_content(ui.ctx(), &reader, index, file_info, hash);
-                }
-                
-                if ui.button("⏹ Stop").clicked() {
+        ui.spacing_mut().item_spacing.y = 6.0;
+
+        let file_name = std::path::Path::new(&file_info.path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&file_info.path);
+        let ext = std::path::Path::new(&file_info.path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("audio")
+            .to_uppercase();
+
+        ui.label(
+            egui::RichText::new(file_name)
+                .size(13.0)
+                .monospace()
+                .color(egui::Color32::from_rgb(228, 228, 231)),
+        );
+        ui.label(
+            egui::RichText::new(ext)
+                .size(10.5)
+                .monospace()
+                .color(egui::Color32::from_rgb(113, 113, 122)),
+        );
+
+        ui.add_space(8.0);
+
+        let is_playing = self.audio_sink.as_ref().map(|s| !s.empty()).unwrap_or(false);
+
+        ui.horizontal(|ui| {
+            if is_playing {
+                if ui.button("■  Stop").clicked() {
                     if let Some(sink) = &self.audio_sink {
                         sink.stop();
                     }
                     self.audio_sink = None;
                 }
-            });
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Volume:");
-                if ui.add(egui::Slider::new(&mut self.audio_volume, 0.0..=1.0).show_value(true)).changed() {
-                     if let Some(sink) = &self.audio_sink {
-                         sink.set_volume(self.audio_volume);
-                     }
-                }
-            });
-            ui.add_space(4.0);
-            
-            let status = if let Some(sink) = &self.audio_sink {
-                 if sink.empty() { "Stopped" } else { "Playing..." }
             } else {
-                 "Stopped"
-            };
-            
-            ui.horizontal(|ui| {
-                 ui.label("Status:");
-                 if status == "Playing..." {
-                     ui.colored_label(egui::Color32::GREEN, status);
-                 } else {
-                     ui.label(status);
-                 }
-            });
+                if ui.button("▶  Play").clicked() {
+                    self.load_bundled_content(ui.ctx(), reader, index, file_info, hash);
+                }
+            }
         });
+
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("VOLUME")
+                    .size(10.5)
+                    .monospace()
+                    .color(egui::Color32::from_rgb(113, 113, 122)),
+            );
+            ui.add_space(6.0);
+            if ui.add_sized(
+                [140.0, 18.0],
+                egui::Slider::new(&mut self.audio_volume, 0.0..=1.0).show_value(false),
+            ).changed() {
+                if let Some(sink) = &self.audio_sink {
+                    sink.set_volume(self.audio_volume);
+                }
+            }
+            ui.label(
+                egui::RichText::new(format!("{:.0}%", self.audio_volume * 100.0))
+                    .size(11.5)
+                    .color(egui::Color32::from_rgb(161, 161, 170)),
+            );
+        });
+
+        ui.add_space(8.0);
+
+        // Status dot + label
+        let (dot_color, status_text) = if is_playing {
+            (egui::Color32::from_rgb(74, 222, 128), "Playing")
+        } else {
+            (egui::Color32::from_rgb(82, 82, 91), "Stopped")
+        };
+        ui.horizontal(|ui| {
+            let top_left = ui.cursor().min;
+            let dot_pos = egui::pos2(top_left.x + 5.0, top_left.y + 8.0);
+            ui.painter().circle_filled(dot_pos, 4.0, dot_color);
+            ui.add_space(14.0);
+            ui.label(
+                egui::RichText::new(status_text)
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(161, 161, 170)),
+            );
+        });
+
+        if let Some(err) = &self.last_error.clone() {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(err)
+                    .size(11.5)
+                    .color(egui::Color32::from_rgb(239, 68, 68)),
+            );
+        }
+
+        if is_playing {
+            ui.ctx().request_repaint();
+        }
     }
 
     fn show_ggpk_file(&mut self, ui: &mut egui::Ui, reader: &GgpkReader, offset: u64, is_poe2: bool) {
             match reader.read_file_record(offset) {
                 Ok(file) => {
                     ui.heading(&file.name);
-                    ui.label(format!("Size: {} bytes", file.data_length));
-                    ui.label(format!("Offset: {}", file.offset));
-                    if ui.button("Export").clicked() {
-                        // TODO
-                    }
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        crate::ui::components::badge(ui, file_kind_label(&file.name));
+                        crate::ui::components::badge(ui, &format_file_size(file.data_length));
+                        crate::ui::components::badge(ui, &format!("Offset {}", file.offset));
+                    });
                     ui.separator();
                     
                     if file.name.ends_with(".dds") {
@@ -513,10 +854,23 @@ impl ContentView {
                          self.dat_viewer.load(reader, offset);
                          self.dat_viewer.show(ui, is_poe2);
                     } else {
-                        // Reset DatViewer if switching away? 
-                        // Or keep state?
-                        // For now just show "Hex View (TODO)"
-                        ui.label("Hex View (TODO)");
+                        // Try new format parsers
+                        match reader.get_data_slice(file.data_offset, file.data_length) {
+                            Ok(data) => {
+                                if let Some(parsed) = parse_with_new_formats(&file.name, data) {
+                                    // Store in cache for potential later use
+                                    self.parsed_content_cache.insert(offset, parsed.clone());
+
+                                    render_parsed_content(ui, &file.name, &parsed);
+                                } else {
+                                    // Fallback to hex view
+                                    ui.label("Hex View (TODO)");
+                                }
+                            },
+                            Err(e) => {
+                                ui.label(format!("Read error: {}", e));
+                            }
+                        }
                     }
                 },
                 Err(e) => {
@@ -611,12 +965,14 @@ impl ContentView {
                              let msg = format!("CDN Fetch Failed: {}", e);
                              println!("{}", msg);
                              self.last_error = Some(msg);
+                             self.failed_loads.insert(hash);
                          }
                      }
                  } else {
                      let msg = format!("Bundle not found in GGPK and CDN Loader not initialized. Hash: {}", hash);
                      println!("{}", msg);
                      self.last_error = Some(msg);
+                     self.failed_loads.insert(hash);
                  }
              }
 
@@ -649,85 +1005,90 @@ impl ContentView {
                                       } else {
                                           self.last_error = None;
                                       }
-                                  } else if path.ends_with(".dds") {
-                                      // Try to load DDS
+                                  } else if path.ends_with(".dds") || path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg") || path.ends_with(".webp") {
+                                      // Try to load Image
                                       self.last_error = None;
                                       
-                                      println!("DDS Loading: Data Length {}", file_data.len());
-                                      if file_data.len() > 16 {
-                                          println!("DDS First 16 bytes: {:02X?}", &file_data[0..16]);
-                                          let magic = &file_data[0..4];
-                                          if magic == b"DDS " {
-                                              println!("Magic 'DDS ' confirmed.");
-                                          } else {
-                                              println!("WARNING: Magic bytes mismatch! Expected 'DDS ', found {:?}", magic);
-                                          }
-                                      }
+                                      println!("Image Loading: Data Length {}", file_data.len());
                                       
-                                      // Method 1: Try image_dds first (better support for various DXT/BC formats)
-                                      let mut loaded = false;
-                                      
-                                      let mut cursor = std::io::Cursor::new(&file_data);
-                                      match ddsfile::Dds::read(&mut cursor) {
-                                          Ok(dds) => {
-                                              println!("DDS Header Read OK.");
-                                              match image_dds::image_from_dds(&dds, 0) {
-                                                  Ok(image) => {
-                                                      println!("image_dds conversion OK. Size: {}x{}", image.width(), image.height());
-                                                      let size = [image.width() as usize, image.height() as usize];
-                                                      let pixels = image.as_raw();
-                                                      let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                          size,
-                                                          pixels,
-                                                      );
-                                                      let texture = ctx.load_texture(
-                                                          path,
-                                                          color_image,
-                                                          egui::TextureOptions::default()
-                                                      );
-                                                      self.texture_cache.insert(hash, texture);
-                                                      loaded = true;
-                                                  },
-                                                  Err(e) => {
-                                                      println!("image_dds failed to convert: {:?}", e);
-                                                  }
+                                      // Special handling for DDS
+                                      if path.ends_with(".dds") {
+                                          if file_data.len() > 16 {
+                                              println!("DDS First 16 bytes: {:02X?}", &file_data[0..16]);
+                                              let magic = &file_data[0..4];
+                                              if magic == b"DDS " {
+                                                  println!("Magic 'DDS ' confirmed.");
+                                              } else {
+                                                  println!("WARNING: Magic bytes mismatch! Expected 'DDS ', found {:?}", magic);
                                               }
-                                          },
-                                          Err(e) => {
-                                              println!("DDS Header Read Failed: {:?}", e);
+                                          }
+                                          
+                                          // Method 1: Try image_dds first (better support for various DXT/BC formats for DDS)
+                                          let mut loaded = false;
+                                          let mut cursor = std::io::Cursor::new(&file_data);
+                                          match ddsfile::Dds::read(&mut cursor) {
+                                              Ok(dds) => {
+                                                  println!("DDS Header Read OK.");
+                                                  match image_dds::image_from_dds(&dds, 0) {
+                                                      Ok(image) => {
+                                                          println!("image_dds conversion OK. Size: {}x{}", image.width(), image.height());
+                                                          let size = [image.width() as usize, image.height() as usize];
+                                                          let pixels = image.as_raw();
+                                                          let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                              size,
+                                                              pixels,
+                                                          );
+                                                          let texture = ctx.load_texture(
+                                                              path,
+                                                              color_image,
+                                                              egui::TextureOptions::default()
+                                                          );
+                                                          self.texture_cache.insert(hash, texture);
+                                                          loaded = true;
+                                                      },
+                                                      Err(e) => {
+                                                          println!("image_dds failed to convert: {:?}", e);
+                                                      }
+                                                  }
+                                              },
+                                              Err(e) => {
+                                                  println!("DDS Header Read Failed: {:?}", e);
+                                              }
+                                          }
+                                          
+                                          if !loaded {
+                                               // Fallback to Method 2 below
+                                          } else {
+                                              self.failed_loads.remove(&hash);
+                                              self.last_error = None;
+                                              return;
                                           }
                                       }
-                                      
-                                      // Method 2: Fallback to image crate (built-in dds support)
-                                      if !loaded {
-                                          if let Ok(img) = image::load_from_memory(&file_data) {
-                                              let size = [img.width() as usize, img.height() as usize];
-                                              let image_buffer = img.to_rgba8();
-                                              let pixels = image_buffer.as_flat_samples();
-                                              let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                  size,
-                                                  pixels.as_slice(),
-                                              );
-                                              
-                                              let texture = ctx.load_texture(
-                                                  path,
-                                                  color_image,
-                                                  egui::TextureOptions::default()
-                                              );
-                                              self.texture_cache.insert(hash, texture);
-                                              loaded = true;
-                                          }
-                                      }
-                                      
-                                      if !loaded {
-                                          let msg = format!("Failed to decode DDS image (unsupported format? type maybe: BC7/DXT10/etc). File size: {}", file_data.len());
-                                          self.last_error = Some(msg);
-                                          self.failed_loads.insert(hash);
-                                      } else {
+
+                                      // Method 2: Standard image crate (supports png, jpg, webp, and some dds)
+                                      if let Ok(img) = image::load_from_memory(&file_data) {
+                                          let size = [img.width() as usize, img.height() as usize];
+                                          let image_buffer = img.to_rgba8();
+                                          let pixels = image_buffer.as_flat_samples();
+                                          let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                              size,
+                                              pixels.as_slice(),
+                                          );
+                                          
+                                          let texture = ctx.load_texture(
+                                              path,
+                                              color_image,
+                                              egui::TextureOptions::default()
+                                          );
+                                          self.texture_cache.insert(hash, texture);
                                           self.failed_loads.remove(&hash);
                                           self.last_error = None;
+                                      } else {
+                                          let msg = format!("Failed to decode image. File size: {}", file_data.len());
+                                          self.last_error = Some(msg);
+                                          self.failed_loads.insert(hash);
                                       }
-                                 } else if path.ends_with(".ogg") {
+                                 } else if path.ends_with(".ogg") || path.ends_with(".wav") {
                                       println!("Audio file selected: {}", path);
                                       
                                       // Initialize audio if needed
@@ -791,20 +1152,24 @@ impl ContentView {
                                       // println!("Loading PSG file: {}", path);
                                       match psg::parse_psg(&file_data) {
                                           Ok(psg_file) => {
-                                              // Convert PSG to Value
+                                              self.psg_cache.insert(hash, psg_file.clone());
+                                              self.psg_viewer_state.entry(hash).or_default();
+                                              
+                                              // Convert PSG to Value for JSON view (fallback)
                                               if let Ok(v) = serde_json::to_value(&psg_file) {
                                                   Self::save_to_cache(hash, &v);
                                                   self.json_cache.insert(hash, v);
                                                   self.last_error = None;
                                               } else {
-                                                   self.last_error = Some("Failed to serialize PSG".to_string());
-                                                   self.failed_loads.insert(hash);
+                                                   self.last_error = Some("Failed to serialize PSG to JSON".to_string());
+                                                   // self.failed_loads.insert(hash); // Don't fail load if graph works?
                                               }
                                           },
                                           Err(e) => {
                                               // println!("PSG Parse Error: {}", e);
                                               self.last_error = Some(format!("PSG Parse Error: {}", e));
                                               self.raw_data_cache.insert(hash, file_data.clone());
+                                              self.failed_loads.insert(hash);
                                           }
                                       }
                                   } else if is_text_file(path) {
@@ -953,7 +1318,67 @@ fn is_text_file(path: &str) -> bool {
     let p = path.to_lowercase();
     p.ends_with(".txt") || p.ends_with(".xml") || p.ends_with(".ini") || 
     p.ends_with(".sh") || p.ends_with(".hlsl") || p.ends_with(".vshader") || 
-    p.ends_with(".pshader") || p.ends_with(".fx") || p.ends_with(".mat") || p.ends_with(".csv")
+    p.ends_with(".pshader") || p.ends_with(".fx") || p.ends_with(".mat") || p.ends_with(".csv") ||
+    p.ends_with(".ao") || p.ends_with(".arm") || p.ends_with(".ddt") || p.ends_with(".ecf") ||
+    p.ends_with(".et") || p.ends_with(".gft") || p.ends_with(".gt") || p.ends_with(".rs") || p.ends_with(".tsi") ||
+    // New supported text/config formats
+    p.ends_with(".amd") || p.ends_with(".pet") || p.ends_with(".trl") || p.ends_with(".tmf")
+}
+
+fn is_image_path(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.ends_with(".dds") || p.ends_with(".png") || p.ends_with(".jpg") || p.ends_with(".jpeg") || p.ends_with(".webp")
+}
+
+fn display_name_from_path(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
+        .to_string()
+}
+
+fn format_file_size(size: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+
+    let size_f = size as f64;
+    if size_f >= GB {
+        format!("{:.2} GB", size_f / GB)
+    } else if size_f >= MB {
+        format!("{:.1} MB", size_f / MB)
+    } else if size_f >= KB {
+        format!("{:.1} KB", size_f / KB)
+    } else {
+        format!("{} B", size)
+    }
+}
+
+fn file_kind_label(path: &str) -> &'static str {
+    let p = path.to_lowercase();
+    if is_image_path(&p) {
+        "IMAGE"
+    } else if p.ends_with(".ogg") || p.ends_with(".wem") || p.ends_with(".wav") {
+        "AUDIO"
+    } else if p.ends_with(".dat") || p.ends_with(".dat64") || p.ends_with(".datc64") || p.ends_with(".datl") || p.ends_with(".datl64") {
+        "DATA"
+    } else if p.ends_with(".json") || is_text_file(&p) {
+        "TEXT"
+    } else if p.ends_with(".psg") {
+        "GRAPH"
+    } else {
+        "BINARY"
+    }
+}
+
+fn is_supported_format(path: &str) -> Option<crate::parsers::FileFormat> {
+    let format = crate::parsers::FileFormat::from_extension(path);
+    if format != crate::parsers::FileFormat::Unknown {
+        Some(format)
+    } else {
+        None
+    }
 }
 
 fn decode_text_with_detection(data: &[u8]) -> String {
@@ -982,3 +1407,32 @@ fn decode_text_with_detection(data: &[u8]) -> String {
     // Default to UTF-8 lossy
     String::from_utf8_lossy(data).to_string()
 }
+
+fn parse_with_new_formats(path: &str, data: &[u8]) -> Option<crate::parsers::ParsedContent> {
+    if let Some(format) = is_supported_format(path) {
+        match crate::parsers::parse(format, data) {
+            Ok(content) => Some(content),
+            Err(_) => None, // Fallback to other viewers
+        }
+    } else {
+        None
+    }
+}
+
+fn render_parsed_content(ui: &mut egui::Ui, file_name: &str, parsed: &crate::parsers::ParsedContent) {
+    let format = crate::parsers::FileFormat::from_extension(file_name);
+
+    match format {
+        crate::parsers::FileFormat::FMT | crate::parsers::FileFormat::GT | crate::parsers::FileFormat::GFT | crate::parsers::FileFormat::ECF => {
+            GraphicsViewer::show(ui, file_name, parsed);
+        }
+        crate::parsers::FileFormat::SMD => {
+            SkeletalViewer::show(ui, file_name, parsed);
+        }
+        _ => {
+            TextConfigViewer::show(ui, file_name, parsed);
+        }
+    }
+}
+
+

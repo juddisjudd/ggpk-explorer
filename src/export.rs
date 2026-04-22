@@ -346,6 +346,8 @@ fn export_single_file(
                  std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
             }
          }
+     } else if path_str.ends_with(".png") || path_str.ends_with(".jpg") || path_str.ends_with(".jpeg") || path_str.ends_with(".webp") {
+          std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
      } else {
          std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
      }

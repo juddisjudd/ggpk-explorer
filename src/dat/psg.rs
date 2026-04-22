@@ -14,11 +14,17 @@ pub struct PsgGroup {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PsgConnection {
+    pub node_id: u32,
+    pub orbit: i32, 
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PsgNode {
     pub skill_id: u32,
     pub radius: u32,
     pub position: u32,
-    pub connections: Vec<u32>,
+    pub connections: Vec<PsgConnection>,
 }
 
 pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
@@ -87,35 +93,6 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
     let mut groups = Vec::new();
     for _ in 0..group_length {
         // Group Header: x(f32), y(f32), flag(u32, python says I?), unknown1(I), unknown2(I), passive_length(b? no, python says I at end)
-        // Python: "<ffIIbI" -> float, float, uint, uint, byte, uint ???
-        // Line 313: `x, y, flag, unknown1, unknown2, passive_length = struct.unpack_from("<ffIIbI", data`
-        // Wait, `IIbI` = 4 + 4 + 1 + 4 = 13 bytes?
-        // Let's re-read psg2.py carefully:
-        // offset += 4*2 + 4 + 4*2 + 1 
-        // 4*2 (x,y) = 8
-        // + 4 (flag?)
-        // + 4*2 (unknown1, unknown2?)
-        // + 1 (byte?)
-        // Wait, the unpack string `<ffIIbI` has 6 items.
-        // x, y = ff
-        // flag = I
-        // unknown1 = I
-        // unknown2 = b ??? No loop only has 5 vars receiving? 
-        // `x, y, flag, unknown1, unknown2, passive_length` = 6 vars.
-        // `<ffIIbI`
-        // f=4, f=4, I=4, I=4, b=1, I=4. Total = 21 bytes.
-        // Python offset increment: `offset += 4 * 2 + 4 + 4 * 2 + 1` ???
-        // 8 + 4 + 8 + 1 = 21?
-        // `4*2` (x,y)
-        // `+ 4` (flag)
-        // `+ 4*2` (unknown1, unknown2 logic mismatch? unpack string has I,I (2 ints) then b, I)
-        // If unknown1 is I, unknown2 is b? 
-        // Let's check unpack string again: `<ffIIbI`
-        // f, f, I, I, b, I
-        // 1, 2, 3, 4, 5, 6
-        // Vars: x, y, flag, unknown1, unknown2, passive_length
-        // So unknown2 matches `b` (byte)?
-        // passive_length matches `I` (uint).
         
         let x = read_f32(&mut offset)?;
         let y = read_f32(&mut offset)?;
@@ -140,8 +117,8 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
                 // Connection: connection(I), curvature(i)
                 // Python: `<Ii` = 4 + 4 = 8 bytes.
                 let conn_id = read_u32(&mut offset)?;
-                let _curvature = read_i32(&mut offset)?;
-                connections.push(conn_id);
+                let orbit = read_i32(&mut offset)?;
+                connections.push(PsgConnection { node_id: conn_id, orbit });
             }
             
             nodes.push(PsgNode {
@@ -212,6 +189,7 @@ mod tests {
         assert_eq!(result.groups.len(), 1);
         assert_eq!(result.groups[0].nodes.len(), 1);
         assert_eq!(result.groups[0].nodes[0].skill_id, 200);
-        assert_eq!(result.groups[0].nodes[0].connections[0], 300);
+        assert_eq!(result.groups[0].nodes[0].connections[0].node_id, 300);
+        assert_eq!(result.groups[0].nodes[0].connections[0].orbit, 0);
     }
 }

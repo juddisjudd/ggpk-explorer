@@ -3,6 +3,8 @@ use crate::dat::reader::DatReader;
 use crate::dat::schema::Schema;
 use eframe::egui;
 use serde_json;
+use lru::LruCache;
+use std::num::NonZeroUsize;
 
 pub struct DatViewer {
     pub schema: Option<Schema>,
@@ -10,6 +12,7 @@ pub struct DatViewer {
     pub reader: Option<DatReader>,
     pub request_update_schema: bool,
     pub error_msg: Option<String>,
+    pub row_cache: LruCache<u32, Vec<crate::dat::reader::DatValue>>,
 }
 
 impl Default for DatViewer {
@@ -20,6 +23,7 @@ impl Default for DatViewer {
             reader: None,
             request_update_schema: false,
             error_msg: None,
+            row_cache: LruCache::new(NonZeroUsize::new(5000).unwrap()),
         }
     }
 }
@@ -51,6 +55,7 @@ impl DatViewer {
 
     pub fn load_from_bytes(&mut self, data: Vec<u8>, filename: &str) {
         self.error_msg = None;
+        self.row_cache.clear();
         match DatReader::new(data, filename) {
             Ok(dat_reader) => {
                 println!("Successfully loaded DAT: {}", filename);
@@ -133,8 +138,21 @@ impl DatViewer {
                                      let row_index = row.index();
                                      row.col(|ui| { ui.label(row_index.to_string()); });
                                      
-                                     match reader.read_row(row_index as u32, table) {
-                                         Ok(values) => {
+                                     // Check cache first
+                                     let values = if let Some(cached) = self.row_cache.get(&(row_index as u32)) {
+                                         Some(cached.clone())
+                                     } else {
+                                         // Read and cache
+                                         match reader.read_row(row_index as u32, table) {
+                                             Ok(v) => {
+                                                 self.row_cache.put(row_index as u32, v.clone());
+                                                 Some(v)
+                                             },
+                                             Err(_) => None
+                                         }
+                                     };
+
+                                     if let Some(values) = values {
                                              for (col_idx, val) in values.iter().enumerate() {
                                                  row.col(|ui| {
                                                      match val {
@@ -177,12 +195,10 @@ impl DatViewer {
                                                      }
                                                  });
                                              }
-                                         },
-                                         Err(_) => {
+                                     } else {
                                               for _ in 0..table.columns.len() {
                                                   row.col(|ui| { ui.label("ERR"); });
                                               }
-                                         }
                                      }
                                  });
                              }
