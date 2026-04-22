@@ -28,16 +28,20 @@ fn main() {
     println!("cargo:rerun-if-changed={}", ooz_path.display());
 
     let mut build = cc::Build::new();
-    
+
     build
         .cpp(true)
         .std("c++17")
         .define("BUN_BUILD_DLL", "1")
         .define("OOZ_BUILD_DLL", "1") // Prevents kraken.cpp from defining main()
-        .flag("/EHsc")
-        .warnings(false) // Suppress warnings intentionally to avoid MSVC treating them as errors if configured that way, or just to clean output
+        .warnings(false)
         .include(&ooz_path)
         .include(ooz_path.join("simde"));
+
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if target_os == "windows" {
+        build.flag("/EHsc");
+    }
 
     let files = vec![
         "bun.cpp",

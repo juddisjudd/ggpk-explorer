@@ -46,4 +46,6 @@ anyhow = "1.0"
 [build-dependencies]
 cc = "1.2"
 bindgen = "0.71"
+
+[target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
