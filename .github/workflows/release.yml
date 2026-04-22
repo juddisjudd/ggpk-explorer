@@ -60,6 +60,7 @@ jobs:
             libxkbcommon-dev \
             libasound2-dev \
             libglib2.0-dev \
+            libunistring-dev \
             cmake \
             g++
 
