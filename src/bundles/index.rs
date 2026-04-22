@@ -326,7 +326,7 @@ pub fn murmur_hash64a(key: &[u8]) -> u64 {
     h
 }
 
-fn fnv1a64(key: &[u8]) -> u64 {
+pub fn fnv1a64(key: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for &byte in key {
         hash ^= byte as u64;

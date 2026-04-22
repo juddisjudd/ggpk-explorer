@@ -204,13 +204,15 @@ impl ExplorerApp {
             self.reader = None;
             self.bundle_index = None;
             self.tree_view = TreeView::default();
-            
+
             let (tx, rx) = channel();
             self.load_rx = Some(rx);
-            
+
             let path_clone = path.clone();
             let ctx_clone = ctx.clone();
-            
+            let schema_for_enrich = self.content_view.dat_viewer.schema.clone();
+            let cdn_for_enrich = self.content_view.cdn_loader.clone();
+
             thread::spawn(move || {
                 let start_total = std::time::Instant::now();
                 let result = (|| -> Result<(Arc<GgpkReader>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String> {
@@ -222,6 +224,7 @@ impl ExplorerApp {
                     let reader = Arc::new(reader_inner);
                     
                     let mut bundle_index = None;
+                    let mut raw_index: Option<crate::bundles::index::Index> = None;
                     let mut extra_status = String::new();
                     let mut found_bundle_index = false;
 
@@ -235,7 +238,7 @@ impl ExplorerApp {
                          match crate::bundles::index::Index::load_from_cache(&cache_path) {
                              Ok(index) => {
                                  println!("Index::load_from_cache took {:?}", start_cache.elapsed());
-                                 bundle_index = Some(Arc::new(index));
+                                 raw_index = Some(index);
                                  extra_status = " (Cached)".to_string();
                                  found_bundle_index = true;
                                  loaded_from_cache = true;
@@ -270,13 +273,13 @@ impl ExplorerApp {
                                                                 
 
                                                                 eprintln!("Saving Index to cache...");
-                                                                if let Err(e) = index.save_to_cache(cache_path) {
+                                                                if let Err(e) = index.save_to_cache(&cache_path) {
                                                                     println!("Failed to save cache: {}", e);
                                                                 } else {
                                                                     println!("Cache saved successfully.");
                                                                 }
-                                                                
-                                                                bundle_index = Some(Arc::new(index));
+
+                                                                raw_index = Some(index);
                                                                 extra_status = " (Bundled)".to_string();
                                                                 found_bundle_index = true;
                                                             },
@@ -299,6 +302,26 @@ impl ExplorerApp {
                         }
                     }
                     
+                    // Enrich unresolved path hashes by scanning dat file @file columns
+                    if let Some(mut index) = raw_index {
+                        let unresolved = index.files.values().filter(|f| f.path.is_empty()).count();
+                        if unresolved > 0 {
+                            if let Some(ref schema) = schema_for_enrich {
+                                let cdn_ref = cdn_for_enrich.as_ref();
+                                let enriched = crate::bundles::path_enrichment::enrich_paths_from_dat(
+                                    &mut index, schema, &*reader, cdn_ref,
+                                );
+                                if enriched > 0 {
+                                    println!("Path enrichment resolved {} new paths from dat files", enriched);
+                                    if let Err(e) = index.save_to_cache(&cache_path) {
+                                        println!("Failed to save enriched cache: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        bundle_index = Some(Arc::new(index));
+                    }
+
                     let is_poe2 = reader.version >= 4 || found_bundle_index;
                     
                     let start_tree = std::time::Instant::now();
