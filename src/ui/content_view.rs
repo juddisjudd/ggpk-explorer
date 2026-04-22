@@ -145,8 +145,10 @@ impl ContentView {
                                  if !self.json_cache.contains_key(&hash) && !self.raw_data_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
-                             } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") {
+                             } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") || file_info.path.ends_with(".mp3") {
                                  // Audio: play on demand, no auto-load needed
+                             } else if is_non_playable_media(&file_info.path) {
+                                 // Non-playable media (bk2/wem/bank/mp4): never auto-load
                              } else if is_text_file(&file_info.path) {
                                  if !self.raw_data_cache.contains_key(&hash) && file_info.file_size < 2 * 1024 * 1024 { // Auto load text < 2MB
                                      perform_load = true;
@@ -398,8 +400,10 @@ impl ContentView {
                          ui.label("Loading PSG...");
                     }
                 }
-            } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") {
+            } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") || file_info.path.ends_with(".mp3") {
                                            self.show_audio_player(ui, &reader, index, file_info, hash);
+                                      } else if is_non_playable_media(&file_info.path) {
+                                           self.show_media_stub(ui, file_info, hash);
                                       } else if is_text_file(&file_info.path) {
                                            egui::ScrollArea::vertical().show(ui, |ui| {
                                                 if let Some(data) = self.raw_data_cache.get(&hash) {
@@ -808,6 +812,102 @@ impl ContentView {
         }
     }
 
+    fn show_media_stub(&mut self, ui: &mut egui::Ui, file_info: &crate::bundles::index::FileInfo, hash: u64) {
+        ui.spacing_mut().item_spacing.y = 6.0;
+
+        let path = &file_info.path;
+        let file_name = std::path::Path::new(path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(path);
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        ui.label(
+            egui::RichText::new(file_name)
+                .size(13.0)
+                .monospace()
+                .color(egui::Color32::from_rgb(228, 228, 231)),
+        );
+
+        let (format_label, description) = match ext.as_str() {
+            "bk2" => ("BINK 2 VIDEO", "Bink 2 encoded video by RAD Game Tools. Export to play with any media player that supports .bk2 (e.g. RAD Video Tools, VLC with Bink plugin, or ffmpeg-bink)."),
+            "wem" => ("WWISE AUDIO",  "Wwise Encoded Media. Export and convert with vgmstream or ww2ogg to play as standard audio."),
+            "bank" => ("FMOD BANK",   "FMOD Sound Bank. Export and unpack with FMOD Bank Tools or fsbext to extract individual audio tracks."),
+            "mp4" => ("MP4 VIDEO",    "MPEG-4 video. Export to play in any standard media player."),
+            _     => ("MEDIA FILE",   "Export to play or inspect this file with an external tool."),
+        };
+
+        ui.label(
+            egui::RichText::new(format_label)
+                .size(10.5)
+                .monospace()
+                .color(egui::Color32::from_rgb(113, 113, 122)),
+        );
+
+        ui.add_space(8.0);
+
+        // Bink header metadata if data is cached
+        if ext == "bk2" {
+            if let Some(data) = self.raw_data_cache.get(&hash) {
+                if let Some(meta) = parse_bink_meta(data) {
+                    egui::Grid::new("bink_meta")
+                        .num_columns(2)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label(egui::RichText::new("Codec").size(11.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                            ui.label(egui::RichText::new(&meta.codec).size(11.5).monospace());
+                            ui.end_row();
+                            if let (Some(w), Some(h)) = (meta.width, meta.height) {
+                                ui.label(egui::RichText::new("Resolution").size(11.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                                ui.label(egui::RichText::new(format!("{}×{}", w, h)).size(11.5).monospace());
+                                ui.end_row();
+                            }
+                            if let Some(frames) = meta.frame_count {
+                                ui.label(egui::RichText::new("Frames").size(11.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                                ui.label(egui::RichText::new(frames.to_string()).size(11.5).monospace());
+                                ui.end_row();
+                            }
+                            if let Some(fps) = meta.fps {
+                                ui.label(egui::RichText::new("FPS").size(11.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                                ui.label(egui::RichText::new(format!("{:.2}", fps)).size(11.5).monospace());
+                                ui.end_row();
+                            }
+                            if let (Some(frames), Some(fps)) = (meta.frame_count, meta.fps) {
+                                if fps > 0.0 {
+                                    let dur = frames as f32 / fps;
+                                    ui.label(egui::RichText::new("Duration").size(11.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                                    ui.label(egui::RichText::new(format!("{:.1}s", dur)).size(11.5).monospace());
+                                    ui.end_row();
+                                }
+                            }
+                            if let Some(tracks) = meta.audio_tracks {
+                                ui.label(egui::RichText::new("Audio Tracks").size(11.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                                ui.label(egui::RichText::new(tracks.to_string()).size(11.5).monospace());
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(8.0);
+                }
+            }
+        }
+
+        if ui.button("Export File").clicked() {
+            self.export_requested = Some((vec![hash], file_info.path.clone(), None));
+        }
+
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(description)
+                .size(11.5)
+                .color(egui::Color32::from_rgb(113, 113, 122))
+                .italics(),
+        );
+    }
+
     fn show_ggpk_file(&mut self, ui: &mut egui::Ui, reader: &GgpkReader, offset: u64, is_poe2: bool) {
             match reader.read_file_record(offset) {
                 Ok(file) => {
@@ -1088,7 +1188,7 @@ impl ContentView {
                                           self.last_error = Some(msg);
                                           self.failed_loads.insert(hash);
                                       }
-                                 } else if path.ends_with(".ogg") || path.ends_with(".wav") {
+                                 } else if path.ends_with(".ogg") || path.ends_with(".wav") || path.ends_with(".mp3") {
                                       println!("Audio file selected: {}", path);
                                       
                                       // Initialize audio if needed
@@ -1316,13 +1416,71 @@ impl ContentView {
 
 fn is_text_file(path: &str) -> bool {
     let p = path.to_lowercase();
-    p.ends_with(".txt") || p.ends_with(".xml") || p.ends_with(".ini") || 
-    p.ends_with(".sh") || p.ends_with(".hlsl") || p.ends_with(".vshader") || 
+    p.ends_with(".txt") || p.ends_with(".xml") || p.ends_with(".ini") ||
+    p.ends_with(".sh") || p.ends_with(".hlsl") || p.ends_with(".vshader") ||
     p.ends_with(".pshader") || p.ends_with(".fx") || p.ends_with(".mat") || p.ends_with(".csv") ||
     p.ends_with(".ao") || p.ends_with(".arm") || p.ends_with(".ddt") || p.ends_with(".ecf") ||
     p.ends_with(".et") || p.ends_with(".gft") || p.ends_with(".gt") || p.ends_with(".rs") || p.ends_with(".tsi") ||
-    // New supported text/config formats
-    p.ends_with(".amd") || p.ends_with(".pet") || p.ends_with(".trl") || p.ends_with(".tmf")
+    p.ends_with(".amd") || p.ends_with(".pet") || p.ends_with(".trl") || p.ends_with(".tmf") ||
+    // Additional UCS-2 text config formats
+    p.ends_with(".cht") || p.ends_with(".clt") || p.ends_with(".dct") || p.ends_with(".dlp") ||
+    p.ends_with(".act") || p.ends_with(".ais") || p.ends_with(".aoc") || p.ends_with(".config") ||
+    p.ends_with(".env") || p.ends_with(".ffx") || p.ends_with(".ot") || p.ends_with(".otc") ||
+    p.ends_with(".tgt") || p.ends_with(".ui") || p.ends_with(".dgr") || p.ends_with(".sm") ||
+    p.ends_with(".tmo") || p.ends_with(".arl") || p.ends_with(".atlas") || p.ends_with(".filter") ||
+    p.ends_with(".chr") || p.ends_with(".tdf") || p.ends_with(".ot") || p.ends_with(".ais")
+}
+
+fn is_non_playable_media(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.ends_with(".bk2") || p.ends_with(".wem") || p.ends_with(".bank") || p.ends_with(".mp4")
+}
+
+struct BinkMeta {
+    codec: String,
+    frame_count: Option<u32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    fps: Option<f32>,
+    audio_tracks: Option<u32>,
+}
+
+fn parse_bink_meta(data: &[u8]) -> Option<BinkMeta> {
+    if data.len() < 4 { return None; }
+    let magic = std::str::from_utf8(&data[0..3]).ok()?;
+    let version = data[3] as char;
+    match magic {
+        "BIK" => {
+            let codec = format!("Bink 1 (v{})", version);
+            if data.len() < 44 {
+                return Some(BinkMeta { codec, frame_count: None, width: None, height: None, fps: None, audio_tracks: None });
+            }
+            let frame_count = u32::from_le_bytes(data[8..12].try_into().ok()?);
+            let width       = u32::from_le_bytes(data[20..24].try_into().ok()?);
+            let height      = u32::from_le_bytes(data[24..28].try_into().ok()?);
+            let fps_num     = u32::from_le_bytes(data[28..32].try_into().ok()?);
+            let fps_den     = u32::from_le_bytes(data[32..36].try_into().ok()?);
+            let audio_tracks = u32::from_le_bytes(data[40..44].try_into().ok()?);
+            let fps = if fps_den > 0 { Some(fps_num as f32 / fps_den as f32) } else { None };
+            Some(BinkMeta { codec, frame_count: Some(frame_count), width: Some(width), height: Some(height), fps, audio_tracks: Some(audio_tracks) })
+        }
+        "KB2" => {
+            // Bink 2: 0=magic(4), 4=filesize, 8=num_frames, 12=largest_frame, 16=fps_num, 20=fps_den, 24=flags, 28=num_audio_tracks, 32=width, 36=height
+            let codec = format!("Bink 2 (v{})", version);
+            if data.len() < 40 {
+                return Some(BinkMeta { codec, frame_count: None, width: None, height: None, fps: None, audio_tracks: None });
+            }
+            let frame_count  = u32::from_le_bytes(data[8..12].try_into().ok()?);
+            let fps_num      = u32::from_le_bytes(data[16..20].try_into().ok()?);
+            let fps_den      = u32::from_le_bytes(data[20..24].try_into().ok()?);
+            let audio_tracks = u32::from_le_bytes(data[28..32].try_into().ok()?);
+            let width        = u32::from_le_bytes(data[32..36].try_into().ok()?);
+            let height       = u32::from_le_bytes(data[36..40].try_into().ok()?);
+            let fps = if fps_den > 0 { Some(fps_num as f32 / fps_den as f32) } else { None };
+            Some(BinkMeta { codec, frame_count: Some(frame_count), width: Some(width), height: Some(height), fps, audio_tracks: Some(audio_tracks) })
+        }
+        _ => None,
+    }
 }
 
 fn is_image_path(path: &str) -> bool {
@@ -1359,7 +1517,9 @@ fn file_kind_label(path: &str) -> &'static str {
     let p = path.to_lowercase();
     if is_image_path(&p) {
         "IMAGE"
-    } else if p.ends_with(".ogg") || p.ends_with(".wem") || p.ends_with(".wav") {
+    } else if p.ends_with(".bk2") || p.ends_with(".mp4") {
+        "VIDEO"
+    } else if p.ends_with(".ogg") || p.ends_with(".wem") || p.ends_with(".wav") || p.ends_with(".mp3") || p.ends_with(".bank") {
         "AUDIO"
     } else if p.ends_with(".dat") || p.ends_with(".dat64") || p.ends_with(".datc64") || p.ends_with(".datl") || p.ends_with(".datl64") {
         "DATA"
