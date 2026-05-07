@@ -23,6 +23,7 @@ use std::thread;
 
 pub struct ExplorerApp {
     reader: Option<Arc<GgpkReader>>,
+    steam_loader: Option<Arc<crate::bundles::steam::SteamBundleLoader>>,
     tree_view: TreeView,
     pub content_view: ContentView,
     pub status_msg: String,
@@ -31,7 +32,7 @@ pub struct ExplorerApp {
     pub bundle_index: Option<Arc<crate::bundles::index::Index>>,
     
 
-    load_rx: Option<Receiver<Result<(Arc<GgpkReader>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String>>>,
+    load_rx: Option<Receiver<Result<(Option<Arc<GgpkReader>>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String>>>,
     pub patch_version_rx: Option<Receiver<Result<String, String>>>,
     pub schema_update_rx: Option<Receiver<Result<String, String>>>,
     pub schema_check_rx: Option<Receiver<Result<i64, String>>>,
@@ -103,6 +104,7 @@ impl ExplorerApp {
 
         let mut app = Self {
             reader: None,
+            steam_loader: None,
             tree_view: TreeView::default(),
             content_view,
             status_msg: "Ready".into(),
@@ -128,10 +130,18 @@ impl ExplorerApp {
         };
 
 
-        if let Some(path) = &app.settings.ggpk_path {
-            let p = std::path::PathBuf::from(path);
+        if let Some(path) = app.settings.steam_path.clone() {
+            let p = std::path::PathBuf::from(&path);
+            if p.join("_.index.bin").exists() {
+                app.open_steam_path(p.clone(), &_cc.egui_ctx);
+                let loader = crate::bundles::steam::SteamBundleLoader::new(p.clone());
+                app.steam_loader = Some(std::sync::Arc::new(loader.clone()));
+                app.content_view.set_steam_loader(loader);
+            }
+        } else if let Some(path) = app.settings.ggpk_path.clone() {
+            let p = std::path::PathBuf::from(&path);
             if p.exists() {
-               app.open_ggpk_path(p, &_cc.egui_ctx);
+                app.open_ggpk_path(p, &_cc.egui_ctx);
             }
         }
 
@@ -153,7 +163,10 @@ impl ExplorerApp {
     fn open_ggpk(&mut self, ctx: &egui::Context) {
         if let Some(path) = FileDialog::new().add_filter("GGPK", &["ggpk"]).pick_file() {
             self.settings.ggpk_path = Some(path.to_string_lossy().to_string());
+            self.settings.steam_path = None;
             self.settings.save();
+            self.steam_loader = None;
+            self.content_view.steam_loader = None;
             self.open_ggpk_path(path, ctx);
         }
     }
@@ -215,7 +228,7 @@ impl ExplorerApp {
 
             thread::spawn(move || {
                 let start_total = std::time::Instant::now();
-                let result = (|| -> Result<(Arc<GgpkReader>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String> {
+                let result = (|| -> Result<(Option<Arc<GgpkReader>>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String> {
                     let start_open = std::time::Instant::now();
                     let reader_inner = GgpkReader::open(&path_clone)
                         .map_err(|e| format!("Failed to open GGPK: {}", e))?;
@@ -309,7 +322,7 @@ impl ExplorerApp {
                             if let Some(ref schema) = schema_for_enrich {
                                 let cdn_ref = cdn_for_enrich.as_ref();
                                 let enriched = crate::bundles::path_enrichment::enrich_paths_from_dat(
-                                    &mut index, schema, &*reader, cdn_ref,
+                                    &mut index, schema, Some(&*reader), cdn_ref, None,
                                 );
                                 if enriched > 0 {
                                     println!("Path enrichment resolved {} new paths from dat files", enriched);
@@ -326,20 +339,106 @@ impl ExplorerApp {
                     
                     let start_tree = std::time::Instant::now();
                     let tree_view = if let Some(idx) = &bundle_index {
-                        TreeView::new_bundled(reader.clone(), idx)
+                        TreeView::new_bundled(Some(reader.clone()), idx)
                     } else {
                         TreeView::new(reader.clone())
                     };
                     println!("TreeView creation took {:?}", start_tree.elapsed());
-                    
+
                     println!("Total Loading Thread took {:?}", start_total.elapsed());
-                    
-                    Ok((reader, bundle_index, is_poe2, path_clone, extra_status, tree_view))
+
+                    Ok((Some(reader), bundle_index, is_poe2, path_clone, extra_status, tree_view))
                 })();
                 
                 let _ = tx.send(result);
                 ctx_clone.request_repaint();
             });
+    }
+
+    fn open_steam_dir(&mut self, ctx: &egui::Context) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Select Path of Exile 2 folder or Bundles2 subfolder")
+            .pick_folder()
+        {
+            // Accept either the game root (containing Bundles2/) or Bundles2/ directly
+            let bundles2 = if path.join("Bundles2").join("_.index.bin").exists() {
+                path.join("Bundles2")
+            } else if path.join("_.index.bin").exists() {
+                path.clone()
+            } else {
+                self.status_msg = "No _.index.bin found — select the game root or its Bundles2 folder".to_string();
+                return;
+            };
+            self.settings.steam_path = Some(bundles2.to_string_lossy().to_string());
+            self.settings.ggpk_path = None;
+            self.settings.save();
+            self.reader = None;
+            self.open_steam_path(bundles2, ctx);
+        }
+    }
+
+    fn open_steam_path(&mut self, bundles2_dir: std::path::PathBuf, ctx: &egui::Context) {
+        self.status_msg = format!("Loading Steam bundles from {}...", bundles2_dir.display());
+        self.is_loading = true;
+        self.reader = None;
+        self.steam_loader = None;
+        self.bundle_index = None;
+        self.tree_view = TreeView::default();
+
+        let (tx, rx) = channel();
+        self.load_rx = Some(rx);
+
+        let ctx_clone = ctx.clone();
+        let path_clone = bundles2_dir.clone();
+        let schema_for_enrich = self.content_view.dat_viewer.schema.clone();
+
+        thread::spawn(move || {
+            let result = (|| -> Result<(Option<Arc<GgpkReader>>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String> {
+                let steam = crate::bundles::steam::SteamBundleLoader::new(path_clone.clone());
+
+                let index_bytes = steam.load_index_bytes()
+                    .map_err(|e| format!("Failed to read _.index.bin: {}", e))?;
+
+                // The index.bin is itself a bundle — decompress it
+                let mut cursor = std::io::Cursor::new(&index_bytes);
+                let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor)
+                    .map_err(|e| format!("Bundle header error: {}", e))?;
+                let decompressed = bundle.decompress(&mut cursor)
+                    .map_err(|e| format!("Decompress error: {}", e))?;
+
+                let mut index = crate::bundles::index::Index::read(&decompressed)
+                    .map_err(|e| format!("Index parse error: {}", e))?;
+
+                // Path enrichment from dat files
+                if let Some(ref schema) = schema_for_enrich {
+                    let unresolved = index.files.values().filter(|f| f.path.is_empty()).count();
+                    if unresolved > 0 {
+                        let enriched = crate::bundles::path_enrichment::enrich_paths_from_dat(
+                            &mut index, schema, None, None, Some(&steam),
+                        );
+                        if enriched > 0 {
+                            println!("Steam path enrichment resolved {} paths", enriched);
+                        }
+                    }
+                }
+
+                // Inject loose files from the game root (Art/, etc.) so they appear in the tree
+                steam.add_loose_files_to_index(&mut index);
+
+                let tree_view = TreeView::new_bundled(None, &index);
+                let bundle_index = Some(Arc::new(index));
+
+                Ok((None, bundle_index, true, path_clone, " (Steam)".to_string(), tree_view))
+            })();
+
+            let _ = tx.send(result);
+            ctx_clone.request_repaint();
+        });
+
+        // Store the loader so content_view can use it for file reads
+        let loader = crate::bundles::steam::SteamBundleLoader::new(bundles2_dir);
+        self.steam_loader = Some(Arc::new(loader.clone()));
+        self.content_view.set_steam_loader(loader);
     }
 
     fn current_location_label(&self) -> String {
@@ -361,7 +460,7 @@ impl ExplorerApp {
                 if self.reader.is_some() {
                     "Folder: Bundles".to_string()
                 } else {
-                    "No gppk mounted".to_string()
+                    "No data source loaded".to_string()
                 }
             }
         }
@@ -471,7 +570,7 @@ impl ExplorerApp {
                                     .size(11.5),
                             );
                             ui.add_space(10.0);
-                            inspector_kv(ui, "Type", "ggpk file");
+                            inspector_kv(ui, "Type", "raw record");
                             inspector_kv(ui, "Offset", &format!("0x{:x}", offset));
                         }
                         None => {
@@ -605,17 +704,19 @@ impl eframe::App for ExplorerApp {
                          self.load_rx = None;
                          
                          match result {
-                             Ok((reader, index, is_poe2, path, extra_status, tree_view)) => {
-                                 // Update state with result
-                                 self.reader = Some(reader.clone());
+                             Ok((reader_opt, index, is_poe2, path, extra_status, tree_view)) => {
+                                 self.reader = reader_opt.clone();
                                  self.bundle_index = index;
                                  self.is_poe2 = is_poe2;
                                  self.tree_view = tree_view;
                                  self.command_palette_needs_refresh = true;
-                                 
-                                 let version = reader.version;
-                                 let game_ver = if self.is_poe2 { "PoE 2" } else { "PoE 1" };
-                                 println!("Opened {:?} (v{}, {}){}", path, version, game_ver, extra_status);
+
+                                 if let Some(reader) = &reader_opt {
+                                     let game_ver = if self.is_poe2 { "PoE 2" } else { "PoE 1" };
+                                     println!("Opened {:?} (v{}, {}){}", path, reader.version, game_ver, extra_status);
+                                 } else {
+                                     println!("Opened Steam directory {:?}{}", path, extra_status);
+                                 }
                                  self.status_msg = String::new();
                              },
                              Err(e) => {
@@ -635,17 +736,21 @@ impl eframe::App for ExplorerApp {
         }
         
     
+        let is_loaded = self.reader.is_some() || self.bundle_index.is_some();
         let chrome_actions = crate::ui::chrome::AppChrome::show(
             ctx,
             &self.current_location_label(),
             &self.status_msg,
-            self.reader.is_some(),
+            is_loaded,
             self.is_loading,
             &mut self.inspector_open,
         );
 
         if chrome_actions.open_ggpk {
             self.open_ggpk(ctx);
+        }
+        if chrome_actions.open_steam {
+            self.open_steam_dir(ctx);
         }
         if chrome_actions.open_settings {
             self.settings_window.open();
@@ -673,7 +778,7 @@ impl eframe::App for ExplorerApp {
             ctx,
             &self.status_msg,
             self.is_loading,
-            self.reader.is_some(),
+            self.reader.is_some() || self.bundle_index.is_some(),
             &poe_version,
             &schema_date
         );
@@ -760,7 +865,7 @@ impl eframe::App for ExplorerApp {
         }
 
         // Sidebar
-        let reader_available = self.reader.is_some();
+        let reader_available = self.reader.is_some() || self.bundle_index.is_some();
         let schema_ref = self.content_view.dat_viewer.schema.as_ref();
         
         crate::ui::sidebar::Sidebar::show(
@@ -779,21 +884,21 @@ impl eframe::App for ExplorerApp {
 
         // Central Panel
         egui::CentralPanel::default().show(ctx, |ui| {
-             if let Some(reader) = &self.reader {
-                 self.content_view.show(ui, reader.clone(), self.selected_file.clone(), self.is_poe2, &self.bundle_index);
+             if self.reader.is_some() || self.bundle_index.is_some() {
+                 self.content_view.show(ui, self.reader.clone(), self.selected_file.clone(), self.is_poe2, &self.bundle_index);
              } else {
                  ui.centered_and_justified(|ui| {
                      if self.is_loading {
                         ui.label(
-                            egui::RichText::new("Mounting GGPK...")
+                            egui::RichText::new("Loading game data...")
                                 .color(egui::Color32::from_rgb(126, 126, 134)),
                         );
                      } else {
                          crate::ui::components::card(ui, |ui| {
                              ui.vertical_centered(|ui| {
-                                 ui.heading("Open a Content.ggpk file to begin");
+                                 ui.heading("Open a GGPK file or Steam folder to begin");
                                  ui.add_space(6.0);
-                                 ui.label("The reference design is mostly about layout rhythm, spacing, and hierarchy. This build now uses the same direction inside egui.");
+                                 ui.label("Use File → Open GGPK... for the standalone installer, or File → Open Steam Folder... for the Steam version.");
                              });
                          });
                      }

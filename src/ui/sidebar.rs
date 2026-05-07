@@ -125,7 +125,7 @@ impl Sidebar {
                 });
             } else {
                  ui.centered_and_justified(|ui| {
-                    ui.label("No GGPK loaded");
+                    ui.label("No data loaded");
                  });
             }
         });

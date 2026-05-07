@@ -2,6 +2,7 @@ use eframe::egui;
 
 pub struct ChromeActions {
     pub open_ggpk: bool,
+    pub open_steam: bool,
     pub open_settings: bool,
     pub open_about: bool,
     pub open_command_palette: bool,
@@ -12,6 +13,7 @@ impl ChromeActions {
     fn new() -> Self {
         Self {
             open_ggpk: false,
+            open_steam: false,
             open_settings: false,
             open_about: false,
             open_command_palette: false,
@@ -239,10 +241,15 @@ impl AppChrome {
                         ui.add_space(10.0);
 
                         let mut open_ggpk = false;
+                        let mut open_steam = false;
                         let mut toggle_inspector = false;
                         Self::nav_button_menu(ui, "File", |ui| {
                             if ui.button("Open GGPK...").clicked() {
                                 open_ggpk = true;
+                                ui.close_menu();
+                            }
+                            if ui.button("Open Steam Folder...").clicked() {
+                                open_steam = true;
                                 ui.close_menu();
                             }
                             ui.separator();
@@ -258,6 +265,9 @@ impl AppChrome {
                         });
                         if open_ggpk {
                             actions.open_ggpk = true;
+                        }
+                        if open_steam {
+                            actions.open_steam = true;
                         }
                         if toggle_inspector {
                             actions.toggle_inspector = true;

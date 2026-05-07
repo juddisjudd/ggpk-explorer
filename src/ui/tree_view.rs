@@ -73,17 +73,17 @@ impl TreeView {
         }
     }
 
-    pub fn new_bundled(reader: Arc<GgpkReader>, index: &Index) -> Self {
+    pub fn new_bundled(reader: Option<Arc<GgpkReader>>, index: &Index) -> Self {
         let nodes = Self::build_flat_tree(index);
         let root_id = if nodes.is_empty() { None } else { Some(0) };
-        
+
         let (tx, rx) = channel();
-        
-        Self { 
-            reader: Some(reader), 
+
+        Self {
+            reader,
             nodes,
             root_id,
-            search_tx: Some(tx), 
+            search_tx: Some(tx),
             search_rx: Some(rx),
             ..Default::default()
         }

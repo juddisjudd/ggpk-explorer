@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use crate::bundles::index::{Index, FileInfo, BundleInfo, murmur_hash64a, fnv1a64};
 use crate::bundles::cdn::CdnBundleLoader;
+use crate::bundles::steam::SteamBundleLoader;
 use crate::dat::reader::{DatReader, DatValue};
 use crate::dat::schema::Schema;
 use crate::ggpk::reader::GgpkReader;
@@ -97,8 +98,9 @@ static DAT_FILE_FIELDS: &[(&str, &[&str])] = &[
 pub fn enrich_paths_from_dat(
     index: &mut Index,
     schema: &Schema,
-    reader: &GgpkReader,
+    reader: Option<&GgpkReader>,
     cdn_loader: Option<&CdnBundleLoader>,
+    steam_loader: Option<&SteamBundleLoader>,
 ) -> u32 {
     let mut resolved = 0u32;
     // Bundle decompression cache keyed by bundle_index — avoids re-decompressing
@@ -139,7 +141,7 @@ pub fn enrich_paths_from_dat(
 
         // Load file bytes using cached bundle decompression
         let dat_bytes = match load_file_bytes_cached(
-            &dat_file_info, &index.bundles, reader, cdn_loader, &mut bundle_cache,
+            &dat_file_info, &index.bundles, reader, cdn_loader, steam_loader, &mut bundle_cache,
         ) {
             Some(b) => b,
             None => continue,
@@ -227,8 +229,9 @@ fn try_resolve(index: &mut Index, path: &str) -> bool {
 fn load_file_bytes_cached(
     file_info: &FileInfo,
     bundles: &[BundleInfo],
-    reader: &GgpkReader,
+    reader: Option<&GgpkReader>,
     cdn_loader: Option<&CdnBundleLoader>,
+    steam_loader: Option<&SteamBundleLoader>,
     bundle_cache: &mut HashMap<u32, Vec<u8>>,
 ) -> Option<Vec<u8>> {
     let bi = file_info.bundle_index;
@@ -237,7 +240,7 @@ fn load_file_bytes_cached(
         cached
     } else {
         let bundle_info = bundles.get(bi as usize)?;
-        let raw = fetch_raw_bundle(bundle_info, reader, cdn_loader)?;
+        let raw = fetch_raw_bundle(bundle_info, reader, cdn_loader, steam_loader)?;
         let mut cursor = std::io::Cursor::new(raw);
         let header = crate::bundles::bundle::Bundle::read_header(&mut cursor).ok()?;
         let data = header.decompress(&mut cursor).ok()?;
@@ -256,18 +259,27 @@ fn load_file_bytes_cached(
 
 fn fetch_raw_bundle(
     bundle_info: &BundleInfo,
-    reader: &GgpkReader,
+    reader: Option<&GgpkReader>,
     cdn_loader: Option<&CdnBundleLoader>,
+    steam_loader: Option<&SteamBundleLoader>,
 ) -> Option<Vec<u8>> {
     // Try GGPK first
-    for cand in &[
-        format!("Bundles2/{}", bundle_info.name),
-        format!("Bundles2/{}.bundle.bin", bundle_info.name),
-    ] {
-        if let Ok(Some(rec)) = reader.read_file_by_path(cand) {
-            if let Ok(data) = reader.get_data_slice(rec.data_offset, rec.data_length) {
-                return Some(data.to_vec());
+    if let Some(reader) = reader {
+        for cand in &[
+            format!("Bundles2/{}", bundle_info.name),
+            format!("Bundles2/{}.bundle.bin", bundle_info.name),
+        ] {
+            if let Ok(Some(rec)) = reader.read_file_by_path(cand) {
+                if let Ok(data) = reader.get_data_slice(rec.data_offset, rec.data_length) {
+                    return Some(data.to_vec());
+                }
             }
+        }
+    }
+    // Try Steam directory
+    if let Some(steam) = steam_loader {
+        if let Ok(data) = steam.fetch_bundle(&bundle_info.name) {
+            return Some(data);
         }
     }
     // Fallback to CDN

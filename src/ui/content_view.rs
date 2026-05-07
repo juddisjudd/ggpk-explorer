@@ -1,11 +1,5 @@
 use eframe::egui;
 use crate::ggpk::reader::GgpkReader;
-// FileRecord is used in other modules but maybe not explicitly here if inferred?
-// Wait, I use FileRecord in found_record return type?
-// found_record is Option<FileRecord>.
-// So I DO need FileRecord visible?
-// The warning said `unused import`.
-// Maybe it's available via GgpkReader preamble or just not needed if I don't name the type?
 use std::collections::HashMap;
 
 use crate::ui::dat_viewer::DatViewer;
@@ -44,6 +38,7 @@ pub struct ContentView {
     image_view_states: HashMap<u64, ImageViewState>,
 
     pub cdn_loader: Option<crate::bundles::cdn::CdnBundleLoader>,
+    pub steam_loader: Option<crate::bundles::steam::SteamBundleLoader>,
     pub audio_volume: f32,
 
     pub export_requested: Option<(Vec<u64>, String, Option<crate::ui::export_window::ExportSettings>)>,
@@ -73,6 +68,7 @@ impl Default for ContentView {
             image_view_states: HashMap::new(),
 
             cdn_loader: None,
+            steam_loader: None,
             audio_volume: 0.5,
             export_requested: None,
             selection_requested: None,
@@ -94,6 +90,10 @@ impl ContentView {
         self.cdn_loader = Some(loader);
     }
 
+    pub fn set_steam_loader(&mut self, loader: crate::bundles::steam::SteamBundleLoader) {
+        self.steam_loader = Some(loader);
+    }
+
     pub fn update_cdn_version(&mut self, ver: &str) {
         if let Some(loader) = &mut self.cdn_loader {
             loader.set_patch_version(ver);
@@ -104,11 +104,13 @@ impl ContentView {
         self.dat_viewer.set_schema(schema, created_at);
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, reader: std::sync::Arc<crate::ggpk::reader::GgpkReader>, selection: Option<FileSelection>, is_poe2: bool, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>) {
+    pub fn show(&mut self, ui: &mut egui::Ui, reader: Option<std::sync::Arc<crate::ggpk::reader::GgpkReader>>, selection: Option<FileSelection>, is_poe2: bool, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>) {
         if let Some(selection) = selection {
             match selection {
                 FileSelection::GgpkOffset(offset) => {
-                    self.show_ggpk_file(ui, &reader, offset, is_poe2);
+                    if let Some(reader) = &reader {
+                        self.show_ggpk_file(ui, reader, offset, is_poe2);
+                    }
                 },
                  FileSelection::Folder { hashes, name, path } => {
                      self.show_folder_list(ui, bundle_index, hashes, name, path);
@@ -181,7 +183,7 @@ impl ContentView {
                              ui.separator();
 
                              if perform_load {
-                                 self.load_bundled_content(ui.ctx(), &reader, index, file_info, hash);
+                                 self.load_bundled_content(ui.ctx(), reader.as_deref(), index, file_info, hash);
                              }
                              
                              if file_info.path.ends_with(".dat") || file_info.path.ends_with(".dat64") || file_info.path.ends_with(".datc64") || file_info.path.ends_with(".datl") || file_info.path.ends_with(".datl64") {
@@ -401,9 +403,9 @@ impl ContentView {
                     }
                 }
             } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") || file_info.path.ends_with(".mp3") {
-                                           self.show_audio_player(ui, &reader, index, file_info, hash);
+                                           self.show_audio_player(ui, reader.as_deref(), index, file_info, hash);
                                       } else if is_non_playable_media(&file_info.path) {
-                                           self.show_media_stub(ui, file_info, hash);
+                                           self.show_media_stub(ui, file_info, hash, reader.as_deref(), bundle_index.as_ref().map(|i| i.as_ref()));
                                       } else if is_text_file(&file_info.path) {
                                            egui::ScrollArea::vertical().show(ui, |ui| {
                                                 if let Some(data) = self.raw_data_cache.get(&hash) {
@@ -708,7 +710,7 @@ impl ContentView {
         rows
     }
 
-    fn show_audio_player(&mut self, ui: &mut egui::Ui, reader: &GgpkReader, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
+    fn show_audio_player(&mut self, ui: &mut egui::Ui, reader: Option<&GgpkReader>, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
         ui.spacing_mut().item_spacing.y = 6.0;
 
         let file_name = std::path::Path::new(&file_info.path)
@@ -812,7 +814,7 @@ impl ContentView {
         }
     }
 
-    fn show_media_stub(&mut self, ui: &mut egui::Ui, file_info: &crate::bundles::index::FileInfo, hash: u64) {
+    fn show_media_stub(&mut self, ui: &mut egui::Ui, file_info: &crate::bundles::index::FileInfo, hash: u64, reader: Option<&GgpkReader>, index: Option<&crate::bundles::index::Index>) {
         ui.spacing_mut().item_spacing.y = 6.0;
 
         let path = &file_info.path;
@@ -834,7 +836,7 @@ impl ContentView {
         );
 
         let (format_label, description) = match ext.as_str() {
-            "bk2" => ("BINK 2 VIDEO", "Bink 2 encoded video by RAD Game Tools. Export to play with any media player that supports .bk2 (e.g. RAD Video Tools, VLC with Bink plugin, or ffmpeg-bink)."),
+            "bk2" => ("BINK 2 VIDEO", "Bink 2 encoded video. Played via RAD Video Tools (binkplay.exe), ffplay, or your system default."),
             "wem" => ("WWISE AUDIO",  "Wwise Encoded Media. Export and convert with vgmstream or ww2ogg to play as standard audio."),
             "bank" => ("FMOD BANK",   "FMOD Sound Bank. Export and unpack with FMOD Bank Tools or fsbext to extract individual audio tracks."),
             "mp4" => ("MP4 VIDEO",    "MPEG-4 video. Export to play in any standard media player."),
@@ -895,9 +897,48 @@ impl ContentView {
             }
         }
 
-        if ui.button("Export File").clicked() {
-            self.export_requested = Some((vec![hash], file_info.path.clone(), None));
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Export File").clicked() {
+                self.export_requested = Some((vec![hash], file_info.path.clone(), None));
+            }
+
+            if ext == "bk2" && ui.button("▶  Play").clicked() {
+                let game_root = self.steam_loader.as_ref().map(|s| s.game_root());
+                // 1. Try loose file on disk (Steam install)
+                let loose = self.steam_loader.as_ref()
+                    .and_then(|s| s.loose_file_path(&file_info.path));
+                if let Some(loose_path) = loose {
+                    if let Err(e) = launch_bink_player(&loose_path, game_root.as_deref()) {
+                        self.last_error = Some(format!("Play failed: {}", e));
+                    }
+                } else {
+                    // 2. Extract from bundle to temp then play
+                    let file_name = std::path::Path::new(&file_info.path)
+                        .file_name()
+                        .map(|n| n.to_os_string())
+                        .unwrap_or_else(|| std::ffi::OsString::from("video.bk2"));
+                    let temp_path = std::env::temp_dir().join(file_name);
+
+                    // Load bytes synchronously from cache or bundle
+                    let bytes = self.raw_data_cache.get(&hash).cloned()
+                        .or_else(|| extract_bundle_file_sync(file_info, index?, reader, self.steam_loader.as_ref()));
+
+                    match bytes {
+                        Some(data) => {
+                            match std::fs::write(&temp_path, &data) {
+                                Ok(_) => {
+                                    if let Err(e) = launch_bink_player(&temp_path, game_root.as_deref()) {
+                                        self.last_error = Some(format!("Play failed: {}", e));
+                                    }
+                                }
+                                Err(e) => self.last_error = Some(format!("Temp write failed: {}", e)),
+                            }
+                        }
+                        None => self.last_error = Some("Could not read file data from bundle".to_string()),
+                    }
+                }
+            }
+        });
 
         ui.add_space(10.0);
         ui.label(
@@ -1008,7 +1049,7 @@ impl ContentView {
         }
     }
 
-    pub fn load_bundled_content(&mut self, ctx: &egui::Context, reader: &GgpkReader, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
+    pub fn load_bundled_content(&mut self, ctx: &egui::Context, reader: Option<&GgpkReader>, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
          // Reset previous state
          self.dat_viewer.reader = None;
          self.dat_viewer.error_msg = None;
@@ -1022,25 +1063,57 @@ impl ContentView {
              }
          }
 
+         // Loose file (Steam Art/ directory) — read directly from disk
+         if file_info.bundle_index == crate::bundles::steam::LOOSE_FILE_SENTINEL {
+             if let Some(steam) = &self.steam_loader {
+                 if let Some(loose_path) = steam.loose_file_path(&file_info.path) {
+                     match std::fs::read(&loose_path) {
+                         Ok(data) => {
+                             self.raw_data_cache.insert(hash, data);
+                             self.failed_loads.remove(&hash);
+                             self.last_error = None;
+                         }
+                         Err(e) => {
+                             self.last_error = Some(format!("Failed to read loose file: {}", e));
+                             self.failed_loads.insert(hash);
+                         }
+                     }
+                 } else {
+                     self.last_error = Some(format!("Loose file not found on disk: {}", file_info.path));
+                     self.failed_loads.insert(hash);
+                 }
+             }
+             return;
+         }
+
          if let Some(bundle_info) = index.bundles.get(file_info.bundle_index as usize) {
              let mut raw_bundle_data: Option<Vec<u8>> = None;
-             
-             // 1. Try Local GGPK
-             // Candidate paths to try
-             let candidates = vec![
-                 format!("Bundles2/{}", bundle_info.name),
-                 format!("Bundles2/{}.bundle.bin", bundle_info.name),
-                 bundle_info.name.clone(),
-                 format!("{}.bundle.bin", bundle_info.name),
-             ];
 
-             for cand in &candidates {
-                 // println!("Attempting to load bundle from GGPK: {}", cand);
-                 if let Ok(Some(rec)) = reader.read_file_by_path(cand) {
-                     println!("Bundle found in GGPK: {}", cand);
-                     if let Ok(data) = reader.get_data_slice(rec.data_offset, rec.data_length) {
-                         raw_bundle_data = Some(data.to_vec());
-                         break;
+             // 1. Try Local GGPK
+             if let Some(reader) = reader {
+                 let candidates = vec![
+                     format!("Bundles2/{}", bundle_info.name),
+                     format!("Bundles2/{}.bundle.bin", bundle_info.name),
+                     bundle_info.name.clone(),
+                     format!("{}.bundle.bin", bundle_info.name),
+                 ];
+                 for cand in &candidates {
+                     if let Ok(Some(rec)) = reader.read_file_by_path(cand) {
+                         println!("Bundle found in GGPK: {}", cand);
+                         if let Ok(data) = reader.get_data_slice(rec.data_offset, rec.data_length) {
+                             raw_bundle_data = Some(data.to_vec());
+                             break;
+                         }
+                     }
+                 }
+             }
+
+             // 1.5. Try Steam directory
+             if raw_bundle_data.is_none() {
+                 if let Some(steam) = &self.steam_loader {
+                     if let Ok(data) = steam.fetch_bundle(&bundle_info.name) {
+                         println!("Bundle found in Steam dir: {}", bundle_info.name);
+                         raw_bundle_data = Some(data);
                      }
                  }
              }
@@ -1577,6 +1650,106 @@ fn parse_with_new_formats(path: &str, data: &[u8]) -> Option<crate::parsers::Par
     } else {
         None
     }
+}
+
+fn launch_bink_player(path: &std::path::Path, _game_root: Option<&std::path::Path>) -> Result<(), String> {
+    let path_str = path.to_string_lossy().into_owned();
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        let raw_tail = format!(r#""{}" /W1280 /H720"#, path_str);
+
+        let try_binkplay = |exe: &std::path::Path| -> bool {
+            if !exe.exists() {
+                return false;
+            }
+            std::process::Command::new(exe)
+                .raw_arg(&raw_tail)
+                .spawn()
+                .is_ok()
+        };
+
+        let rad_paths = [
+            r"C:\Program Files\RADVideo\binkplay.exe",
+            r"C:\Program Files (x86)\RADVideo\binkplay.exe",
+            r"C:\Program Files\RAD Game Tools\binkplay.exe",
+            r"C:\Program Files (x86)\RAD Game Tools\binkplay.exe",
+        ];
+        for loc in &rad_paths {
+            if try_binkplay(std::path::Path::new(loc)) {
+                return Ok(());
+            }
+        }
+    }
+
+    if std::process::Command::new("ffplay")
+        .args(["-autoexit", "-x", "1280", "-y", "720", "-window_title", "BK2 Preview"])
+        .arg(&path_str)
+        .spawn()
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // mpv — common on Linux/macOS, backed by ffmpeg so Bink 2 works
+    #[cfg(not(target_os = "windows"))]
+    if std::process::Command::new("mpv")
+        .args(["--autofit=1280x720", "--title=BK2 Preview"])
+        .arg(&path_str)
+        .spawn()
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // vlc — widely available Linux/macOS fallback
+    #[cfg(not(target_os = "windows"))]
+    if std::process::Command::new("vlc")
+        .arg(&path_str)
+        .spawn()
+        .is_ok()
+    {
+        return Ok(());
+    }
+
+    // Last resort: system default handler (ShellExecute on Windows, xdg-open on Linux,
+    // open on macOS). On Windows this respects the .bk2 file-type association set by
+    // the RAD installer, which is equivalent to double-clicking the file in Explorer.
+    open::that(path).map_err(|e| e.to_string())
+}
+
+/// Synchronously extracts one file from the bundle system without going through the cache.
+fn extract_bundle_file_sync(
+    file_info: &crate::bundles::index::FileInfo,
+    index: &crate::bundles::index::Index,
+    reader: Option<&GgpkReader>,
+    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+) -> Option<Vec<u8>> {
+    let bundle_info = index.bundles.get(file_info.bundle_index as usize)?;
+
+    let raw = if let Some(reader) = reader {
+        let candidates = [
+            format!("Bundles2/{}", bundle_info.name),
+            format!("Bundles2/{}.bundle.bin", bundle_info.name),
+        ];
+        candidates.iter().find_map(|c| {
+            reader.read_file_by_path(c).ok().flatten().and_then(|rec| {
+                reader.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec())
+            })
+        })
+    } else {
+        None
+    }
+    .or_else(|| steam_loader.and_then(|s| s.fetch_bundle(&bundle_info.name).ok()))?;
+
+    let mut cursor = std::io::Cursor::new(raw);
+    let header = crate::bundles::bundle::Bundle::read_header(&mut cursor).ok()?;
+    let data = header.decompress(&mut cursor).ok()?;
+    let start = file_info.file_offset as usize;
+    let end = start + file_info.file_size as usize;
+    if end <= data.len() { Some(data[start..end].to_vec()) } else { None }
 }
 
 fn render_parsed_content(ui: &mut egui::Ui, file_name: &str, parsed: &crate::parsers::ParsedContent) {

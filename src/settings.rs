@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppSettings {
     pub ggpk_path: Option<String>,
+    #[serde(default)]
+    pub steam_path: Option<String>,
     pub recent_files: Vec<String>,
     #[serde(default = "default_patch_version")]
     pub poe2_patch_version: String,
@@ -36,6 +38,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             ggpk_path: None,
+            steam_path: None,
             recent_files: Vec::new(),
             poe2_patch_version: default_patch_version(),
             patch_version_source_url: default_patch_source(),
