@@ -20,6 +20,7 @@ pub fn run_export(
     settings: ExportSettings,
     target_dir: PathBuf,
     cdn_loader: Option<crate::bundles::cdn::CdnBundleLoader>,
+    steam_loader: Option<crate::bundles::steam::SteamBundleLoader>,
     schema: Option<Schema>,
     tx: Sender<ExportStatus>,
     _cancel_flag: Option<Arc<AtomicBool>>, // Future proofing for cancellation
@@ -41,6 +42,7 @@ pub fn run_export(
                 &settings, 
                 &target_dir, 
                 &cdn_loader, 
+                &steam_loader,
                 &schema
             ) {
                 Ok(name) => Ok(name),
@@ -113,93 +115,94 @@ fn export_single_file(
     settings: &ExportSettings,
     target_dir: &Path,
     cdn_loader: &Option<crate::bundles::cdn::CdnBundleLoader>,
+    steam_loader: &Option<crate::bundles::steam::SteamBundleLoader>,
     schema: &Option<Schema>,
 ) -> Result<String, String> {
-    
-    // 1. Identify File Info
-    // This part logic is taken from app.rs but needs to be adapted to look up by hash
-    // The previous app.rs logic iterated hashes and then looked up in index.
-    
-    let file_info = if let Some(idx) = bundle_index {
-        idx.files.get(&hash).ok_or("File hash not found in bundle index")?
-    } else {
-        // Fallback for GGPK (non-bundled) mode?
-        // The current app.rs structure for GGPK mode wasn't clearly using hashes for tree view same way, 
-        // wait, GGPK mode uses offsets?
-        // TreeView uses `FileSelection` which has `GgpkOffset(u64)` or `BundleFile(u64)`.
-        // BUT `ExportWindow` uses `hashes: Vec<u64>`.
-        // In `TreeView::collect_hashes` it collects `file_hash`.
-        // In GGPK mode (non-bundled), `file_hash` might be the offset?
-        
-        // Let's verify how `TreeView` sets `file_hash` for GGPK mode.
-        // `TreeView::build_bundle_tree` is only called for bundled mode.
-        // For GGPK mode, `render_directory` is used, but wait, `render_directory` context menu says:
-        // `if ui.button("Export...").clicked()`... NO, `render_directory` does NOT currently implement export context menu in the code I saw earlier?
-        // Let's re-read `tree_view.rs` lines 463+.
-        return Err("Exporting from raw GGPK not fully supported in this refactor yet (hash/offset ambiguity)".to_string());
-    };
-    
-    // Assuming Bundled Mode for now based on the file_info usage in app.rs
-    // "if let Some(file_info) = index_clone.files.get(&hash)"
-    
-    let bundle_info = if let Some(idx) = bundle_index {
-        idx.bundles.get(file_info.bundle_index as usize).ok_or("Bundle info not found")?
-    } else {
-        return Err("Bundle index missing".to_string());
-    };
+    let (path_str, file_data) = if let Some(idx) = bundle_index {
+        let file_info = idx.files.get(&hash).ok_or("File hash not found in bundle index")?;
+        let path = file_info.path.clone();
 
-
-    
-    let mut raw_bundle_data = None;
-
-    // Try reading local bundle file
-    // Candidate paths to try (matching content_view.rs logic)
-    let candidates = vec![
-        format!("Bundles2/{}", bundle_info.name),
-        format!("Bundles2/{}.bundle.bin", bundle_info.name),
-        bundle_info.name.clone(),
-        format!("{}.bundle.bin", bundle_info.name),
-    ];
-
-    for cand in &candidates {
-         if let Ok(Some(file_record)) = reader.read_file_by_path(cand) {
-             if let Ok(data) = reader.get_data_slice(file_record.data_offset, file_record.data_length) {
-                 raw_bundle_data = Some(data.to_vec());
-                 break;
-             }
-         }
-    }
-
-    // Try CDN
-    if raw_bundle_data.is_none() {
-        if let Some(cdn) = cdn_loader {
-            let fetch_name = if bundle_info.name.ends_with(".bundle.bin") {
-                bundle_info.name.clone()
+        if file_info.bundle_index == crate::bundles::steam::LOOSE_FILE_SENTINEL {
+            if let Some(steam) = steam_loader {
+                if let Some(loose_path) = steam.loose_file_path(&path) {
+                    let bytes = std::fs::read(&loose_path)
+                        .map_err(|e| format!("Failed to read loose file {}: {}", loose_path.display(), e))?;
+                    (path, bytes)
+                } else {
+                    return Err(format!("Loose file not found on disk: {}", path));
+                }
             } else {
-                format!("{}.bundle.bin", bundle_info.name)
-            };
-            if let Ok(data) = cdn.fetch_bundle(&fetch_name) {
-                raw_bundle_data = Some(data);
+                return Err("Steam loader unavailable for loose-file export".to_string());
             }
-        }
-    }
+        } else {
+            let bundle_info = idx
+                .bundles
+                .get(file_info.bundle_index as usize)
+                .ok_or("Bundle info not found")?;
 
-    let data = raw_bundle_data.ok_or("Failed to load bundle data (Local or CDN)")?;
-    
-    let mut cursor = std::io::Cursor::new(data);
-    let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor).map_err(|e| format!("Bundle Header: {}", e))?;
-    let decompressed_data = bundle.decompress(&mut cursor).map_err(|e| format!("Decompress: {}", e))?;
-    
-    let start = file_info.file_offset as usize;
-    let end = start + file_info.file_size as usize;
-    
-    if end > decompressed_data.len() {
-        return Err(format!("File range {}..{} out of bundle bounds {}", start, end, decompressed_data.len()));
-    }
-    
-    let file_data = &decompressed_data[start..end];
-    let path_str = &file_info.path;
-    let relative_path = std::path::Path::new(path_str);
+            let mut raw_bundle_data = None;
+            let candidates = vec![
+                format!("Bundles2/{}", bundle_info.name),
+                format!("Bundles2/{}.bundle.bin", bundle_info.name),
+                bundle_info.name.clone(),
+                format!("{}.bundle.bin", bundle_info.name),
+            ];
+
+            for cand in &candidates {
+                if let Ok(Some(file_record)) = reader.read_file_by_path(cand) {
+                    if let Ok(data) = reader.get_data_slice(file_record.data_offset, file_record.data_length) {
+                        raw_bundle_data = Some(data.to_vec());
+                        break;
+                    }
+                }
+            }
+
+            if raw_bundle_data.is_none() {
+                if let Some(cdn) = cdn_loader {
+                    let fetch_name = if bundle_info.name.ends_with(".bundle.bin") {
+                        bundle_info.name.clone()
+                    } else {
+                        format!("{}.bundle.bin", bundle_info.name)
+                    };
+                    if let Ok(data) = cdn.fetch_bundle(&fetch_name) {
+                        raw_bundle_data = Some(data);
+                    }
+                }
+            }
+
+            let data = raw_bundle_data.ok_or("Failed to load bundle data (local, Steam, or CDN)")?;
+            let mut cursor = std::io::Cursor::new(data);
+            let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor)
+                .map_err(|e| format!("Bundle Header: {}", e))?;
+            let decompressed_data = bundle
+                .decompress(&mut cursor)
+                .map_err(|e| format!("Decompress: {}", e))?;
+
+            let start = file_info.file_offset as usize;
+            let end = start + file_info.file_size as usize;
+            if end > decompressed_data.len() {
+                return Err(format!(
+                    "File range {}..{} out of bundle bounds {}",
+                    start,
+                    end,
+                    decompressed_data.len()
+                ));
+            }
+
+            (path, decompressed_data[start..end].to_vec())
+        }
+    } else {
+        let file = reader
+            .read_file_record(hash)
+            .map_err(|e| format!("Failed to read GGPK file record at offset {}: {}", hash, e))?;
+        let bytes = reader
+            .get_data_slice(file.data_offset, file.data_length)
+            .map_err(|e| format!("Failed to read GGPK file data: {}", e))?
+            .to_vec();
+        (file.name, bytes)
+    };
+
+    let relative_path = std::path::Path::new(&path_str);
     let full_path = target_dir.join(relative_path);
     
     if let Some(parent) = full_path.parent() {
@@ -207,18 +210,19 @@ fn export_single_file(
     }
     
     // File Extension Handling
-    let filename_display = path_str.to_string();
+    let filename_display = path_str.clone();
+    let path_lower = path_str.to_ascii_lowercase();
 
     // Skip .header files as per user request
-    if path_str.ends_with(".header") {
+    if path_lower.ends_with(".header") {
         return Ok(format!("Skipped header: {}", filename_display));
     }
     
-    if path_str.ends_with(".dds") {
+    if path_lower.ends_with(".dds") {
         match settings.texture_format {
             TextureFormat::WebP => {
                 let mut converted = false;
-                let mut cursor = std::io::Cursor::new(file_data);
+                let mut cursor = std::io::Cursor::new(&file_data);
                 if let Ok(dds) = ddsfile::Dds::read(&mut cursor) {
                     if let Ok(image) = image_dds::image_from_dds(&dds, 0) {
                         let img = image::DynamicImage::ImageRgba8(image);
@@ -229,12 +233,12 @@ fn export_single_file(
                     }
                 }
                 if !converted {
-                    std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                    std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
                 }
             },
             TextureFormat::Png => {
                 let mut converted = false;
-                let mut cursor = std::io::Cursor::new(file_data);
+                let mut cursor = std::io::Cursor::new(&file_data);
                 if let Ok(dds) = ddsfile::Dds::read(&mut cursor) {
                     if let Ok(image) = image_dds::image_from_dds(&dds, 0) {
                         let img = image::DynamicImage::ImageRgba8(image);
@@ -245,17 +249,17 @@ fn export_single_file(
                     }
                 }
                 if !converted {
-                    std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                    std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
                 }
             },
             TextureFormat::OriginalDds => {
-                 std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                 std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
             }
         }
-    } else if path_str.ends_with(".ogg") { 
+    } else if path_lower.ends_with(".ogg") { 
          match settings.audio_format {
              AudioFormat::Wav => {
-                 let cursor = std::io::Cursor::new(file_data.to_vec());
+                 let cursor = std::io::Cursor::new(file_data.clone());
                  if let Ok(source) = rodio::Decoder::new(cursor) {
                       use rodio::Source;
                       let spec = hound::WavSpec {
@@ -271,21 +275,21 @@ fn export_single_file(
                       }
                       writer.finalize().map_err(|e| e.to_string())?;
                  } else {
-                      std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                      std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
                  }
              },
              AudioFormat::Original => {
-                  std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                  std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
              }
          }
-    } else if path_str.ends_with(".dat") || path_str.ends_with(".datc64") || path_str.ends_with(".datl") || path_str.ends_with(".datl64") {
+    } else if path_lower.ends_with(".dat") || path_lower.ends_with(".dat64") || path_lower.ends_with(".datc64") || path_lower.ends_with(".datl") || path_lower.ends_with(".datl64") {
          match settings.data_format {
              DataFormat::Json => {
                  let mut converted = false;
                   if let Some(schema) = schema {
-                       let stem = std::path::Path::new(path_str).file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                       let stem = std::path::Path::new(&path_str).file_stem().and_then(|s| s.to_str()).unwrap_or("");
                        if let Some(table_def) = schema.tables.iter().find(|t| t.name.eq_ignore_ascii_case(stem)) {
-                           if let Ok(r) = crate::dat::reader::DatReader::new(file_data.to_vec(), path_str) {
+                           if let Ok(r) = crate::dat::reader::DatReader::new(file_data.clone(), path_str.as_str()) {
                                use serde_json::{Map, Value};
                                use crate::dat::reader::DatValue;
                                
@@ -319,18 +323,18 @@ fn export_single_file(
                        }
                   }
                  if !converted {
-                       std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                       std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
                  }
              },
              DataFormat::Original => {
-                  std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                  std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
              }
          }
-     } else if path_str.ends_with(".psg") {
+     } else if path_lower.ends_with(".psg") {
          match settings.psg_format {
             PsgFormat::Json => {
                  let mut converted = false;
-                 if let Ok(psg_file) = crate::dat::psg::parse_psg(file_data) {
+                 if let Ok(psg_file) = crate::dat::psg::parse_psg(&file_data) {
                      if let Ok(json_val) = serde_json::to_value(&psg_file) {
                          let dest = full_path.with_extension("json");
                          let s = serde_json::to_string_pretty(&json_val).map_err(|e| e.to_string())?;
@@ -339,17 +343,17 @@ fn export_single_file(
                      }
                  }
                  if !converted {
-                      std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                      std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
                  }
             },
             PsgFormat::Original => {
-                 std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                  std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
             }
          }
-     } else if path_str.ends_with(".png") || path_str.ends_with(".jpg") || path_str.ends_with(".jpeg") || path_str.ends_with(".webp") {
-          std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+        } else if path_lower.ends_with(".png") || path_lower.ends_with(".jpg") || path_lower.ends_with(".jpeg") || path_lower.ends_with(".webp") {
+            std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
      } else {
-         std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+            std::fs::write(&full_path, &file_data).map_err(|e| e.to_string())?;
      }
 
     Ok(filename_display)

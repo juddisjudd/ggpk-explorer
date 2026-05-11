@@ -788,8 +788,15 @@ impl eframe::App for ExplorerApp {
         if self.export_window.confirmed {
              self.export_window.confirmed = false;
              if let Some(target_dir) = rfd::FileDialog::new().set_directory("/").pick_folder() {
-                 let hashes = self.export_window.hashes.clone();
                  let settings = self.export_window.settings.clone();
+                 let hashes = if self.export_window.settings.recursive {
+                     self.export_window.hashes.clone()
+                 } else {
+                     self.export_window
+                         .immediate_hashes
+                         .clone()
+                         .unwrap_or_else(|| self.export_window.hashes.clone())
+                 };
                  
                  if let Some(reader) = &self.reader {
                      let bundle_index = self.bundle_index.clone();
@@ -802,6 +809,7 @@ impl eframe::App for ExplorerApp {
                      
                      let schema_clone = self.content_view.dat_viewer.schema.clone();
                      let cdn_loader = self.content_view.cdn_loader.clone();
+                     let steam_loader = self.content_view.steam_loader.clone();
                      
                      std::thread::spawn(move || {
                          crate::export::run_export(
@@ -811,6 +819,7 @@ impl eframe::App for ExplorerApp {
                             settings,
                             target_dir,
                             cdn_loader,
+                            steam_loader,
                             schema_clone,
                             tx,
                             None
@@ -911,6 +920,7 @@ impl eframe::App for ExplorerApp {
              let is_folder = hashes.len() > 1; 
              self.export_window.open_for(&name, is_folder);
              self.export_window.hashes = hashes;
+               self.export_window.immediate_hashes = None;
              if let Some(s) = settings {
                  self.export_window.settings = s;
              }

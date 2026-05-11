@@ -54,6 +54,7 @@ pub struct ExportWindow {
     target_name: String,
     is_folder: bool,
     pub hashes: Vec<u64>,
+    pub immediate_hashes: Option<Vec<u64>>,
 }
 
 impl Default for ExportWindow {
@@ -65,6 +66,7 @@ impl Default for ExportWindow {
             target_name: String::new(),
             is_folder: false,
             hashes: Vec::new(),
+            immediate_hashes: None,
         }
     }
 }
@@ -80,6 +82,7 @@ impl ExportWindow {
         self.target_name = name.to_string();
         self.is_folder = is_folder;
         self.settings.recursive = is_folder;
+        self.immediate_hashes = None;
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
@@ -152,6 +155,21 @@ impl ExportWindow {
                     ui.separator();
                     modal_section(ui, "OPTIONS");
                     ui.checkbox(&mut self.settings.recursive, "Include subfolders");
+
+                    let export_count = if self.settings.recursive {
+                        self.hashes.len()
+                    } else {
+                        self.immediate_hashes
+                            .as_ref()
+                            .map(|h| h.len())
+                            .unwrap_or(self.hashes.len())
+                    };
+                    ui.label(
+                        egui::RichText::new(format!("FILES TO EXPORT · {}", export_count))
+                            .monospace()
+                            .size(10.5)
+                            .color(egui::Color32::from_rgb(113, 113, 122)),
+                    );
                 }
 
                 ui.add_space(6.0);

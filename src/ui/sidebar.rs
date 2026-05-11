@@ -147,9 +147,10 @@ impl Sidebar {
         match action {
             TreeViewAction::None => {},
             TreeViewAction::Select => {}, 
-            TreeViewAction::RequestExport { hashes, name, is_folder, settings } => {
+            TreeViewAction::RequestExport { hashes, immediate_hashes, name, is_folder, settings } => {
                 export_window.open_for(&name, is_folder);
                 export_window.hashes = hashes;
+                export_window.immediate_hashes = immediate_hashes;
                 if let Some(s) = settings {
                     export_window.settings = s;
                 }

@@ -36,7 +36,13 @@ pub struct FlatNode {
 pub enum TreeViewAction {
     None,
     Select,
-    RequestExport { hashes: Vec<u64>, name: String, is_folder: bool, settings: Option<crate::ui::export_window::ExportSettings> },
+    RequestExport {
+        hashes: Vec<u64>,
+        immediate_hashes: Option<Vec<u64>>,
+        name: String,
+        is_folder: bool,
+        settings: Option<crate::ui::export_window::ExportSettings>,
+    },
 }
 
 impl Default for TreeView {
@@ -398,7 +404,7 @@ impl TreeView {
             }
         } else if let Some(reader) = &self.reader {
             let root_offset = reader.root_offset;
-            self.render_directory(ui, reader, root_offset, "Root", selected_file, schema);
+            self.render_directory(ui, reader, root_offset, "Root", selected_file, &mut action, schema);
         }
         
         action
@@ -450,7 +456,13 @@ impl TreeView {
                 }
                 response.context_menu(|ui| {
                     if ui.button("Export...").clicked() {
-                        *action = TreeViewAction::RequestExport { hashes: vec![hash], name: node.name.clone(), is_folder: false, settings: None };
+                        *action = TreeViewAction::RequestExport {
+                            hashes: vec![hash],
+                            immediate_hashes: None,
+                            name: node.name.clone(),
+                            is_folder: false,
+                            settings: None,
+                        };
                         ui.close_menu();
                     }
                 });
@@ -493,9 +505,17 @@ impl TreeView {
 
             response.header_response.context_menu(|ui| {
                 if ui.button("Export Folder...").clicked() {
+                    let mut immediate_hashes = Vec::new();
+                    self.collect_immediate_hashes(node_idx, &mut immediate_hashes);
                     let mut hashes = Vec::new();
                     self.collect_hashes(node_idx, &mut hashes);
-                    *action = TreeViewAction::RequestExport { hashes, name: node.name.clone(), is_folder: true, settings: None };
+                    *action = TreeViewAction::RequestExport {
+                        hashes,
+                        immediate_hashes: Some(immediate_hashes),
+                        name: node.name.clone(),
+                        is_folder: true,
+                        settings: None,
+                    };
                     ui.close_menu();
                 }
             });
@@ -525,13 +545,13 @@ impl TreeView {
     }
     
     // Existing helper for raw view... can leave as is
-    fn render_directory(&self, ui: &mut egui::Ui, reader: &GgpkReader, offset: u64, name: &str, selected_file: &mut Option<crate::ui::app::FileSelection>, schema: Option<&crate::dat::schema::Schema>) {
+    fn render_directory(&self, ui: &mut egui::Ui, reader: &GgpkReader, offset: u64, name: &str, selected_file: &mut Option<crate::ui::app::FileSelection>, action: &mut TreeViewAction, schema: Option<&crate::dat::schema::Schema>) {
          // ... (Same as before, abbreviated here, but I must provide full content if replacing file?)
          // The prompt says "ReplacementContent" must be complete.
          // I will copy the previous logic for render_directory.
          
          let id = ui.make_persistent_id(offset);
-         egui::CollapsingHeader::new(name)
+         let response = egui::CollapsingHeader::new(name)
              .id_salt(id)
              .show(ui, |ui| {
                  match reader.read_directory(offset) {
@@ -560,7 +580,7 @@ impl TreeView {
                                  RecordTag::PDIR => {
                                      match reader.read_directory(entry.offset) {
                                          Ok(sub_dir) => {
-                                             self.render_directory(ui, reader, entry.offset, &sub_dir.name, selected_file, schema);
+                                             self.render_directory(ui, reader, entry.offset, &sub_dir.name, selected_file, action, schema);
                                          },
                                          Err(_) => { ui.label("<Read Error>"); }
                                      }
@@ -578,9 +598,22 @@ impl TreeView {
                                                       }
                                                   }
                                               }
-                                              if ui.button(label).clicked() {
+                                              let response = ui.button(label);
+                                              if response.clicked() {
                                                   *selected_file = Some(crate::ui::app::FileSelection::GgpkOffset(entry.offset));
                                               }
+                                              response.context_menu(|ui| {
+                                                  if ui.button("Export...").clicked() {
+                                                      *action = TreeViewAction::RequestExport {
+                                                          hashes: vec![entry.offset],
+                                                          immediate_hashes: None,
+                                                          name: file.name.clone(),
+                                                          is_folder: false,
+                                                          settings: None,
+                                                      };
+                                                      ui.close_menu();
+                                                  }
+                                              });
                                           },
                                           Err(_) => { ui.label("<Read Error>"); }
                                       }
@@ -594,6 +627,51 @@ impl TreeView {
                      }
                  }
              });
+
+         response.header_response.context_menu(|ui| {
+             if ui.button("Export Folder...").clicked() {
+                 let mut immediate_hashes = Vec::new();
+                 self.collect_ggpk_immediate_hashes(reader, offset, &mut immediate_hashes);
+                 let mut hashes = Vec::new();
+                 self.collect_ggpk_hashes(reader, offset, &mut hashes);
+                 *action = TreeViewAction::RequestExport {
+                     hashes,
+                     immediate_hashes: Some(immediate_hashes),
+                     name: name.to_string(),
+                     is_folder: true,
+                     settings: None,
+                 };
+                 ui.close_menu();
+             }
+         });
+    }
+
+    fn collect_ggpk_hashes(&self, reader: &GgpkReader, dir_offset: u64, hashes: &mut Vec<u64>) {
+        if let Ok(dir) = reader.read_directory(dir_offset) {
+            for entry in dir.entries {
+                if let Ok(header) = reader.read_record_header(entry.offset) {
+                    match header.tag {
+                        crate::ggpk::record::RecordTag::FILE => hashes.push(entry.offset),
+                        crate::ggpk::record::RecordTag::PDIR => {
+                            self.collect_ggpk_hashes(reader, entry.offset, hashes)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    fn collect_ggpk_immediate_hashes(&self, reader: &GgpkReader, dir_offset: u64, hashes: &mut Vec<u64>) {
+        if let Ok(dir) = reader.read_directory(dir_offset) {
+            for entry in dir.entries {
+                if let Ok(header) = reader.read_record_header(entry.offset) {
+                    if matches!(header.tag, crate::ggpk::record::RecordTag::FILE) {
+                        hashes.push(entry.offset);
+                    }
+                }
+            }
+        }
     }
 }
 
