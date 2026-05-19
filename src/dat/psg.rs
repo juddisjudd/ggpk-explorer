@@ -153,8 +153,8 @@ mod tests {
         
         // Header
         buffer.push(0); // Version
-        // Unknown data (11 bytes)
-        for _ in 0..11 { buffer.push(0); }
+        // Unknown data (12 bytes, total 13 byte header)
+        for _ in 0..12 { buffer.push(0); }
         
         // Root Length: 1
         buffer.extend_from_slice(&1u32.to_le_bytes());

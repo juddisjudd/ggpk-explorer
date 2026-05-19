@@ -45,6 +45,7 @@ fn main() {
 
     let files = vec![
         "bun.cpp",
+        "path_rep.cpp",
         "kraken.cpp",
         "bitknit.cpp",
         "lzna.cpp",

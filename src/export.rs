@@ -15,7 +15,7 @@ pub enum ExportStatus {
 
 pub fn run_export(
     hashes: Vec<u64>,
-    reader: Arc<GgpkReader>,
+    reader: Option<Arc<GgpkReader>>,
     bundle_index: Option<Arc<BundleIndex>>,
     settings: ExportSettings,
     target_dir: PathBuf,
@@ -37,7 +37,7 @@ pub fn run_export(
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match export_single_file(
                 *hash, 
-                &reader, 
+                reader.as_deref(), 
                 bundle_index.as_deref(), 
                 &settings, 
                 &target_dir, 
@@ -110,7 +110,7 @@ pub fn run_export(
 
 fn export_single_file(
     hash: u64,
-    reader: &GgpkReader,
+    reader: Option<&GgpkReader>,
     bundle_index: Option<&BundleIndex>,
     settings: &ExportSettings,
     target_dir: &Path,
@@ -148,11 +148,21 @@ fn export_single_file(
                 format!("{}.bundle.bin", bundle_info.name),
             ];
 
-            for cand in &candidates {
-                if let Ok(Some(file_record)) = reader.read_file_by_path(cand) {
-                    if let Ok(data) = reader.get_data_slice(file_record.data_offset, file_record.data_length) {
-                        raw_bundle_data = Some(data.to_vec());
-                        break;
+            if let Some(r) = reader {
+                for cand in &candidates {
+                    if let Ok(Some(file_record)) = r.read_file_by_path(cand) {
+                        if let Ok(data) = r.get_data_slice(file_record.data_offset, file_record.data_length) {
+                            raw_bundle_data = Some(data.to_vec());
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if raw_bundle_data.is_none() {
+                if let Some(steam) = steam_loader {
+                    if let Ok(data) = steam.fetch_bundle(&bundle_info.name) {
+                        raw_bundle_data = Some(data);
                     }
                 }
             }
@@ -192,10 +202,11 @@ fn export_single_file(
             (path, decompressed_data[start..end].to_vec())
         }
     } else {
-        let file = reader
+        let r = reader.ok_or("GGPK reader is required for raw export")?;
+        let file = r
             .read_file_record(hash)
             .map_err(|e| format!("Failed to read GGPK file record at offset {}: {}", hash, e))?;
-        let bytes = reader
+        let bytes = r
             .get_data_slice(file.data_offset, file.data_length)
             .map_err(|e| format!("Failed to read GGPK file data: {}", e))?
             .to_vec();

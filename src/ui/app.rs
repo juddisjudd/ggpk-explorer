@@ -798,9 +798,9 @@ impl eframe::App for ExplorerApp {
                          .unwrap_or_else(|| self.export_window.hashes.clone())
                  };
                  
-                 if let Some(reader) = &self.reader {
+                 if self.reader.is_some() || self.bundle_index.is_some() {
                      let bundle_index = self.bundle_index.clone();
-                     let reader_clone = reader.clone();
+                     let reader_clone = self.reader.clone();
                      
                      let (tx, rx) = std::sync::mpsc::channel();
                      self.export_status_rx = Some(rx);
@@ -1132,3 +1132,4 @@ impl eframe::App for ExplorerApp {
         }
     }
 }
+
