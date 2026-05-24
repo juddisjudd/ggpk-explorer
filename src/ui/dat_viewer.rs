@@ -264,7 +264,7 @@ impl DatViewer {
                          for (j, col) in table.columns.iter().enumerate() {
                              if let Some(val) = values.get(j) {
                                  let key = col.name.clone().unwrap_or_else(|| format!("Col{}", j));
-                                 row_map.insert(key, serde_json::to_value(val).unwrap_or(serde_json::Value::Null));
+                                 row_map.insert(key, reader.value_to_json(val, col));
                              }
                          }
                          all_rows.push(row_map);
@@ -347,9 +347,8 @@ impl DatViewer {
                              for (j, col) in table.columns.iter().enumerate() {
                                  if let Some(val) = values.get(j) {
                                      let key = col.name.clone().unwrap_or_else(|| format!("Col{}", j));
-                                     if let Ok(v) = serde_json::to_value(val) {
-                                          row_map.insert(key, v);
-                                     }
+                                     let v = reader.value_to_json(val, col);
+                                     row_map.insert(key, v);
                                  }
                              }
                              all_rows.push(row_map);

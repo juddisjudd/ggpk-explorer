@@ -302,26 +302,18 @@ fn export_single_file(
                        if let Some(table_def) = schema.tables.iter().find(|t| t.name.eq_ignore_ascii_case(stem)) {
                            if let Ok(r) = crate::dat::reader::DatReader::new(file_data.clone(), path_str.as_str()) {
                                use serde_json::{Map, Value};
-                               use crate::dat::reader::DatValue;
                                
                                let mut rows = Vec::new();
                                for i in 0..r.row_count {
                                    if let Ok(vals) = r.read_row(i, table_def) {
                                        let mut map = Map::new();
-                                       for (j, val) in vals.iter().enumerate() {
-                                           let col_name = table_def.columns.get(j).and_then(|c| c.name.clone()).unwrap_or_else(|| format!("Col{}", j));
-                                           let v = match val {
-                                               DatValue::Bool(b) => Value::from(*b),
-                                               DatValue::Int(i) => Value::from(*i),
-                                               DatValue::Long(l) => Value::from(*l),
-                                               DatValue::Float(f) => Value::from(*f),
-                                               DatValue::String(s) => Value::from(s.clone()),
-                                               DatValue::List(count, _) => Value::String(format!("List(len={})", count)), 
-                                               DatValue::ForeignRow(k) => Value::String(format!("Key({})", k)), 
-                                               _ => Value::Null,
-                                           };
-                                           map.insert(col_name, v);
-                                       }
+                                        for (j, val) in vals.iter().enumerate() {
+                                            if let Some(col) = table_def.columns.get(j) {
+                                                let col_name = col.name.clone().unwrap_or_else(|| format!("Col{}", j));
+                                                let v = r.value_to_json(val, col);
+                                                map.insert(col_name, v);
+                                            }
+                                        }
                                        rows.push(Value::Object(map));
                                    }
                                }

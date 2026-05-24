@@ -349,6 +349,113 @@ impl DatReader {
         
         Ok(values)
     }
+
+    pub fn value_to_json(&self, val: &DatValue, col: &Column) -> serde_json::Value {
+        use serde_json::Value;
+        match val {
+            DatValue::Bool(b) => Value::from(*b),
+            DatValue::Int(i) => Value::from(*i),
+            DatValue::Long(l) => Value::from(*l),
+            DatValue::Float(f) => Value::from(*f),
+            DatValue::String(s) => Value::from(s.clone()),
+            DatValue::List(count, offset) => {
+                if let Ok(items) = self.read_list_values(*offset, *count, col) {
+                    let json_items: Vec<Value> = items.iter().map(|item| {
+                        match item {
+                            DatValue::Bool(b) => Value::from(*b),
+                            DatValue::Int(i) => Value::from(*i),
+                            DatValue::Long(l) => Value::from(*l),
+                            DatValue::Float(f) => Value::from(*f),
+                            DatValue::String(s) => Value::from(s.clone()),
+                            DatValue::ForeignRow(k) => Value::from(*k),
+                            _ => Value::Null,
+                        }
+                    }).collect();
+                    Value::Array(json_items)
+                } else {
+                    Value::Array(Vec::new())
+                }
+            },
+            DatValue::ForeignRow(k) => Value::String(format!("Key({})", k)),
+            _ => Value::Null,
+        }
+    }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_value_to_json() {
+        let reader = DatReader {
+            data: vec![],
+            is_64bit: true,
+            row_count: 0,
+            row_length: None,
+            data_section_offset: 0,
+            filename: "test.dat64".to_string(),
+        };
+
+        let col = Column {
+            name: Some("test_col".to_string()),
+            r#type: "int".to_string(),
+            references: None,
+            array: false,
+            unique: false,
+            localized: false,
+            description: None,
+        };
+
+        assert_eq!(reader.value_to_json(&DatValue::Bool(true), &col), serde_json::json!(true));
+        assert_eq!(reader.value_to_json(&DatValue::Int(42), &col), serde_json::json!(42));
+        assert_eq!(reader.value_to_json(&DatValue::Long(123456789), &col), serde_json::json!(123456789));
+        assert_eq!(reader.value_to_json(&DatValue::Float(3.14), &col), serde_json::json!(3.14f32));
+        assert_eq!(reader.value_to_json(&DatValue::String("hello".to_string()), &col), serde_json::json!("hello"));
+        assert_eq!(reader.value_to_json(&DatValue::ForeignRow(77), &col), serde_json::json!("Key(77)"));
+        assert_eq!(reader.value_to_json(&DatValue::Unknown, &col), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_value_to_json_list() {
+        // Let's create a reader with mock data for a 64-bit list of foreign row references.
+        // Element type is "ref|Stats", size = 8 bytes.
+        // Element 1: value 18478 (0x482E), followed by 4 bytes padding (all zeroes).
+        // Element 2: value 42 (0x2A), followed by 4 bytes padding.
+        // Total list size = 16 bytes.
+        let mut data = vec![0u8; 32];
+        let offset = 8;
+        // Write element 1 at index 8 (offset 8)
+        data[8] = 0x2E;
+        data[9] = 0x48;
+        // Write element 2 at index 16 (offset 16)
+        data[16] = 0x2A;
+
+        let reader = DatReader {
+            data,
+            is_64bit: true,
+            row_count: 0,
+            row_length: None,
+            data_section_offset: 0,
+            filename: "test.dat64".to_string(),
+        };
+
+        let col = Column {
+            name: Some("Stats".to_string()),
+            r#type: "ref|Stats".to_string(),
+            references: None,
+            array: true, // List
+            unique: false,
+            localized: false,
+            description: None,
+        };
+
+        let val = DatValue::List(2, offset);
+
+        let json_val = reader.value_to_json(&val, &col);
+        assert_eq!(json_val, serde_json::json!([18478, 42]));
+    }
+}
+
 
 
