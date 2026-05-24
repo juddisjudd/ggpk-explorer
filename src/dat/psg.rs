@@ -1,9 +1,28 @@
-use serde::Serialize;
+use serde::{Serialize, Serializer};
+use serde::ser::SerializeStruct;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct PsgFile {
     pub roots: Vec<u32>,
     pub groups: Vec<PsgGroup>,
+}
+
+impl Serialize for PsgFile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("PsgFile", 4)?;
+        state.serialize_field("roots", &self.roots)?;
+        state.serialize_field("groups", &self.groups)?;
+        
+        let orbit_radii: &[i32] = &[0, 82, 162, 335, 493, 662, 846, 510, 765, 1020];
+        let orbit_sizes: &[u32] = &[1, 12, 24, 24, 72, 72, 72, 24, 72, 144];
+        
+        state.serialize_field("orbitRadii", orbit_radii)?;
+        state.serialize_field("orbitSizes", orbit_sizes)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -191,5 +210,19 @@ mod tests {
         assert_eq!(result.groups[0].nodes[0].skill_id, 200);
         assert_eq!(result.groups[0].nodes[0].connections[0].node_id, 300);
         assert_eq!(result.groups[0].nodes[0].connections[0].orbit, 0);
+    }
+
+    #[test]
+    fn test_psg_serialization() {
+        let psg = PsgFile {
+            roots: vec![100],
+            groups: vec![],
+        };
+        let serialized = serde_json::to_string(&psg).expect("Failed to serialize");
+        let val: serde_json::Value = serde_json::from_str(&serialized).expect("Failed to parse JSON");
+        assert_eq!(val.get("roots").unwrap().as_array().unwrap()[0].as_u64().unwrap(), 100);
+        assert_eq!(val.get("groups").unwrap().as_array().unwrap().len(), 0);
+        assert_eq!(val.get("orbitRadii").unwrap(), &serde_json::json!([0, 82, 162, 335, 493, 662, 846, 510, 765, 1020]));
+        assert_eq!(val.get("orbitSizes").unwrap(), &serde_json::json!([1, 12, 24, 24, 72, 72, 72, 24, 72, 144]));
     }
 }

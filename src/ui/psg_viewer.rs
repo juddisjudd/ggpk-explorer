@@ -3,12 +3,17 @@ use crate::dat::psg::PsgFile;
 
 // Standard PoE Orbit Radii (Approximation for PoE2 or legacy)
 // 0: Center
-// 1: Inner circle (6 nodes)
-// 2: Middle circle (12 nodes)
-// 3: Large circle (12 nodes?) - varies
-// 4: Outer circle (40 nodes) or similar.
-const ORBIT_RADII: [f32; 7] = [0.0, 82.0, 162.0, 335.0, 493.0, 662.0, 846.0];
-const ORBIT_NODES: [u32; 7] = [1, 6, 12, 12, 40, 72, 72]; // Capacities
+// 1: Inner circle
+// 2: Middle circle
+// 3: Large circle
+// 4: Outer circle
+// 5: Greater outer circle
+// 6: Master circle
+// 7: Orbit 7
+// 8: Orbit 8
+// 9: Orbit 9
+const ORBIT_RADII: [f32; 10] = [0.0, 82.0, 162.0, 335.0, 493.0, 662.0, 846.0, 510.0, 765.0, 1020.0];
+const ORBIT_NODES: [u32; 10] = [1, 12, 24, 24, 72, 72, 72, 24, 72, 144]; // Capacities
 
 pub struct PsgViewerState {
     pub pan: egui::Vec2,
