@@ -14,6 +14,38 @@ use crate::dat::psg::PsgFile;
 // 9: Orbit 9
 const ORBIT_RADII: [f32; 10] = [0.0, 82.0, 162.0, 335.0, 493.0, 662.0, 846.0, 251.0, 1080.0, 1322.0];
 
+fn get_node_angle(radius: u32, position: u32, passives_per_orbit: &[u8]) -> f32 {
+    let r_idx = radius as usize;
+    let capacities = if r_idx < passives_per_orbit.len() {
+        passives_per_orbit[r_idx] as u32
+    } else {
+        12
+    };
+
+    let degree = if capacities == 16 {
+        let angles = [0, 30, 45, 60, 90, 120, 135, 150, 180, 210, 225, 240, 270, 300, 315, 330];
+        if (position as usize) < angles.len() {
+            angles[position as usize] as f32
+        } else {
+            (360 * position) as f32 / capacities as f32
+        }
+    } else if capacities == 40 {
+        let angles = [
+            0, 10, 20, 30, 40, 45, 50, 60, 70, 80, 90, 100, 110, 120, 130, 135, 140, 150, 160, 170, 180, 190,
+            200, 210, 220, 225, 230, 240, 250, 260, 270, 280, 290, 300, 310, 315, 320, 330, 340, 350,
+        ];
+        if (position as usize) < angles.len() {
+            angles[position as usize] as f32
+        } else {
+            (360 * position) as f32 / capacities as f32
+        }
+    } else {
+        (360 * position) as f32 / capacities as f32
+    };
+
+    degree.to_radians()
+}
+
 pub struct PsgViewerState {
     pub pan: egui::Vec2,
     pub zoom: f32,
@@ -119,6 +151,14 @@ impl<'a> PsgViewer<'a> {
             // Let's first compute absolute positions for all nodes.
             
             let mut node_positions: std::collections::HashMap<u32, egui::Pos2> = std::collections::HashMap::new();
+            struct PsgNodeInfo {
+                pos: egui::Pos2,
+                group_x: f32,
+                group_y: f32,
+                poe_arc: f32,
+                radius: f32,
+            }
+            let mut node_info: std::collections::HashMap<u32, PsgNodeInfo> = std::collections::HashMap::new();
             
             for group in &self.psg.groups {
                 for node in &group.nodes {
@@ -126,12 +166,9 @@ impl<'a> PsgViewer<'a> {
                     // Standard orbit calculation
                     let r_idx = node.radius as usize;
                     let radius = if r_idx < ORBIT_RADII.len() { ORBIT_RADII[r_idx] } else { node.radius as f32 * 50.0 };
-                    let capacities = if r_idx < self.psg.passives_per_orbit.len() { self.psg.passives_per_orbit[r_idx] as u32 } else { 12 };
                     
-                    // Angle
-                    // Standard GGG: angle = -PI/2 + (2PI * position / capacity)
-                    // Note: GGG angles start at top (-90 deg) and go clockwise usually?
-                    let angle = -std::f32::consts::FRAC_PI_2 + (std::f32::consts::TAU * node.position as f32 / capacities as f32);
+                    let poe_arc = get_node_angle(node.radius, node.position, &self.psg.passives_per_orbit);
+                    let angle = -std::f32::consts::FRAC_PI_2 + poe_arc;
                     
                     let offset_x = angle.cos() * radius;
                     let offset_y = angle.sin() * radius;
@@ -142,6 +179,13 @@ impl<'a> PsgViewer<'a> {
                     );
                     
                     node_positions.insert(node.skill_id, pos);
+                    node_info.insert(node.skill_id, PsgNodeInfo {
+                        pos,
+                        group_x: group.x,
+                        group_y: group.y,
+                        poe_arc,
+                        radius,
+                    });
                 }
             }
             
@@ -170,13 +214,11 @@ impl<'a> PsgViewer<'a> {
             }
 
             for ((start_id, end_id), orbit_idx) in unique_connections {
-                 if let (Some(&start_pos), Some(&end_pos)) = (node_positions.get(&start_id), node_positions.get(&end_id)) {
-                     let start_screen = to_screen(start_pos);
-                     let end_screen = to_screen(end_pos);
+                 if let (Some(start_node), Some(end_node)) = (node_info.get(&start_id), node_info.get(&end_id)) {
+                     let start_screen = to_screen(start_node.pos);
+                     let end_screen = to_screen(end_node.pos);
 
                      // Check visibility (culling) - simple check
-                     // Check if bounded box of line intersects screen?
-                     // Or just check endpoints with margin
                      let margin = 500.0 * self.state.zoom;
                      if !response.rect.expand(margin).contains(start_screen) && !response.rect.expand(margin).contains(end_screen) {
                          continue;
@@ -186,65 +228,89 @@ impl<'a> PsgViewer<'a> {
 
                      if orbit_idx != 0 {
                          // Draw Arc
-                         // Calculate Orbit Radius
-                         let orbit_abs = orbit_idx.abs() as usize;
-                         let radius = if orbit_abs < ORBIT_RADII.len() { ORBIT_RADII[orbit_abs] } else { 0.0 };
-                         
-                         if radius > 0.0 {
-                            // Calculate Center of the arc circle
-                            // Distance between nodes
-                            let dx = end_pos.x - start_pos.x;
-                            let dy = end_pos.y - start_pos.y;
-                            let dist = (dx*dx + dy*dy).sqrt();
-                            
-                            // Perpendicular distance to center
-                            // r^2 = (d/2)^2 + h^2  => h = sqrt(r^2 - d^2/4)
-                            // If dist > 2*r, then points are too far for this radius? (Shouldn't happen if valid)
-                            if dist < radius * 2.0 {
-                                let h = (radius * radius - (dist * dist) / 4.0).sqrt();
+                         // 1. Preferred method: If they are in the same group, draw using the group center
+                         if (start_node.group_x - end_node.group_x).abs() < 0.1 
+                            && (start_node.group_y - end_node.group_y).abs() < 0.1 
+                            && (start_node.radius - end_node.radius).abs() < 0.1 
+                         {
+                             let group_x = start_node.group_x;
+                             let group_y = start_node.group_y;
+                             let radius = start_node.radius;
+
+                             let arc1 = start_node.poe_arc;
+                             let arc2 = end_node.poe_arc;
+
+                             let mut start_arc = if arc1 < arc2 { arc1 } else { arc2 };
+                             let mut end_arc = if arc1 < arc2 { arc2 } else { arc1 };
+
+                             let diff = end_arc - start_arc;
+                             if diff >= std::f32::consts::PI {
+                                 let c = std::f32::consts::TAU - diff;
+                                 start_arc = end_arc;
+                                 end_arc = start_arc + c;
+                             }
+
+                             let angle1 = -std::f32::consts::FRAC_PI_2 + start_arc;
+                             let angle2 = -std::f32::consts::FRAC_PI_2 + end_arc;
+
+                             let mut points = Vec::new();
+                             let steps = 15;
+                             for i in 0..=steps {
+                                 let t = i as f32 / steps as f32;
+                                 let a = angle1 + (angle2 - angle1) * t;
+                                 let px = group_x + radius * a.cos();
+                                 let py = group_y + radius * a.sin();
+                                 points.push(to_screen(egui::Pos2::new(px, py)));
+                             }
+
+                             painter.add(egui::Shape::Path(egui::epaint::PathShape::line(points, stroke)));
+                             continue;
+                         } else {
+                             // 2. Fallback method: Perpendicular sphere intersection
+                             let start_pos = start_node.pos;
+                             let end_pos = end_node.pos;
+                             let orbit_abs = orbit_idx.abs() as usize;
+                             let radius = if orbit_abs < ORBIT_RADII.len() { ORBIT_RADII[orbit_abs] } else { 0.0 };
+                             
+                             if radius > 0.0 {
+                                let dx = end_pos.x - start_pos.x;
+                                let dy = end_pos.y - start_pos.y;
+                                let dist = (dx*dx + dy*dy).sqrt();
                                 
-                                // Direction of perpendicular: (dy, -dx) or (-dy, dx)
-                                // PoB: (connection.orbit > 0 and 1 or -1)
-                                let sign = if orbit_idx > 0 { 1.0 } else { -1.0 };
-                                
-                                let mid_x = start_pos.x + dx / 2.0;
-                                let mid_y = start_pos.y + dy / 2.0;
-                                
-                                let perp_x = (dy / dist) * h * sign;
-                                let perp_y = (-dx / dist) * h * sign; // Note: -dx because (x, y) -> (y, -x) is 90 deg clockwise?
-                                // PoB: perp * (dy / dist), -perp * (dx / dist)
-                                // Let's stick to standard vector math.
-                                // Vec (dx, dy). Normal (-dy, dx) or (dy, -dx).
-                                
-                                let cx = mid_x + perp_x;
-                                let cy = mid_y + perp_y;
-                                
-                                // Angles
-                                let angle1 = (start_pos.y - cy).atan2(start_pos.x - cx);
-                                let angle2 = (end_pos.y - cy).atan2(end_pos.x - cx);
-                                
-                                // Draw Arc Segments
-                                let mut points = Vec::new();
-                                let steps = 10;
-                                
-                                // We need to ensure we go the "short" way or "long" way?
-                                // Usually short way for these connections.
-                                let mut diff = angle2 - angle1;
-                                // Normalize diff to -PI..PI
-                                if diff < -std::f32::consts::PI { diff += std::f32::consts::TAU; }
-                                if diff > std::f32::consts::PI { diff -= std::f32::consts::TAU; }
-                                
-                                for i in 0..=steps {
-                                    let t = i as f32 / steps as f32;
-                                    let a = angle1 + diff * t;
-                                    let px = cx + radius * a.cos();
-                                    let py = cy + radius * a.sin(); // Standard math
-                                    points.push(to_screen(egui::Pos2::new(px, py)));
+                                if dist < radius * 2.0 {
+                                    let h = (radius * radius - (dist * dist) / 4.0).sqrt();
+                                    let sign = if orbit_idx > 0 { 1.0 } else { -1.0 };
+                                    
+                                    let mid_x = start_pos.x + dx / 2.0;
+                                    let mid_y = start_pos.y + dy / 2.0;
+                                    
+                                    let perp_x = (dy / dist) * h * sign;
+                                    let perp_y = (-dx / dist) * h * sign;
+                                    
+                                    let cx = mid_x + perp_x;
+                                    let cy = mid_y + perp_y;
+                                    
+                                    let angle1 = (start_pos.y - cy).atan2(start_pos.x - cx);
+                                    let angle2 = (end_pos.y - cy).atan2(end_pos.x - cx);
+                                    
+                                    let mut diff = angle2 - angle1;
+                                    if diff < -std::f32::consts::PI { diff += std::f32::consts::TAU; }
+                                    if diff > std::f32::consts::PI { diff -= std::f32::consts::TAU; }
+                                    
+                                    let mut points = Vec::new();
+                                    let steps = 15;
+                                    for i in 0..=steps {
+                                        let t = i as f32 / steps as f32;
+                                        let a = angle1 + diff * t;
+                                        let px = cx + radius * a.cos();
+                                        let py = cy + radius * a.sin();
+                                        points.push(to_screen(egui::Pos2::new(px, py)));
+                                    }
+                                    
+                                    painter.add(egui::Shape::Path(egui::epaint::PathShape::line(points, stroke)));
+                                    continue;
                                 }
-                                
-                                painter.add(egui::Shape::Path(egui::epaint::PathShape::line(points, stroke)));
-                                continue;
-                            }
+                             }
                          }
                      }
 

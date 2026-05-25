@@ -29,6 +29,8 @@ impl Serialize for PsgFile {
 pub struct PsgGroup {
     pub x: f32,
     pub y: f32,
+    #[serde(rename = "isProxy")]
+    pub is_proxy: bool,
     pub nodes: Vec<PsgNode>,
 }
 
@@ -116,7 +118,7 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
         let y = read_f32(&mut offset)?;
         let _flag = read_u32(&mut offset)?;
         let _unknown1 = read_u32(&mut offset)?;
-        let _unknown2 = read_u8(&mut offset)?; // This is the 'b'
+        let unknown2 = read_u8(&mut offset)?; // This is the 'b'
         let passive_length = read_u32(&mut offset)?;
         
         // Skip padding? No padding mentioned.
@@ -150,6 +152,7 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
         groups.push(PsgGroup {
             x,
             y,
+            is_proxy: unknown2 == 1,
             nodes,
         });
     }
