@@ -5,6 +5,7 @@ use serde::ser::SerializeStruct;
 pub struct PsgFile {
     pub roots: Vec<u32>,
     pub groups: Vec<PsgGroup>,
+    pub passives_per_orbit: Vec<u8>,
 }
 
 impl Serialize for PsgFile {
@@ -16,11 +17,10 @@ impl Serialize for PsgFile {
         state.serialize_field("roots", &self.roots)?;
         state.serialize_field("groups", &self.groups)?;
         
-        let orbit_radii: &[i32] = &[0, 82, 162, 335, 493, 662, 846, 510, 765, 1020];
-        let orbit_sizes: &[u32] = &[1, 12, 24, 24, 72, 72, 72, 24, 72, 144];
+        let orbit_radii: &[i32] = &([0, 82, 162, 335, 493, 662, 846, 251, 1080, 1322][..]);
         
         state.serialize_field("orbitRadii", orbit_radii)?;
-        state.serialize_field("orbitSizes", orbit_sizes)?;
+        state.serialize_field("orbitSizes", &self.passives_per_orbit)?;
         state.end()
     }
 }
@@ -81,15 +81,14 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
         Ok(f32::from_le_bytes(bytes))
     };
 
-    // Header Parsing based on psg2.py
-    // version? u8
-    // Header Parsing based on Gist research: Root starts at 13.
-    // So we skip 13 bytes.
-    let header_size = 13;
-    if data.len() < header_size {
-        return Err("File too small for header".to_string());
+    // Header Parsing
+    let _version = read_u8(&mut offset)?;
+    let _graph_type = read_u8(&mut offset)?;
+    let passives_per_orbit_len = read_u8(&mut offset)?;
+    let mut passives_per_orbit = Vec::new();
+    for _ in 0..passives_per_orbit_len {
+        passives_per_orbit.push(read_u8(&mut offset)?);
     }
-    offset += header_size;
     
     // Root Length (u32)
     let root_length = read_u32(&mut offset)?;
@@ -158,6 +157,7 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
     Ok(PsgFile {
         roots,
         groups,
+        passives_per_orbit,
     })
 }
 
@@ -171,9 +171,11 @@ mod tests {
         let mut buffer = Vec::new();
         
         // Header
-        buffer.push(0); // Version
-        // Unknown data (12 bytes, total 13 byte header)
-        for _ in 0..12 { buffer.push(0); }
+        buffer.push(2); // Version
+        buffer.push(1); // Graph Type
+        buffer.push(10); // passives_per_orbit_len
+        // 10 values for passives_per_orbit
+        buffer.extend_from_slice(&[1, 12, 24, 24, 72, 72, 72, 24, 72, 144]);
         
         // Root Length: 1
         buffer.extend_from_slice(&1u32.to_le_bytes());
@@ -210,6 +212,7 @@ mod tests {
         assert_eq!(result.groups[0].nodes[0].skill_id, 200);
         assert_eq!(result.groups[0].nodes[0].connections[0].node_id, 300);
         assert_eq!(result.groups[0].nodes[0].connections[0].orbit, 0);
+        assert_eq!(result.passives_per_orbit, vec![1, 12, 24, 24, 72, 72, 72, 24, 72, 144]);
     }
 
     #[test]
@@ -217,12 +220,13 @@ mod tests {
         let psg = PsgFile {
             roots: vec![100],
             groups: vec![],
+            passives_per_orbit: vec![1, 12, 24, 24, 72, 72, 72, 24, 72, 144],
         };
         let serialized = serde_json::to_string(&psg).expect("Failed to serialize");
         let val: serde_json::Value = serde_json::from_str(&serialized).expect("Failed to parse JSON");
         assert_eq!(val.get("roots").unwrap().as_array().unwrap()[0].as_u64().unwrap(), 100);
         assert_eq!(val.get("groups").unwrap().as_array().unwrap().len(), 0);
-        assert_eq!(val.get("orbitRadii").unwrap(), &serde_json::json!([0, 82, 162, 335, 493, 662, 846, 510, 765, 1020]));
+        assert_eq!(val.get("orbitRadii").unwrap(), &serde_json::json!([0, 82, 162, 335, 493, 662, 846, 251, 1080, 1322]));
         assert_eq!(val.get("orbitSizes").unwrap(), &serde_json::json!([1, 12, 24, 24, 72, 72, 72, 24, 72, 144]));
     }
 }

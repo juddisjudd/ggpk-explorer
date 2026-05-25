@@ -12,8 +12,7 @@ use crate::dat::psg::PsgFile;
 // 7: Orbit 7
 // 8: Orbit 8
 // 9: Orbit 9
-const ORBIT_RADII: [f32; 10] = [0.0, 82.0, 162.0, 335.0, 493.0, 662.0, 846.0, 510.0, 765.0, 1020.0];
-const ORBIT_NODES: [u32; 10] = [1, 12, 24, 24, 72, 72, 72, 24, 72, 144]; // Capacities
+const ORBIT_RADII: [f32; 10] = [0.0, 82.0, 162.0, 335.0, 493.0, 662.0, 846.0, 251.0, 1080.0, 1322.0];
 
 pub struct PsgViewerState {
     pub pan: egui::Vec2,
@@ -127,7 +126,7 @@ impl<'a> PsgViewer<'a> {
                     // Standard orbit calculation
                     let r_idx = node.radius as usize;
                     let radius = if r_idx < ORBIT_RADII.len() { ORBIT_RADII[r_idx] } else { node.radius as f32 * 50.0 };
-                    let capacities = if r_idx < ORBIT_NODES.len() { ORBIT_NODES[r_idx] } else { 12 };
+                    let capacities = if r_idx < self.psg.passives_per_orbit.len() { self.psg.passives_per_orbit[r_idx] as u32 } else { 12 };
                     
                     // Angle
                     // Standard GGG: angle = -PI/2 + (2PI * position / capacity)

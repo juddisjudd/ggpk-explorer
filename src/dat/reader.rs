@@ -180,12 +180,12 @@ fn read_column_value(cursor: &mut Cursor<&[u8]>, col: &Column, file_data: &[u8],
         "short" | "i16" => {
              let mut b = [0u8; 2];
              cursor.read_exact(&mut b)?;
-             Ok(DatValue::Int(LittleEndian::read_i16(&b) as i64))
+             Ok(DatValue::Int(LittleEndian::read_i16(&b[..]) as i64))
         },
         "ushort" | "u16" => {
              let mut b = [0u8; 2];
              cursor.read_exact(&mut b)?;
-             Ok(DatValue::Int(LittleEndian::read_u16(&b) as i64))
+             Ok(DatValue::Int(LittleEndian::read_u16(&b[..]) as i64))
         },
         "int" | "i32" => {
              Ok(DatValue::Int(read_u32(cursor)? as i32 as i64))
@@ -297,13 +297,13 @@ pub enum DatValue {
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> io::Result<u32> {
     let mut buf = [0u8; 4];
     cursor.read_exact(&mut buf)?;
-    Ok(LittleEndian::read_u32(&buf))
+    Ok(LittleEndian::read_u32(&buf[..]))
 }
 
 fn read_u64(cursor: &mut Cursor<&[u8]>) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     cursor.read_exact(&mut buf)?;
-    Ok(LittleEndian::read_u64(&buf))
+    Ok(LittleEndian::read_u64(&buf[..]))
 }
 
 impl DatReader {
