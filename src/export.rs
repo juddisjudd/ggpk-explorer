@@ -224,10 +224,6 @@ fn export_single_file(
     let filename_display = path_str.clone();
     let path_lower = path_str.to_ascii_lowercase();
 
-    // Skip .header files as per user request
-    if path_lower.ends_with(".header") {
-        return Ok(format!("Skipped header: {}", filename_display));
-    }
     
     if path_lower.ends_with(".dds") {
         match settings.texture_format {

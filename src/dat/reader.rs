@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(reader.value_to_json(&DatValue::Bool(true), &col), serde_json::json!(true));
         assert_eq!(reader.value_to_json(&DatValue::Int(42), &col), serde_json::json!(42));
         assert_eq!(reader.value_to_json(&DatValue::Long(123456789), &col), serde_json::json!(123456789));
-        assert_eq!(reader.value_to_json(&DatValue::Float(3.14), &col), serde_json::json!(3.14f32));
+        assert_eq!(reader.value_to_json(&DatValue::Float(1.23), &col), serde_json::json!(1.23f32));
         assert_eq!(reader.value_to_json(&DatValue::String("hello".to_string()), &col), serde_json::json!("hello"));
         assert_eq!(reader.value_to_json(&DatValue::ForeignRow(77), &col), serde_json::json!("Key(77)"));
         assert_eq!(reader.value_to_json(&DatValue::Unknown, &col), serde_json::Value::Null);
