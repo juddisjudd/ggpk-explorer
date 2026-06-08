@@ -123,10 +123,25 @@ impl SettingsWindow {
                         settings.ggpk_path = if path.is_empty() { None } else { Some(path) };
                     }
                     if ui.button("Browse").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("GGPK", &["ggpk"]).pick_file() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("GGPK", &["ggpk"] as &[&str]).pick_file() {
                             settings.ggpk_path = Some(p.to_string_lossy().to_string());
                         }
                     }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Theme").size(12.5));
+                    egui::ComboBox::from_id_salt("theme_selector")
+                        .selected_text(match settings.theme.as_str() {
+                            "dark" => "Premium Dark",
+                            "light" => "Premium Light",
+                            _ => "System Preference",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut settings.theme, "system".to_string(), "System Preference");
+                            ui.selectable_value(&mut settings.theme, "dark".to_string(), "Premium Dark");
+                            ui.selectable_value(&mut settings.theme, "light".to_string(), "Premium Light");
+                        });
                 });
 
                 ui.separator();
@@ -149,10 +164,15 @@ impl SettingsWindow {
                         });
                     }
                     if let Some(msg) = &self.fetch_status_msg {
+                        let msg_color = if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(161, 161, 170)
+                        } else {
+                            egui::Color32::from_rgb(80, 80, 90)
+                        };
                         ui.label(
                             egui::RichText::new(msg)
                                 .size(11.5)
-                                .color(egui::Color32::from_rgb(161, 161, 170)),
+                                .color(msg_color),
                         );
                     }
                 });
@@ -179,10 +199,15 @@ impl SettingsWindow {
                     }
                 });
                 if let Some(date) = schema_date {
+                    let date_color = if ui.visuals().dark_mode {
+                        egui::Color32::from_rgb(113, 113, 122)
+                    } else {
+                        egui::Color32::from_rgb(80, 80, 90)
+                    };
                     ui.label(
                         egui::RichText::new(format!("Last updated: {}", date))
                             .size(11.5)
-                            .color(egui::Color32::from_rgb(113, 113, 122)),
+                            .color(date_color),
                     );
                 }
                 ui.checkbox(&mut settings.auto_update_schema, "Auto-update schema when a newer release is available");
@@ -192,19 +217,34 @@ impl SettingsWindow {
                         self.request_update_schema = true;
                     }
                     if let Some(msg) = &self.schema_status_msg {
+                        let msg_color = if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(161, 161, 170)
+                        } else {
+                            egui::Color32::from_rgb(80, 80, 90)
+                        };
                         ui.label(
                             egui::RichText::new(msg)
                                 .size(11.5)
-                                .color(egui::Color32::from_rgb(161, 161, 170)),
+                                .color(msg_color),
                         );
                     }
                     match &self.schema_update_status {
                         SchemaUpdateStatus::Checking => { ui.spinner(); },
                         SchemaUpdateStatus::UpToDate => {
-                            ui.label(egui::RichText::new("Up to date").size(11.5).color(egui::Color32::from_rgb(74, 222, 128)));
+                            let color = if ui.visuals().dark_mode {
+                                egui::Color32::from_rgb(74, 222, 128)
+                            } else {
+                                egui::Color32::from_rgb(22, 163, 74)
+                            };
+                            ui.label(egui::RichText::new("Up to date").size(11.5).color(color));
                         },
                         SchemaUpdateStatus::UpdateAvailable => {
-                            ui.label(egui::RichText::new("Update available").size(11.5).color(egui::Color32::from_rgb(250, 204, 21)));
+                            let color = if ui.visuals().dark_mode {
+                                egui::Color32::from_rgb(250, 204, 21)
+                            } else {
+                                egui::Color32::from_rgb(217, 119, 6)
+                            };
+                            ui.label(egui::RichText::new("Update available").size(11.5).color(color));
                         },
                         SchemaUpdateStatus::Error(e) => {
                             ui.label(egui::RichText::new(format!("Check failed: {}", e)).size(11.5).color(egui::Color32::from_rgb(239, 68, 68)));
@@ -233,10 +273,15 @@ impl SettingsWindow {
                         }
                     }
                     if let Some(msg) = &self.cache_status_msg {
+                        let msg_color = if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(161, 161, 170)
+                        } else {
+                            egui::Color32::from_rgb(80, 80, 90)
+                        };
                         ui.label(
                             egui::RichText::new(msg)
                                 .size(11.5)
-                                .color(egui::Color32::from_rgb(161, 161, 170)),
+                                .color(msg_color),
                         );
                     }
                 });

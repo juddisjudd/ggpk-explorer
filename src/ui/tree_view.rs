@@ -281,11 +281,16 @@ impl TreeView {
         let mut action = TreeViewAction::None;
         let mut trigger_search = false;
 
+        let label_color = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(113, 113, 122)
+        } else {
+            egui::Color32::from_rgb(80, 80, 90)
+        };
         ui.label(
             egui::RichText::new("FILTER TREE")
                 .monospace()
                 .size(10.5)
-                .color(egui::Color32::from_rgb(113, 113, 122)),
+                .color(label_color),
         );
 
         ui.horizontal(|ui| {
@@ -294,7 +299,11 @@ impl TreeView {
                     .id(ui.make_persistent_id("search_box"))
                     .hint_text(
                         egui::RichText::new("Search... (press enter)")
-                            .color(egui::Color32::from_rgb(82, 82, 91)),
+                            .color(if ui.visuals().dark_mode {
+                                egui::Color32::from_rgb(82, 82, 91)
+                            } else {
+                                egui::Color32::from_rgb(140, 140, 148)
+                            }),
                     )
                     .desired_width(ui.available_width()),
             );
@@ -309,14 +318,14 @@ impl TreeView {
                 ui.label(
                     egui::RichText::new("Searching bundle index...")
                         .size(11.0)
-                        .color(egui::Color32::from_rgb(113, 113, 122)),
+                        .color(label_color),
                 );
             });
         } else if !self.active_search_term.is_empty() {
             ui.label(
                 egui::RichText::new(format!("{} matches", self.match_count))
                     .size(11.0)
-                    .color(egui::Color32::from_rgb(113, 113, 122)),
+                    .color(label_color),
             );
         }
 
@@ -474,12 +483,22 @@ impl TreeView {
 
             let open_state = if use_filter_expand { Some(true) } else { None };
 
-            let response = egui::CollapsingHeader::new(
-                egui::RichText::new(&node.name).color(if is_selected {
+            let text_color = if ui.visuals().dark_mode {
+                if is_selected {
                     egui::Color32::from_rgb(236, 236, 240)
                 } else {
                     egui::Color32::from_rgb(200, 200, 206)
-                }),
+                }
+            } else {
+                if is_selected {
+                    egui::Color32::from_rgb(20, 20, 24)
+                } else {
+                    egui::Color32::from_rgb(40, 40, 48)
+                }
+            };
+
+            let response = egui::CollapsingHeader::new(
+                egui::RichText::new(&node.name).color(text_color),
             )
             .id_salt(ui.make_persistent_id(node_idx))
             .open(open_state)

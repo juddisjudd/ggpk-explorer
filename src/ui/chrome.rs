@@ -44,15 +44,28 @@ impl AppChrome {
             .map(|p| next_rect.contains(p))
             .unwrap_or(false);
 
+        let dark_mode = ui.visuals().dark_mode;
         let fill = if is_hovered {
-            egui::Color32::from_rgb(23, 23, 23)
+            if dark_mode {
+                egui::Color32::from_rgb(23, 23, 23)
+            } else {
+                egui::Color32::from_rgb(230, 230, 235)
+            }
         } else {
             egui::Color32::TRANSPARENT
         };
         let text_color = if is_hovered {
-            egui::Color32::from_rgb(228, 228, 231)
+            if dark_mode {
+                egui::Color32::from_rgb(228, 228, 231)
+            } else {
+                egui::Color32::from_rgb(24, 24, 28)
+            }
         } else {
-            egui::Color32::from_rgb(161, 161, 170)
+            if dark_mode {
+                egui::Color32::from_rgb(161, 161, 170)
+            } else {
+                egui::Color32::from_rgb(70, 70, 80)
+            }
         };
 
         ui.add(
@@ -72,26 +85,42 @@ impl AppChrome {
 
         // Must zero BOTH bg_fill and weak_bg_fill — egui 0.29 Button uses weak_bg_fill
         // for its background rect, not bg_fill.
+        let dark_mode = ui.visuals().dark_mode;
+        let inactive_text = if dark_mode {
+            egui::Color32::from_rgb(161, 161, 170)
+        } else {
+            egui::Color32::from_rgb(70, 70, 80)
+        };
+        let hover_bg = if dark_mode {
+            egui::Color32::from_rgb(39, 39, 42)
+        } else {
+            egui::Color32::from_rgb(230, 230, 235)
+        };
+        let active_text = if dark_mode {
+            egui::Color32::from_rgb(228, 228, 231)
+        } else {
+            egui::Color32::from_rgb(24, 24, 28)
+        };
+
         ui.visuals_mut().widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
         ui.visuals_mut().widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
         ui.visuals_mut().widgets.inactive.bg_stroke = egui::Stroke::NONE;
-        ui.visuals_mut().widgets.inactive.fg_stroke.color = egui::Color32::from_rgb(161, 161, 170);
+        ui.visuals_mut().widgets.inactive.fg_stroke.color = inactive_text;
 
-        let hover_bg = egui::Color32::from_rgb(39, 39, 42);
         ui.visuals_mut().widgets.hovered.bg_fill = hover_bg;
         ui.visuals_mut().widgets.hovered.weak_bg_fill = hover_bg;
         ui.visuals_mut().widgets.hovered.bg_stroke = egui::Stroke::NONE;
-        ui.visuals_mut().widgets.hovered.fg_stroke.color = egui::Color32::from_rgb(228, 228, 231);
+        ui.visuals_mut().widgets.hovered.fg_stroke.color = active_text;
 
         ui.visuals_mut().widgets.active.bg_fill = hover_bg;
         ui.visuals_mut().widgets.active.weak_bg_fill = hover_bg;
         ui.visuals_mut().widgets.active.bg_stroke = egui::Stroke::NONE;
-        ui.visuals_mut().widgets.active.fg_stroke.color = egui::Color32::from_rgb(228, 228, 231);
+        ui.visuals_mut().widgets.active.fg_stroke.color = active_text;
 
         ui.visuals_mut().widgets.open.bg_fill = hover_bg;
         ui.visuals_mut().widgets.open.weak_bg_fill = hover_bg;
         ui.visuals_mut().widgets.open.bg_stroke = egui::Stroke::NONE;
-        ui.visuals_mut().widgets.open.fg_stroke.color = egui::Color32::from_rgb(228, 228, 231);
+        ui.visuals_mut().widgets.open.fg_stroke.color = active_text;
 
         egui::menu::menu_button(ui, egui::RichText::new(label).size(13.0), add_contents);
 
@@ -145,12 +174,34 @@ impl AppChrome {
 
     fn show_location_breadcrumbs(ui: &mut egui::Ui, location: &str) {
         let parts: Vec<&str> = location.split('/').filter(|segment| !segment.is_empty()).collect();
+        let dark_mode = ui.visuals().dark_mode;
+        let root_color = if dark_mode {
+            egui::Color32::from_rgb(228, 228, 231)
+        } else {
+            egui::Color32::from_rgb(24, 24, 28)
+        };
+        let separator_color = if dark_mode {
+            egui::Color32::from_rgb(113, 113, 122)
+        } else {
+            egui::Color32::from_rgb(120, 120, 130)
+        };
+        let inactive_part = if dark_mode {
+            egui::Color32::from_rgb(161, 161, 170)
+        } else {
+            egui::Color32::from_rgb(80, 80, 90)
+        };
+        let active_part = if dark_mode {
+            egui::Color32::from_rgb(228, 228, 231)
+        } else {
+            egui::Color32::from_rgb(24, 24, 28)
+        };
+
         if parts.len() <= 1 {
             ui.label(
                 egui::RichText::new(location)
                     .size(11.5)
                     .monospace()
-                    .color(egui::Color32::from_rgb(228, 228, 231)),
+                    .color(root_color),
             );
             return;
         }
@@ -161,7 +212,7 @@ impl AppChrome {
                     egui::RichText::new("/")
                         .size(11.0)
                         .monospace()
-                        .color(egui::Color32::from_rgb(113, 113, 122)),
+                        .color(separator_color),
                 );
             }
             let is_current = idx + 1 == parts.len();
@@ -170,9 +221,9 @@ impl AppChrome {
                     .size(11.5)
                     .monospace()
                     .color(if is_current {
-                        egui::Color32::from_rgb(228, 228, 231)
+                        active_part
                     } else {
-                        egui::Color32::from_rgb(161, 161, 170)
+                        inactive_part
                     }),
             );
         }
@@ -232,10 +283,15 @@ impl AppChrome {
                                 .fit_to_exact_size(egui::vec2(16.0, 16.0)),
                         );
                         ui.add_space(6.0);
+                        let title_color = if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(161, 161, 170)
+                        } else {
+                            egui::Color32::from_rgb(70, 70, 80)
+                        };
                         ui.label(
                             egui::RichText::new("GGPK Explorer")
                                 .size(12.5)
-                                .color(egui::Color32::from_rgb(161, 161, 170)),
+                                .color(title_color),
                         );
 
                         ui.add_space(10.0);
@@ -305,11 +361,16 @@ impl AppChrome {
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.add_space(12.0);
+                        let path_label_color = if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(113, 113, 122)
+                        } else {
+                            egui::Color32::from_rgb(100, 100, 110)
+                        };
                         ui.label(
                             egui::RichText::new("PATH")
                                 .size(10.5)
                                 .monospace()
-                                .color(egui::Color32::from_rgb(113, 113, 122)),
+                                .color(path_label_color),
                         );
                         ui.add_space(4.0);
                         Self::show_location_breadcrumbs(ui, location);

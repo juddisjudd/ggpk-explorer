@@ -49,16 +49,37 @@ pub struct ExplorerApp {
     pub command_palette: crate::ui::command_palette::CommandPalette,
     pub command_palette_items: Vec<crate::ui::command_palette::CommandPaletteItem>,
     pub command_palette_needs_refresh: bool,
+    pub last_theme_dark: Option<bool>,
+    pub last_applied_theme: Option<String>,
 }
 
 impl ExplorerApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        // Apply premium dark theme
+        let settings = crate::settings::AppSettings::load();
+
+        // Apply theme preferences dynamically on startup
+        let is_dark = match settings.theme.as_str() {
+            "light" => false,
+            "dark" => true,
+            _ => _cc.egui_ctx.style().visuals.dark_mode,
+        };
+
+        _cc.egui_ctx.options_mut(|o| {
+            o.theme_preference = match settings.theme.as_str() {
+                "dark" => egui::ThemePreference::Dark,
+                "light" => egui::ThemePreference::Light,
+                _ => egui::ThemePreference::System,
+            };
+        });
+
         let mut style = (*_cc.egui_ctx.style()).clone();
-        crate::ui::theme::PremiumDarkTheme::apply_to_style(&mut style);
+        if is_dark {
+            crate::ui::theme::PremiumDarkTheme::apply_to_style(&mut style);
+        } else {
+            crate::ui::theme::PremiumLightTheme::apply_to_style(&mut style);
+        }
         _cc.egui_ctx.set_style(style);
 
-        let settings = crate::settings::AppSettings::load();
         let mut content_view = ContentView::default();
         
         let app_data_dir = crate::settings::AppSettings::get_app_data_dir();
@@ -127,6 +148,8 @@ impl ExplorerApp {
             command_palette: crate::ui::command_palette::CommandPalette::default(),
             command_palette_items: Vec::new(),
             command_palette_needs_refresh: true,
+            last_theme_dark: Some(is_dark),
+            last_applied_theme: Some(settings.theme.clone()),
         };
 
 
@@ -161,7 +184,7 @@ impl ExplorerApp {
     }
 
     fn open_ggpk(&mut self, ctx: &egui::Context) {
-        if let Some(path) = FileDialog::new().add_filter("GGPK", &["ggpk"]).pick_file() {
+        if let Some(path) = FileDialog::new().add_filter("GGPK", &["ggpk"] as &[&str]).pick_file() {
             self.settings.ggpk_path = Some(path.to_string_lossy().to_string());
             self.settings.steam_path = None;
             self.settings.save();
@@ -308,7 +331,7 @@ impl ExplorerApp {
                                     Err(e) => extra_status = format!(" (Read Error: {})", e),
                                 }
                             },
-                            Ok(None) => {
+                            Ok(std::option::Option::None) => {
                                 eprintln!("Bundles2/_.index.bin not found. This is normal for PoE 1 or un-bundled GGPKs.");
                             }, 
                             Err(e) => extra_status = format!(" (Find Error: {})", e),
@@ -456,7 +479,7 @@ impl ExplorerApp {
                 .and_then(|reader| reader.read_file_record(*offset).ok())
                 .map(|file| file.name)
                 .unwrap_or_else(|| format!("GGPK Offset 0x{:x}", offset)),
-            None => {
+            std::option::Option::None => {
                 if self.reader.is_some() {
                     "Folder: Bundles".to_string()
                 } else {
@@ -573,7 +596,7 @@ impl ExplorerApp {
                             inspector_kv(ui, "Type", "raw record");
                             inspector_kv(ui, "Offset", &format!("0x{:x}", offset));
                         }
-                        None => {
+                        std::option::Option::None => {
                             ui.add_space(ui.available_height() * 0.4);
                             ui.vertical_centered(|ui| {
                                 ui.label(
@@ -596,7 +619,7 @@ fn handle_resize_zones(ctx: &egui::Context) {
 
     let pos = match ctx.input(|i| i.pointer.latest_pos()) {
         Some(p) => p,
-        None => return,
+        std::option::Option::None => return,
     };
 
     let on_left   = pos.x < screen.min.x + border;
@@ -693,6 +716,31 @@ fn download_latest_schema(target_path: &str) -> Result<String, String> {
 
 impl eframe::App for ExplorerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Enforce the preferred theme (Dark, Light, or System) dynamically
+        let current_pref = self.settings.theme.as_str();
+        if self.last_applied_theme.as_deref() != Some(current_pref) {
+            ctx.options_mut(|o| {
+                o.theme_preference = match current_pref {
+                    "dark" => egui::ThemePreference::Dark,
+                    "light" => egui::ThemePreference::Light,
+                    _ => egui::ThemePreference::System,
+                };
+            });
+            self.last_applied_theme = Some(self.settings.theme.clone());
+        }
+
+        let current_dark = ctx.style().visuals.dark_mode;
+        if self.last_theme_dark != Some(current_dark) {
+            ctx.style_mut(|style| {
+                if current_dark {
+                    crate::ui::theme::PremiumDarkTheme::apply_to_style(style);
+                } else {
+                    crate::ui::theme::PremiumLightTheme::apply_to_style(style);
+                }
+            });
+            self.last_theme_dark = Some(current_dark);
+        }
+
         self.update_state.poll();
         
         // Poll loader

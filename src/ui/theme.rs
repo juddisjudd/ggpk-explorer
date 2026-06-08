@@ -106,6 +106,72 @@ impl PremiumDarkTheme {
     }
 }
 
+pub struct PremiumLightTheme;
+
+impl PremiumLightTheme {
+    pub fn get_visuals() -> egui::Visuals {
+        let mut visuals = egui::Visuals::light();
+
+        let bg_primary = Color::from_rgb(250, 250, 252);
+        let bg_secondary = Color::from_rgb(243, 243, 246);
+        let bg_tertiary = Color::from_rgb(230, 230, 235);
+        let bg_hover = Color::from_rgb(236, 236, 241);
+        let border = Color::from_rgb(215, 215, 222);
+        let border_strong = Color::from_rgb(180, 180, 190);
+        let text_primary = Color::from_rgb(24, 24, 28);
+        let text_muted = Color::from_rgb(70, 70, 80);
+        let selection = Color::from_rgb(220, 225, 238);
+
+        visuals.panel_fill = bg_primary;
+        visuals.window_fill = bg_primary;
+        visuals.extreme_bg_color = bg_tertiary;
+        visuals.faint_bg_color = bg_secondary;
+        visuals.override_text_color = Some(text_primary);
+        visuals.window_rounding = egui::Rounding::same(6.0);
+        visuals.window_shadow = egui::Shadow {
+            offset: egui::vec2(0.0, 4.0),
+            blur: 18.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(20),
+        };
+        visuals.window_stroke = egui::Stroke::new(1.0, border);
+
+        visuals.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.noninteractive.bg_fill = bg_secondary;
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_muted);
+
+        visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.inactive.bg_fill = bg_secondary;
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_primary);
+
+        visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.hovered.bg_fill = bg_hover;
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, border_strong);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text_primary);
+
+        visuals.widgets.active.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.active.bg_fill = selection;
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, border_strong);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text_primary);
+
+        visuals.selection.bg_fill = selection;
+        visuals.selection.stroke = egui::Stroke::new(1.0, border_strong);
+        visuals.hyperlink_color = Color::from_rgb(50, 70, 150);
+
+        visuals
+    }
+
+    pub fn apply_to_style(style: &mut egui::Style) {
+        style.visuals = Self::get_visuals();
+        for (text_style, font_id) in PremiumDarkTheme::text_styles() {
+            style.text_styles.insert(text_style, font_id);
+        }
+        style.spacing = PremiumDarkTheme::spacing();
+    }
+}
+
 type Color = egui::Color32;
 
 #[cfg(test)]
@@ -114,11 +180,14 @@ mod tests {
 
     #[test]
     fn test_theme_creation() {
-        let visuals = PremiumDarkTheme::get_visuals();
-        assert_ne!(visuals.panel_fill, egui::Color32::WHITE);
+        let visuals_dark = PremiumDarkTheme::get_visuals();
+        assert_ne!(visuals_dark.panel_fill, egui::Color32::WHITE);
+        
+        let visuals_light = PremiumLightTheme::get_visuals();
+        assert_eq!(visuals_light.panel_fill, egui::Color32::from_rgb(250, 250, 252));
         
         let text_styles = PremiumDarkTheme::text_styles();
-        assert_eq!(text_styles.len(), 5); // Small, Body, Monospace, Button, Heading
+        assert_eq!(text_styles.len(), 5);
         
         let spacing = PremiumDarkTheme::spacing();
         assert!(spacing.item_spacing.x > 0.0);

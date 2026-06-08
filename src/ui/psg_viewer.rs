@@ -678,11 +678,21 @@ impl<'a> PsgViewer<'a> {
 
                           // Highlight hovered and root nodes
                           let stroke = if is_hovered {
-                              egui::Stroke::new(2.0 * self.state.zoom, egui::Color32::WHITE)
+                              let stroke_color = if ui.visuals().dark_mode {
+                                  egui::Color32::WHITE
+                              } else {
+                                  egui::Color32::from_rgb(20, 20, 20)
+                              };
+                              egui::Stroke::new(2.0 * self.state.zoom, stroke_color)
                           } else if self.psg.roots.contains(&node.skill_id) {
                               egui::Stroke::new(1.5 * self.state.zoom, egui::Color32::from_rgb(255, 215, 0)) // Gold
                           } else {
-                              egui::Stroke::new(1.0 * self.state.zoom, egui::Color32::from_rgb(20, 20, 20))  // Subtle dark border
+                              let border_color = if ui.visuals().dark_mode {
+                                  egui::Color32::from_rgb(20, 20, 20)
+                              } else {
+                                  egui::Color32::from_rgb(160, 160, 165)
+                              };
+                              egui::Stroke::new(1.0 * self.state.zoom, border_color)  // Subtle border
                           };
 
                           painter.circle(screen_pos, radius, color, stroke);
@@ -699,7 +709,11 @@ impl<'a> PsgViewer<'a> {
                                  "keystone" => egui::Color32::from_rgb(255, 90, 120),  // Pink/Rose
                                  "notable" => egui::Color32::from_rgb(255, 200, 50),   // Orange/Gold
                                  "jewel" => egui::Color32::from_rgb(0, 220, 180),      // Teal
-                                 _ => egui::Color32::WHITE,
+                                 _ => if ui.visuals().dark_mode {
+                                     egui::Color32::WHITE
+                                 } else {
+                                     egui::Color32::from_rgb(24, 24, 28)
+                                 },
                              };
                              
                              ui.vertical(|ui| {
@@ -712,14 +726,24 @@ impl<'a> PsgViewer<'a> {
                                      "mastery" => "Passive Skill Mastery",
                                      _ => "Passive Skill",
                                  };
-                                 ui.label(egui::RichText::new(type_label).color(egui::Color32::from_rgb(150, 150, 150)).size(11.0).italics());
+                                 let type_color = if ui.visuals().dark_mode {
+                                     egui::Color32::from_rgb(150, 150, 150)
+                                 } else {
+                                     egui::Color32::from_rgb(100, 100, 110)
+                                 };
+                                 ui.label(egui::RichText::new(type_label).color(type_color).size(11.0).italics());
                                  
                                  if !compact.s.is_empty() {
                                      ui.add_space(4.0);
                                      ui.separator();
                                      ui.add_space(4.0);
                                      for stat in &compact.s {
-                                         ui.label(egui::RichText::new(stat).color(egui::Color32::from_rgb(180, 210, 255)).size(12.0));
+                                         let stat_color = if ui.visuals().dark_mode {
+                                             egui::Color32::from_rgb(180, 210, 255)
+                                         } else {
+                                             egui::Color32::from_rgb(37, 99, 235)
+                                         };
+                                         ui.label(egui::RichText::new(stat).color(stat_color).size(12.0));
                                      }
                                  }
                              });

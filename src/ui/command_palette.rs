@@ -96,8 +96,8 @@ impl CommandPalette {
             .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 72.0))
             .show(ctx, |ui| {
                 egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(18, 18, 20))
-                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 42, 46)))
+                    .fill(ui.visuals().window_fill)
+                    .stroke(ui.visuals().window_stroke)
                     .rounding(egui::Rounding::same(12.0))
                     .inner_margin(egui::Margin::same(14.0))
                     .show(ui, |ui| {
@@ -143,12 +143,12 @@ impl CommandPalette {
                                 let item = &items[*idx];
                                 let selected = row == self.selected_index;
                                 let fill = if selected {
-                                    egui::Color32::from_rgb(34, 34, 38)
+                                    ui.visuals().selection.bg_fill
                                 } else {
                                     egui::Color32::TRANSPARENT
                                 };
                                 let stroke = if selected {
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(66, 66, 74))
+                                    ui.visuals().selection.stroke
                                 } else {
                                     egui::Stroke::NONE
                                 };
@@ -171,7 +171,7 @@ impl CommandPalette {
                                                     egui::RichText::new(format!("{:016x}", item.hash))
                                                         .monospace()
                                                         .size(10.0)
-                                                        .color(egui::Color32::from_rgb(122, 122, 130)),
+                                                        .color(ui.visuals().weak_text_color()),
                                                 );
                                             });
                                         });

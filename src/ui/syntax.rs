@@ -27,6 +27,20 @@ impl Theme {
             type_name: egui::Color32::from_rgb(78, 201, 176), // Teal
         }
     }
+
+    pub fn light() -> Self {
+        Self {
+            display_name: "Light".into(),
+            background: egui::Color32::from_rgb(250, 250, 252),
+            cursor: egui::Color32::BLACK,
+            selection: egui::Color32::from_rgba_premultiplied(200, 220, 240, 120),
+            normal: egui::Color32::from_rgb(24, 24, 28),
+            keyword: egui::Color32::from_rgb(9, 79, 172), // Blue
+            literal: egui::Color32::from_rgb(3, 117, 43), // Greenish
+            comment: egui::Color32::from_rgb(100, 100, 110), // Grayish green
+            type_name: egui::Color32::from_rgb(112, 26, 173), // Purple
+        }
+    }
 }
 
 pub fn highlight(ctx: &egui::Context, theme: &Theme, text: &str, language: &str) -> egui::text::LayoutJob {

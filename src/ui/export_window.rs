@@ -107,11 +107,16 @@ impl ExportWindow {
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 5.0;
 
+                let name_color = if ui.visuals().dark_mode {
+                    egui::Color32::from_rgb(228, 228, 231)
+                } else {
+                    egui::Color32::from_rgb(24, 24, 28)
+                };
                 ui.label(
                     egui::RichText::new(&self.target_name)
                         .size(13.0)
                         .monospace()
-                        .color(egui::Color32::from_rgb(228, 228, 231)),
+                        .color(name_color),
                 );
 
                 if show_all || is_dds {
@@ -164,11 +169,16 @@ impl ExportWindow {
                             .map(|h| h.len())
                             .unwrap_or(self.hashes.len())
                     };
+                    let count_color = if ui.visuals().dark_mode {
+                        egui::Color32::from_rgb(113, 113, 122)
+                    } else {
+                        egui::Color32::from_rgb(80, 80, 90)
+                    };
                     ui.label(
                         egui::RichText::new(format!("FILES TO EXPORT · {}", export_count))
                             .monospace()
                             .size(10.5)
-                            .color(egui::Color32::from_rgb(113, 113, 122)),
+                            .color(count_color),
                     );
                 }
 

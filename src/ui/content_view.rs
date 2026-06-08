@@ -266,7 +266,11 @@ impl ContentView {
                                                       egui::RichText::new(format!("{:.0}%", state.zoom * 100.0))
                                                           .size(11.5)
                                                           .monospace()
-                                                          .color(egui::Color32::from_rgb(161, 161, 170)),
+                                                          .color(if ui.visuals().dark_mode {
+                                                              egui::Color32::from_rgb(161, 161, 170)
+                                                          } else {
+                                                              egui::Color32::from_rgb(70, 70, 80)
+                                                          }),
                                                   );
                                                   ui.add_space(4.0);
                                                   if ui.small_button("+").clicked() {
@@ -288,7 +292,11 @@ impl ContentView {
                                                               texture_size.y as u32
                                                           ))
                                                           .size(11.0)
-                                                          .color(egui::Color32::from_rgb(113, 113, 122)),
+                                                          .color(if ui.visuals().dark_mode {
+                                                              egui::Color32::from_rgb(113, 113, 122)
+                                                          } else {
+                                                              egui::Color32::from_rgb(100, 100, 110)
+                                                          }),
                                                       );
                                                   });
                                               });
@@ -417,7 +425,11 @@ impl ContentView {
                                                           "text"
                                                       };
 
-                                                      let theme = crate::ui::syntax::Theme::dark();
+                                                      let theme = if ui.visuals().dark_mode {
+                                                          crate::ui::syntax::Theme::dark()
+                                                      } else {
+                                                          crate::ui::syntax::Theme::light()
+                                                      };
                                                       let mut layouter = |ui: &egui::Ui, string: &str, _wrap_width: f32| {
                                                           let mut layout_job = crate::ui::syntax::highlight(ui.ctx(), &theme, string, language);
                                                           layout_job.wrap.max_width = f32::INFINITY; 
@@ -476,7 +488,11 @@ impl ContentView {
         ui.label(
             egui::RichText::new(&path)
                 .heading()
-                .color(egui::Color32::from_rgb(236, 236, 240)),
+                .color(if ui.visuals().dark_mode {
+                    egui::Color32::from_rgb(236, 236, 240)
+                } else {
+                    egui::Color32::from_rgb(24, 24, 28)
+                }),
         );
         ui.add_space(4.0);
         if let Some(index) = bundle_index {
@@ -495,7 +511,11 @@ impl ContentView {
             egui::RichText::new(format!("ENTRIES · {}", total_entries))
                 .monospace()
                 .size(10.5)
-                .color(egui::Color32::from_rgb(113, 113, 122)),
+                .color(if ui.visuals().dark_mode {
+                    egui::Color32::from_rgb(113, 113, 122)
+                } else {
+                    egui::Color32::from_rgb(80, 80, 90)
+                }),
         );
         ui.separator();
 
@@ -504,7 +524,11 @@ impl ContentView {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new(format!("{} has no direct file entries.", name))
-                        .color(egui::Color32::from_rgb(126, 126, 134)),
+                        .color(if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(126, 126, 134)
+                        } else {
+                            egui::Color32::from_rgb(80, 80, 90)
+                        }),
                 );
             });
             return;

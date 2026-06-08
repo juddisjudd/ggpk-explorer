@@ -16,6 +16,12 @@ pub struct AppSettings {
     #[serde(default = "default_auto_update_schema")]
     pub auto_update_schema: bool,
     pub schema_local_path: Option<String>,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_theme() -> String {
+    "system".to_string()
 }
 
 fn default_patch_version() -> String {
@@ -45,6 +51,7 @@ impl Default for AppSettings {
             auto_detect_patch_version: default_auto_detect_patch_version(),
             auto_update_schema: default_auto_update_schema(),
             schema_local_path: None,
+            theme: default_theme(),
         }
     }
 }

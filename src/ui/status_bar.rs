@@ -26,10 +26,31 @@ impl StatusBar {
                     |ui| {
                         ui.add_space(10.0);
 
+                        let dark_mode = ui.visuals().dark_mode;
+
                         // Mounted chip
                         if is_mounted {
-                            let chip_color = egui::Color32::from_rgb(31, 31, 35);
-                            let dot_color = egui::Color32::from_rgb(74, 222, 128); // green
+                            let chip_color = if dark_mode {
+                                egui::Color32::from_rgb(31, 31, 35)
+                            } else {
+                                egui::Color32::from_rgb(220, 235, 225)
+                            };
+                            let chip_border = if dark_mode {
+                                egui::Color32::from_rgb(42, 42, 46)
+                            } else {
+                                egui::Color32::from_rgb(180, 200, 185)
+                            };
+                            let chip_text_color = if dark_mode {
+                                egui::Color32::from_rgb(228, 228, 231)
+                            } else {
+                                egui::Color32::from_rgb(20, 80, 40)
+                            };
+                            let dot_color = if dark_mode {
+                                egui::Color32::from_rgb(74, 222, 128)
+                            } else {
+                                egui::Color32::from_rgb(34, 197, 94)
+                            };
+
                             let (rect, _) = ui.allocate_exact_size(
                                 egui::vec2(76.0, 18.0),
                                 egui::Sense::hover(),
@@ -42,7 +63,7 @@ impl StatusBar {
                             ui.painter().rect_stroke(
                                 rect,
                                 egui::Rounding::same(3.0),
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(42, 42, 46)),
+                                egui::Stroke::new(1.0, chip_border),
                             );
                             // dot
                             let dot_center = egui::pos2(rect.min.x + 10.0, rect.center().y);
@@ -53,19 +74,30 @@ impl StatusBar {
                                 egui::Align2::LEFT_CENTER,
                                 "Mounted",
                                 egui::FontId::monospace(10.0),
-                                egui::Color32::from_rgb(228, 228, 231),
+                                chip_text_color,
                             );
                             ui.add_space(6.0);
                         }
 
                         // Status message / loading
                         if !status_msg.is_empty() {
+                            let dot_color = if dark_mode {
+                                egui::Color32::from_rgb(82, 82, 91)
+                            } else {
+                                egui::Color32::from_rgb(120, 120, 130)
+                            };
+                            let text_color = if dark_mode {
+                                egui::Color32::from_rgb(168, 168, 176)
+                            } else {
+                                egui::Color32::from_rgb(70, 70, 80)
+                            };
+
                             if is_mounted {
                                 ui.label(
                                     egui::RichText::new("\u{00B7}")
                                         .monospace()
                                         .size(11.0)
-                                        .color(egui::Color32::from_rgb(82, 82, 91)),
+                                        .color(dot_color),
                                 );
                                 ui.add_space(2.0);
                             }
@@ -73,7 +105,7 @@ impl StatusBar {
                                 egui::RichText::new(status_msg)
                                     .monospace()
                                     .size(11.0)
-                                    .color(egui::Color32::from_rgb(168, 168, 176)),
+                                    .color(text_color),
                             );
                         }
                         if is_loading {
@@ -82,35 +114,41 @@ impl StatusBar {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(10.0);
+                            let meta_color = if dark_mode {
+                                egui::Color32::from_rgb(82, 82, 91)
+                            } else {
+                                egui::Color32::from_rgb(100, 100, 110)
+                            };
+
                             ui.label(
                                 egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                                     .monospace()
                                     .size(10.5)
-                                    .color(egui::Color32::from_rgb(82, 82, 91)),
+                                    .color(meta_color),
                             );
                             ui.label(
                                 egui::RichText::new("\u{00B7}")
                                     .monospace()
                                     .size(10.5)
-                                    .color(egui::Color32::from_rgb(82, 82, 91)),
+                                    .color(meta_color),
                             );
                             ui.label(
                                 egui::RichText::new(format!("Patch {}", poe_version))
                                     .monospace()
                                     .size(10.5)
-                                    .color(egui::Color32::from_rgb(82, 82, 91)),
+                                    .color(meta_color),
                             );
                             ui.label(
                                 egui::RichText::new("\u{00B7}")
                                     .monospace()
                                     .size(10.5)
-                                    .color(egui::Color32::from_rgb(82, 82, 91)),
+                                    .color(meta_color),
                             );
                             ui.label(
                                 egui::RichText::new(format!("Schema {}", schema_date))
                                     .monospace()
                                     .size(10.5)
-                                    .color(egui::Color32::from_rgb(82, 82, 91)),
+                                    .color(meta_color),
                             );
                         });
                     },

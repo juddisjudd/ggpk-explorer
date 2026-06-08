@@ -10,18 +10,32 @@ impl Sidebar {
         let button_size = egui::vec2(24.0, 24.0);
         let (rect, response) = ui.allocate_exact_size(button_size, egui::Sense::click());
 
+        let dark_mode = ui.visuals().dark_mode;
         if response.hovered() {
+            let bg_color = if dark_mode {
+                egui::Color32::from_rgb(42, 42, 46)
+            } else {
+                egui::Color32::from_rgb(220, 220, 225)
+            };
             ui.painter().rect_filled(
                 rect,
                 egui::Rounding::same(4.0),
-                egui::Color32::from_rgb(42, 42, 46),
+                bg_color,
             );
         }
 
         let text_color = if response.hovered() {
-            egui::Color32::from_rgb(228, 228, 231)
+            if dark_mode {
+                egui::Color32::from_rgb(228, 228, 231)
+            } else {
+                egui::Color32::from_rgb(24, 24, 28)
+            }
         } else {
-            egui::Color32::from_rgb(161, 161, 170)
+            if dark_mode {
+                egui::Color32::from_rgb(161, 161, 170)
+            } else {
+                egui::Color32::from_rgb(80, 80, 90)
+            }
         };
 
         ui.painter().text(
@@ -87,11 +101,16 @@ impl Sidebar {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.add_space(10.0);
+                    let label_color = if ui.visuals().dark_mode {
+                        egui::Color32::from_rgb(113, 113, 122)
+                    } else {
+                        egui::Color32::from_rgb(80, 80, 90)
+                    };
                     ui.label(
                         egui::RichText::new("GGPK Content")
                             .monospace()
                             .size(10.5)
-                            .color(egui::Color32::from_rgb(113, 113, 122)),
+                            .color(label_color),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(6.0);

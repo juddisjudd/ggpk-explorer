@@ -14,12 +14,25 @@ impl JsonTreeViewer {
     fn show_recursive(ui: &mut Ui, value: &Value, key: Option<&str>, is_last: bool) {
         let font_id = FontId::monospace(14.0);
         
-        let color_key = Color32::from_rgb(97, 175, 239); // Blue
-        let color_string = Color32::from_rgb(152, 195, 121); // Green
-        let color_number = Color32::from_rgb(209, 154, 102); // Orange
-        let color_bool = Color32::from_rgb(209, 154, 102); // Orange (same as number usually)
-        let color_null = Color32::from_rgb(86, 182, 194); // Cyan
-        let color_punct = Color32::from_rgb(171, 178, 191); // Light Gray
+        let (color_key, color_string, color_number, color_bool, color_null, color_punct) = if ui.visuals().dark_mode {
+            (
+                Color32::from_rgb(97, 175, 239), // Blue
+                Color32::from_rgb(152, 195, 121), // Green
+                Color32::from_rgb(209, 154, 102), // Orange
+                Color32::from_rgb(209, 154, 102), // Orange
+                Color32::from_rgb(86, 182, 194), // Cyan
+                Color32::from_rgb(171, 178, 191), // Light Gray
+            )
+        } else {
+            (
+                Color32::from_rgb(9, 79, 172), // Dark Blue
+                Color32::from_rgb(3, 117, 43), // Dark Green
+                Color32::from_rgb(180, 83, 9), // Dark Orange/Brown
+                Color32::from_rgb(180, 83, 9), // Dark Orange/Brown
+                Color32::from_rgb(13, 116, 124), // Teal
+                Color32::from_rgb(80, 80, 90), // Darker Gray
+            )
+        };
 
         let comma = if is_last { "" } else { "," };
 

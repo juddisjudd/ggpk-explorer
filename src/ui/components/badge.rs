@@ -1,8 +1,8 @@
 use eframe::egui;
 
 pub fn badge(ui: &mut egui::Ui, text: &str) {
-    let fill = egui::Color32::from_rgb(20, 20, 22);
-    let stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 38, 42));
+    let fill = ui.visuals().widgets.noninteractive.bg_fill;
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
 
     egui::Frame::none()
         .fill(fill)
@@ -14,7 +14,7 @@ pub fn badge(ui: &mut egui::Ui, text: &str) {
                 egui::RichText::new(text)
                     .size(11.0)
                     .monospace()
-                    .color(egui::Color32::from_rgb(168, 168, 176)),
+                    .color(ui.visuals().weak_text_color()),
             );
         });
 }
