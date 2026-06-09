@@ -4,11 +4,12 @@ use crate::bundles::index::Index;
 use crate::ggpk::reader::GgpkReader;
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread;
+use serde::{Serialize, Deserialize};
 
 pub struct TreeView {
     reader: Option<Arc<GgpkReader>>,
     // Flattened Tree Storage
-    nodes: Vec<FlatNode>,
+    pub nodes: Vec<FlatNode>,
     root_id: Option<usize>,
 
     search_term: String,
@@ -26,6 +27,7 @@ pub struct TreeView {
     render_limit: std::cell::Cell<usize>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlatNode {
     pub name: String,
     pub children: Vec<usize>,
@@ -93,6 +95,33 @@ impl TreeView {
             search_rx: Some(rx),
             ..Default::default()
         }
+    }
+
+    pub fn new_with_nodes(reader: Option<Arc<GgpkReader>>, nodes: Vec<FlatNode>) -> Self {
+        let root_id = if nodes.is_empty() { None } else { Some(0) };
+        let (tx, rx) = channel();
+        Self {
+            reader,
+            nodes,
+            root_id,
+            search_tx: Some(tx),
+            search_rx: Some(rx),
+            ..Default::default()
+        }
+    }
+
+    pub fn save_nodes_to_cache<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        bincode::serialize_into(&mut writer, &self.nodes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
+
+    pub fn load_nodes_from_cache<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<Vec<FlatNode>> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = std::io::BufReader::new(file);
+        bincode::deserialize_from(&mut reader)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
     pub fn command_palette_items(&self, max_items: usize) -> Vec<crate::ui::command_palette::CommandPaletteItem> {

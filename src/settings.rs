@@ -239,6 +239,7 @@ impl AppSettings {
         let dir = Self::get_app_data_dir();
         let cache_dir = dir.join("cache");
         let cache_file = dir.join("bundles2.cache");
+        let tree_cache = dir.join("bundles2.tree.cache");
         let mut size = 0;
 
         if cache_dir.exists() {
@@ -256,6 +257,12 @@ impl AppSettings {
                  size += metadata.len();
              }
         }
+
+        if tree_cache.exists() {
+             if let Ok(metadata) = std::fs::metadata(&tree_cache) {
+                 size += metadata.len();
+             }
+        }
         
         size
     }
@@ -264,6 +271,7 @@ impl AppSettings {
         let dir = Self::get_app_data_dir();
         let cache_dir = dir.join("cache");
         let cache_file = dir.join("bundles2.cache");
+        let tree_cache = dir.join("bundles2.tree.cache");
 
         if cache_dir.exists() {
             std::fs::remove_dir_all(&cache_dir)?;
@@ -272,6 +280,10 @@ impl AppSettings {
         
         if cache_file.exists() {
             std::fs::remove_file(&cache_file)?;
+        }
+
+        if tree_cache.exists() {
+            std::fs::remove_file(&tree_cache)?;
         }
         Ok(())
     }

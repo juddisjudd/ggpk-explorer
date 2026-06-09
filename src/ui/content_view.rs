@@ -12,6 +12,14 @@ use crate::ui::text_config_viewer::TextConfigViewer;
 use egui_extras::{Column, TableBuilder};
 use std::collections::BTreeMap;
 
+// Caps to keep memory bounded as the user browses many files.
+// Textures live in VRAM (PoE DDS textures are frequently 2K-4K = tens of MB
+// each); without eviction the GPU driver eventually spills to system memory and
+// every repaint — including window drags — stalls. Dropping a TextureHandle
+// frees the VRAM, so we keep a small most-recently-used set.
+const MAX_CACHED_TEXTURES: usize = 16;
+const MAX_RAW_CACHE_BYTES: usize = 96 * 1024 * 1024; // raw file bytes in system RAM
+
 struct ImageViewState {
     zoom: f32,
     pan: egui::Vec2,
@@ -26,7 +34,10 @@ impl ImageViewState {
 
 pub struct ContentView {
     texture_cache: HashMap<u64, egui::TextureHandle>,
+    texture_lru: Vec<u64>,
     raw_data_cache: HashMap<u64, Vec<u8>>,
+    raw_cache_order: Vec<u64>,
+    raw_cache_bytes: usize,
     pub csd_cache: HashMap<u64, csd::CsdFile>,
     pub csd_language_filter: Option<String>,
     pub json_cache: HashMap<u64, serde_json::Value>,
@@ -56,7 +67,10 @@ impl Default for ContentView {
     fn default() -> Self {
         Self {
             texture_cache: HashMap::new(),
+            texture_lru: Vec::new(),
             raw_data_cache: HashMap::new(),
+            raw_cache_order: Vec::new(),
+            raw_cache_bytes: 0,
             csd_cache: HashMap::new(),
             csd_language_filter: Some("English".to_string()),
             json_cache: HashMap::new(),
@@ -102,6 +116,47 @@ impl ContentView {
     
     pub fn set_dat_schema(&mut self, schema: crate::dat::schema::Schema, created_at: String) {
         self.dat_viewer.set_schema(schema, created_at);
+    }
+
+    /// Insert a decoded texture, evicting the least-recently-used one(s) so the
+    /// GPU texture set stays bounded (see `MAX_CACHED_TEXTURES`).
+    fn insert_texture(&mut self, hash: u64, texture: egui::TextureHandle) {
+        self.texture_cache.insert(hash, texture);
+        self.touch_texture(hash);
+        while self.texture_lru.len() > MAX_CACHED_TEXTURES {
+            let evicted = self.texture_lru.remove(0);
+            // Dropping the TextureHandle releases the VRAM on the next frame.
+            self.texture_cache.remove(&evicted);
+            self.image_view_states.remove(&evicted);
+        }
+    }
+
+    /// Mark a texture as most-recently-used so it survives eviction.
+    fn touch_texture(&mut self, hash: u64) {
+        if let Some(pos) = self.texture_lru.iter().position(|&h| h == hash) {
+            self.texture_lru.remove(pos);
+        }
+        self.texture_lru.push(hash);
+    }
+
+    /// Insert raw file bytes, evicting oldest entries to stay under the RAM cap.
+    fn insert_raw(&mut self, hash: u64, data: Vec<u8>) {
+        if let Some(old) = self.raw_data_cache.remove(&hash) {
+            self.raw_cache_bytes = self.raw_cache_bytes.saturating_sub(old.len());
+            if let Some(pos) = self.raw_cache_order.iter().position(|&h| h == hash) {
+                self.raw_cache_order.remove(pos);
+            }
+        }
+        self.raw_cache_bytes += data.len();
+        self.raw_data_cache.insert(hash, data);
+        self.raw_cache_order.push(hash);
+        // Keep the just-inserted (currently viewed) entry; evict older ones.
+        while self.raw_cache_bytes > MAX_RAW_CACHE_BYTES && self.raw_cache_order.len() > 1 {
+            let evicted = self.raw_cache_order.remove(0);
+            if let Some(d) = self.raw_data_cache.remove(&evicted) {
+                self.raw_cache_bytes = self.raw_cache_bytes.saturating_sub(d.len());
+            }
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, reader: Option<std::sync::Arc<crate::ggpk::reader::GgpkReader>>, selection: Option<FileSelection>, is_poe2: bool, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>) {
@@ -259,6 +314,7 @@ impl ContentView {
                                           let texture_info = self.texture_cache.get(&hash)
                                               .map(|t| (t.id(), t.size_vec2()));
                                           if let Some((texture_id, texture_size)) = texture_info {
+                                              self.touch_texture(hash);
                                               let state = self.image_view_states
                                                   .entry(hash)
                                                   .or_insert_with(ImageViewState::new);
@@ -993,8 +1049,11 @@ impl ContentView {
                     ui.separator();
                     
                     if file.name.ends_with(".dds") {
-                        if let Some(texture) = self.texture_cache.get(&offset) {
-                             ui.image(texture);
+                        if self.texture_cache.contains_key(&offset) {
+                             self.touch_texture(offset);
+                             if let Some(texture) = self.texture_cache.get(&offset) {
+                                 ui.image(texture);
+                             }
                         } else {
                              match reader.get_data_slice(file.data_offset, file.data_length) {
                                   Ok(data) => {
@@ -1014,7 +1073,7 @@ impl ContentView {
                                                   egui::TextureOptions::default()
                                               );
                                               ui.image(&texture);
-                                              self.texture_cache.insert(offset, texture);
+                                              self.insert_texture(offset, texture);
                                           },
                                           Err(e) => { ui.label(format!("Failed to load DDS: {}", e)); }
                                       }
@@ -1096,23 +1155,25 @@ impl ContentView {
 
          // Loose file (Steam Art/ directory) — read directly from disk
          if file_info.bundle_index == crate::bundles::steam::LOOSE_FILE_SENTINEL {
-             if let Some(steam) = &self.steam_loader {
-                 if let Some(loose_path) = steam.loose_file_path(&file_info.path) {
-                     match std::fs::read(&loose_path) {
-                         Ok(data) => {
-                             self.raw_data_cache.insert(hash, data);
-                             self.failed_loads.remove(&hash);
-                             self.last_error = None;
-                         }
-                         Err(e) => {
-                             self.last_error = Some(format!("Failed to read loose file: {}", e));
-                             self.failed_loads.insert(hash);
-                         }
+             // Resolve the path first so the immutable steam_loader borrow is
+             // released before we mutate the caches.
+             let loose_path = self.steam_loader.as_ref()
+                 .and_then(|steam| steam.loose_file_path(&file_info.path));
+             if let Some(loose_path) = loose_path {
+                 match std::fs::read(&loose_path) {
+                     Ok(data) => {
+                         self.insert_raw(hash, data);
+                         self.failed_loads.remove(&hash);
+                         self.last_error = None;
                      }
-                 } else {
-                     self.last_error = Some(format!("Loose file not found on disk: {}", file_info.path));
-                     self.failed_loads.insert(hash);
+                     Err(e) => {
+                         self.last_error = Some(format!("Failed to read loose file: {}", e));
+                         self.failed_loads.insert(hash);
+                     }
                  }
+             } else if self.steam_loader.is_some() {
+                 self.last_error = Some(format!("Loose file not found on disk: {}", file_info.path));
+                 self.failed_loads.insert(hash);
              }
              return;
          }
@@ -1267,7 +1328,7 @@ impl ContentView {
                                                   color_image,
                                                   egui::TextureOptions::default()
                                               );
-                                              self.texture_cache.insert(hash, texture);
+                                              self.insert_texture(hash, texture);
                                               loaded = true;
                                           },
                                           Err(e) => {
@@ -1304,7 +1365,7 @@ impl ContentView {
                                   color_image,
                                   egui::TextureOptions::default()
                               );
-                              self.texture_cache.insert(hash, texture);
+                              self.insert_texture(hash, texture);
                               self.failed_loads.remove(&hash);
                               self.last_error = None;
                           } else {
@@ -1384,17 +1445,17 @@ impl ContentView {
                               Err(e) => {
                                   // println!("PSG Parse Error: {}", e);
                                   self.last_error = Some(format!("PSG Parse Error: {}", e));
-                                  self.raw_data_cache.insert(hash, file_data.clone());
+                                  self.insert_raw(hash, file_data.clone());
                                   self.failed_loads.insert(hash);
                               }
                           }
                       } else if is_text_file(path) {
                           // Just store raw data, we decode on render
-                          self.raw_data_cache.insert(hash, file_data);
+                          self.insert_raw(hash, file_data);
                           self.last_error = None;
                       } else {
                           // Fallback for unknown files - cache raw data to stop re-loading
-                          self.raw_data_cache.insert(hash, file_data);
+                          self.insert_raw(hash, file_data);
                           self.last_error = None;
                       }
                  } else {

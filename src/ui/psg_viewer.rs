@@ -96,39 +96,21 @@ fn get_class_bg_assets(class_name: &str) -> Option<PsgClassBg> {
     }
 }
 
-// Standard PoE Orbit Radii (Approximation for PoE2 or legacy)
-const ORBIT_RADII: [f32; 10] = [0.0, 82.0, 164.0, 334.0, 488.0, 657.0, 839.0, 250.0, 1076.0, 1320.0];
 
+// Angle (radians) of a node on its orbit, measured clockwise from north.
+// PoE2 orbits are evenly spaced: theta = position / capacity * 2*pi.
 fn get_node_angle(radius: u32, position: u32, passives_per_orbit: &[u8]) -> f32 {
     let r_idx = radius as usize;
-    let capacities = if r_idx < passives_per_orbit.len() {
-        passives_per_orbit[r_idx] as u32
+    let capacity = if r_idx < passives_per_orbit.len() {
+        passives_per_orbit[r_idx] as f32
     } else {
-        12
+        12.0
     };
 
-    let degree = if capacities == 16 {
-        let angles = [0, 30, 45, 60, 90, 120, 135, 150, 180, 210, 225, 240, 270, 300, 315, 330];
-        if (position as usize) < angles.len() {
-            angles[position as usize] as f32
-        } else {
-            (360 * position) as f32 / capacities as f32
-        }
-    } else if capacities == 40 {
-        let angles = [
-            0, 10, 20, 30, 40, 45, 50, 60, 70, 80, 90, 100, 110, 120, 130, 135, 140, 150, 160, 170, 180, 190,
-            200, 210, 220, 225, 230, 240, 250, 260, 270, 280, 290, 300, 310, 315, 320, 330, 340, 350,
-        ];
-        if (position as usize) < angles.len() {
-            angles[position as usize] as f32
-        } else {
-            (360 * position) as f32 / capacities as f32
-        }
-    } else {
-        (360 * position) as f32 / capacities as f32
-    };
-
-    degree.to_radians()
+    if capacity <= 0.0 {
+        return 0.0;
+    }
+    (position as f32 / capacity) * std::f32::consts::TAU
 }
 
 pub struct PsgViewerState {
@@ -421,6 +403,9 @@ impl<'a> PsgViewer<'a> {
                 (pos.to_vec2() * zoom + pan).to_pos2() + center
             };
 
+            // Orbit radii depend on graph type (passive tree vs atlas).
+            let orbit_radii = self.psg.orbit_radii();
+
             // Calculate Node Positions
             let mut node_positions: std::collections::HashMap<u32, egui::Pos2> = std::collections::HashMap::new();
             struct PsgNodeInfo {
@@ -438,25 +423,25 @@ impl<'a> PsgViewer<'a> {
                 }
                 for node in &group.nodes {
                     let r_idx = node.radius as usize;
-                    let radius = if r_idx < ORBIT_RADII.len() { ORBIT_RADII[r_idx] } else { node.radius as f32 * 50.0 };
-                    
-                    let poe_arc = get_node_angle(node.radius, node.position, &self.psg.passives_per_orbit);
-                    let angle = -std::f32::consts::FRAC_PI_2 + poe_arc;
-                    
-                    let offset_x = angle.cos() * radius;
-                    let offset_y = angle.sin() * radius;
-                    
+                    let radius = if r_idx < orbit_radii.len() { orbit_radii[r_idx] } else { node.radius as f32 * 50.0 };
+
+                    // Canonical PoE orbit placement: theta measured clockwise from north.
+                    //   x = group.x + r * sin(theta)
+                    //   y = group.y - r * cos(theta)
+                    // (matches the reference skilltree export exactly; egui y is already down).
+                    let theta = get_node_angle(node.radius, node.position, &self.psg.passives_per_orbit);
+
                     let pos = egui::Pos2::new(
-                        group.x + offset_x,
-                        -(group.y + offset_y)
+                        group.x + theta.sin() * radius,
+                        group.y - theta.cos() * radius,
                     );
-                    
+
                     node_positions.insert(node.skill_id, pos);
                     node_info.insert(node.skill_id, PsgNodeInfo {
                         pos,
                         group_x: group.x,
-                        group_y: -group.y,
-                        poe_arc,
+                        group_y: group.y,
+                        poe_arc: theta,
                         radius,
                     });
                 }
@@ -561,26 +546,23 @@ impl<'a> PsgViewer<'a> {
                               let arc1 = start_node.poe_arc;
                               let arc2 = end_node.poe_arc;
 
-                              let mut start_arc = if arc1 < arc2 { arc1 } else { arc2 };
-                              let mut end_arc = if arc1 < arc2 { arc2 } else { arc1 };
+                              let lo = if arc1 < arc2 { arc1 } else { arc2 };
+                              let hi = if arc1 < arc2 { arc2 } else { arc1 };
 
-                              let diff = end_arc - start_arc;
-                              if diff >= std::f32::consts::PI {
-                                  let c = std::f32::consts::TAU - diff;
-                                  start_arc = end_arc;
-                                  end_arc = start_arc + c;
-                              }
-
-                              let angle1 = -std::f32::consts::FRAC_PI_2 + start_arc;
-                              let angle2 = -std::f32::consts::FRAC_PI_2 + end_arc;
+                              let (start_arc, end_arc) = if hi - lo >= std::f32::consts::PI {
+                                  // Sweep the short way around the orbit instead of the long way.
+                                  (hi, lo + std::f32::consts::TAU)
+                              } else {
+                                  (lo, hi)
+                              };
 
                               let mut points = Vec::new();
                               let steps = 15;
                               for i in 0..=steps {
                                   let t = i as f32 / steps as f32;
-                                  let a = angle1 + (angle2 - angle1) * t;
-                                  let px = group_x + radius * a.cos();
-                                  let py = group_y - radius * a.sin();
+                                  let th = start_arc + (end_arc - start_arc) * t;
+                                  let px = group_x + radius * th.sin();
+                                  let py = group_y - radius * th.cos();
                                   points.push(to_screen(egui::Pos2::new(px, py)));
                               }
 
@@ -591,7 +573,7 @@ impl<'a> PsgViewer<'a> {
                               let start_pos = start_node.pos;
                               let end_pos = end_node.pos;
                               let orbit_abs = orbit_idx.abs() as usize;
-                              let radius = if orbit_abs < ORBIT_RADII.len() { ORBIT_RADII[orbit_abs] } else { 0.0 };
+                              let radius = if orbit_abs < orbit_radii.len() { orbit_radii[orbit_abs] } else { 0.0 };
                               
                               if radius > 0.0 {
                                  let dx = end_pos.x - start_pos.x;

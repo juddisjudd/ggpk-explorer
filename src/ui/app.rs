@@ -384,13 +384,44 @@ impl ExplorerApp {
 
                     let is_poe2 = reader.version >= 4 || found_bundle_index;
                     
-                    let start_tree = std::time::Instant::now();
-                    let tree_view = if let Some(idx) = &bundle_index {
-                        TreeView::new_bundled(Some(reader.clone()), idx)
+                    let mut tree_view = None;
+                    if loaded_from_cache {
+                        let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.tree.cache");
+                        if tree_cache_path.exists() {
+                            eprintln!("Found tree cache file, attempting to load...");
+                            let start_tree_cache = std::time::Instant::now();
+                            match TreeView::load_nodes_from_cache(&tree_cache_path) {
+                                Ok(nodes) => {
+                                    println!("TreeView loaded from cache took {:?}", start_tree_cache.elapsed());
+                                    tree_view = Some(TreeView::new_with_nodes(Some(reader.clone()), nodes));
+                                }
+                                Err(e) => {
+                                    eprintln!("Failed to load tree cache: {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                    let tree_view = if let Some(tv) = tree_view {
+                        tv
                     } else {
-                        TreeView::new(reader.clone())
+                        let start_tree = std::time::Instant::now();
+                        let tv = if let Some(idx) = &bundle_index {
+                            let built_tv = TreeView::new_bundled(Some(reader.clone()), idx);
+                            let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.tree.cache");
+                            eprintln!("Saving TreeView to cache...");
+                            if let Err(e) = built_tv.save_nodes_to_cache(&tree_cache_path) {
+                                println!("Failed to save tree cache: {}", e);
+                            } else {
+                                println!("Tree cache saved successfully.");
+                            }
+                            built_tv
+                        } else {
+                            TreeView::new(reader.clone())
+                        };
+                        println!("TreeView creation/build took {:?}", start_tree.elapsed());
+                        tv
                     };
-                    println!("TreeView creation took {:?}", start_tree.elapsed());
 
                     println!("Total Loading Thread took {:?}", start_total.elapsed());
 
