@@ -20,20 +20,30 @@ impl CdnBundleLoader {
         CdnBundleLoader {
             cache_dir,
             client: Client::new(),
-            patch_ver: patch_ver.unwrap_or("4.4.0.3.7").to_string(), // Default patch version
+            patch_ver: patch_ver.unwrap_or("4.5.1.1.4").to_string(),
         }
     }
 
+    pub fn patch_version(&self) -> &str {
+        &self.patch_ver
+    }
+
     pub fn fetch_bundle(&self, bundle_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+        // Reject bundle names that are clearly index-internal paths, not real CDN bundles.
+        // The index uses "Folders/" prefix for directory-structure metadata bundles that
+        // don't exist as individual files on the CDN.
+        if bundle_name.starts_with("Folders/") || bundle_name.starts_with("folders/") {
+            return Err(format!(
+                "Bundle name '{}' starts with 'Folders/' which is an index-internal path, not a valid CDN bundle",
+                bundle_name
+            ).into());
+        }
+
         // 1. Check Local Cache
-        // Flatten path components for safe caching? 
-        // poe-dat-viewer replaces '/' with '@'.
-        // Let's mirror that to be safe on Windows.
         let safe_name = bundle_name.replace("/", "@");
         let cache_path = self.cache_dir.join(&safe_name);
 
         if cache_path.exists() {
-            // println!("Loading from cache: {:?}", cache_path);
             let data = fs::read(&cache_path)?;
             return Ok(data);
         }
@@ -48,8 +58,18 @@ impl CdnBundleLoader {
         println!("[CDN] Downloading: {}", url);
         let resp = self.client.get(&url).send()?;
 
-        if !resp.status().is_success() {
-             return Err(format!("CDN Request Failed: {} ({})", url, resp.status()).into());
+        let status = resp.status();
+        if !status.is_success() {
+            if status.as_u16() == 404 {
+                return Err(format!(
+                    "CDN 404 Not Found: {} — patch version '{}' may be incorrect or the bundle doesn't exist on CDN",
+                    url, self.patch_ver
+                ).into());
+            }
+            return Err(format!(
+                "CDN Request Failed: {} ({}) — using patch version '{}'",
+                url, status, self.patch_ver
+            ).into());
         }
 
         let bytes = resp.bytes()?;
@@ -61,9 +81,8 @@ impl CdnBundleLoader {
         
         Ok(data)
     }
+
     pub fn set_patch_version(&mut self, ver: &str) {
         self.patch_ver = ver.to_string();
     }
 }
-
-

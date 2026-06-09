@@ -17,71 +17,100 @@ impl DatReader {
     }
 
     pub fn new(data: Vec<u8>, filename: &str) -> io::Result<Self> {
+        // Minimum valid dat file: 4 bytes row count + 8 bytes separator = 12 bytes
+        if data.len() < 12 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("File too small to be a valid dat file ({} bytes): {}", data.len(), filename),
+            ));
+        }
 
         let mut cursor = Cursor::new(data.as_slice());
         
-        let is_64bit = filename.ends_with(".dat64") || filename.ends_with(".datc64");
-
+        let is_64bit = filename.ends_with(".dat64") || filename.ends_with(".datc64")
+            || filename.ends_with(".datl64");
 
         let row_count = read_u32(&mut cursor)?;
-        println!("DatReader: Loading {}, Row Count: {}, Is 64bit: {}", filename, row_count, is_64bit);
+        println!("DatReader: Loading {}, Row Count: {}, Is 64bit: {}, Size: {} bytes", filename, row_count, is_64bit, data.len());
+
+        // Sanity check: row_count should be reasonable relative to file size.
+        // Each row must be at least 1 byte, plus 4 bytes for the count + 8 bytes for separator.
+        // If row_count exceeds the file size, the data is clearly not a valid dat file.
+        if row_count > 0 {
+            let max_possible_rows = (data.len().saturating_sub(12)) as u64;
+            if (row_count as u64) > max_possible_rows {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid row_count {} for file of {} bytes (max possible: {}). \
+                         Data is likely not a valid dat file: {}",
+                        row_count, data.len(), max_possible_rows, filename
+                    ),
+                ));
+            }
+            // Additional sanity: reject absurdly large row counts (>10M rows)
+            if row_count > 10_000_000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Unreasonable row_count {} (>10M) for {}, first 16 bytes: {:02X?}",
+                        row_count, filename, &data[..std::cmp::min(16, data.len())]
+                    ),
+                ));
+            }
+        }
         
         let mut row_length = None;
         let mut data_section_offset = 0;
-        
+
+        // The boundary marker is always 8 bytes of 0xBB for all modern dat files
+        // (matching poe_data_tools reference implementation).
+        let separator: [u8; 8] = [0xBB; 8];
 
         if row_count > 0 {
-             let pattern_32 = [0xBB, 0xBB, 0xBB, 0xBB];
-             let pattern_64 = [0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB];
-             
-
-             
              let mut found_pattern = false;
 
-             for i in 4..data.len().saturating_sub(4) {
-                 if is_64bit {
-                      if i + 8 <= data.len() && data[i..i+8] == pattern_64 {
-                           let data_size = i - 4;
-                           println!("DatReader: Found 64-bit pattern at {}, data_size={}, row_count={}", i, data_size, row_count);
-                           if data_size % (row_count as usize) == 0 {
-                               row_length = Some(data_size / (row_count as usize));
-                               data_section_offset = i as u64;
-                               found_pattern = true;
-                               break;
-                           }
+             // Scan for the 8-byte separator after the fixed-data section.
+             // The fixed data starts at byte 4 (after row_count).
+             // We look for the separator at every position from byte 4 onwards.
+             for i in 4..data.len().saturating_sub(7) {
+                 if data[i..i+8] == separator {
+                      let fixed_data_size = i - 4;
+                      if fixed_data_size > 0 && fixed_data_size % (row_count as usize) == 0 {
+                          row_length = Some(fixed_data_size / (row_count as usize));
+                          data_section_offset = (i + 8) as u64; // Variable data starts after separator
+                          found_pattern = true;
+                          println!("DatReader: Found boundary at offset {}, row_length={}, var_data_offset={}",
+                              i, row_length.unwrap(), data_section_offset);
+                          break;
                       }
-                 } else {
-                      if data[i..i+4] == pattern_32 {
-                           let data_size = i - 4;
-                           println!("DatReader: Found 32-bit pattern at {}, data_size={}, row_count={}", i, data_size, row_count);
-                           if data_size % (row_count as usize) == 0 {
-                               row_length = Some(data_size / (row_count as usize));
-                               data_section_offset = i as u64;
-                               found_pattern = true;
-                               break;
-                           }
-                      }
+                      // If not aligned, keep scanning — could be a false positive in the data
                  }
              }
 
              if !found_pattern {
-                 return Err(io::Error::new(io::ErrorKind::InvalidData, format!("Aligned data boundary not found for row_count {}", row_count)));
+                 return Err(io::Error::new(
+                     io::ErrorKind::InvalidData,
+                     format!(
+                         "Aligned data boundary not found for row_count {} in {} ({} bytes). \
+                          First 16 bytes: {:02X?}",
+                         row_count, filename, data.len(),
+                         &data[..std::cmp::min(16, data.len())]
+                     ),
+                 ));
              }
 
         } else {
             println!("DatReader: Row count is 0 for {}", filename);
-
             row_length = Some(0);
 
-             let pattern_32 = [0xBB, 0xBB, 0xBB, 0xBB];
-             if data.len() >= 8 && data[4..8] == pattern_32 {
-                 data_section_offset = 4;
-             }
-
-             let pattern_64 = [0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB];
-             if is_64bit && data.len() >= 12 && data[4..12] == pattern_64 {
-                 data_section_offset = 4;
-             }
+            // For zero-row files, the separator should be immediately after the row count
+            if data.len() >= 12 && data[4..12] == separator {
+                data_section_offset = 12; // Variable data starts after row_count(4) + separator(8)
+            } else {
+                // Fallback: variable data starts right after row count
+                data_section_offset = 4;
+            }
         }
         
         Ok(Self {
@@ -133,21 +162,27 @@ impl DatReader {
 
 fn get_column_size(col: &Column, is_64bit: bool) -> usize {
     if col.array {
+        // Arrays are always (length: u64, pointer: u64) = 16 bytes in 64-bit dat files
         return if is_64bit { 16 } else { 8 };
     }
     match col.r#type.as_str() {
         "bool" => 1,
         "byte" | "u8" => 1,
-        "short" | "u16" => 2,
+        "short" | "i16" | "u16" => 2,
         "ushort" => 2,
         "int" | "i32" | "u32" => 4,
         "uint" => 4,
+        "enumrow" => 4, // Enum reference — always u32
         "float" | "f32" => 4,
         "long" | "u64" | "i64" => 8,
         "ulong" => 8,
         "ref|string" | "string" => if is_64bit { 8 } else { 4 },
-        t if t.starts_with("ref|") || t == "row" => if is_64bit { 8 } else { 4 }, // Generic ref size
-        "foreign_row" | "foreignrow" => if is_64bit { 16 } else { 8 }, // Key(8)+Ptr(8) or Key(4)+Ptr(4)? Usually 16/8 is safe guess for complex foreign keys
+        // "row" is a self-reference: u64 in 64-bit, u32 in 32-bit (nullable via 0xFEFEFEFE...)
+        t if t.starts_with("ref|") || t == "row" => if is_64bit { 8 } else { 4 },
+        // "foreignrow" is a cross-table reference: u128 in 64-bit (nullable via 0xFE×16), u64 in 32-bit
+        "foreign_row" | "foreignrow" => if is_64bit { 16 } else { 8 },
+        // "rid" / "_" — unknown/padding types, treat as 8 bytes (u64)
+        "rid" | "_" => if is_64bit { 8 } else { 4 },
         _ => 4,
     }
 }
@@ -214,7 +249,11 @@ fn read_column_value(cursor: &mut Cursor<&[u8]>, col: &Column, file_data: &[u8],
              if offset_val == 0 {
                  return Ok(DatValue::String("".to_string()));
              }
-             let abs_offset = var_data_offset + offset_val;
+             let abs_offset = if offset_val >= 8 {
+                 var_data_offset + (offset_val - 8)
+             } else {
+                 var_data_offset
+             };
              if (abs_offset as usize) < file_data.len() {
                  let s = read_string_at(file_data, abs_offset as usize);
                  Ok(DatValue::String(s))
@@ -223,27 +262,50 @@ fn read_column_value(cursor: &mut Cursor<&[u8]>, col: &Column, file_data: &[u8],
              }
         },
         "foreign_row" | "foreignrow" => {
-             let idx = if is_64bit {
-                 let v = read_u32(cursor)? as u64;
-                 let _ = read_u32(cursor)?; // padding
-                 let _ = read_u64(cursor)?; // unknown 2nd part (8 bytes)
-                 v
+             // foreignrow: u128 in 64-bit, u64 in 32-bit
+             // Null sentinel: all 0xFE bytes
+             if is_64bit {
+                 let lo = read_u64(cursor)?;
+                 let hi = read_u64(cursor)?;
+                 let combined = (hi as u128) << 64 | (lo as u128);
+                 if combined == 0xfefefefe_fefefefe_fefefefe_fefefefe_u128 {
+                     Ok(DatValue::ForeignRow(usize::MAX)) // Null reference
+                 } else {
+                     Ok(DatValue::ForeignRow(lo as usize))
+                 }
              } else {
-                 read_u32(cursor)? as u64
-             };
-             // Existing 32-bit logic was just read_u32.
-             Ok(DatValue::ForeignRow(idx as usize))
+                 let lo = read_u32(cursor)? as u64;
+                 let hi = read_u32(cursor)? as u64;
+                 let combined = (hi << 32) | lo;
+                 if combined == 0xfefefefe_fefefefe_u64 {
+                     Ok(DatValue::ForeignRow(usize::MAX)) // Null reference
+                 } else {
+                     Ok(DatValue::ForeignRow(lo as usize))
+                 }
+             }
+        },
+        "enumrow" => {
+             // Enum reference — always u32, non-nullable
+             let val = read_u32(cursor)?;
+             Ok(DatValue::Int(val as i64))
         },
         t if t.starts_with("ref|") || t == "row" => {
-             // Generic ref
+             // Self-reference: u64 in 64-bit, u32 in 32-bit
+             // Null sentinel: all 0xFE bytes
              let val = if is_64bit {
-                  let v = read_u32(cursor)? as u64;
-                  let _ = read_u32(cursor)?; // padding
+                  let v = read_u64(cursor)?;
+                  if v == 0xfefefefe_fefefefe_u64 {
+                      return Ok(DatValue::ForeignRow(usize::MAX)); // Null
+                  }
                   v
              } else {
-                  read_u32(cursor)? as u64
+                  let v = read_u32(cursor)? as u64;
+                  if v == 0xfefefefe_u64 {
+                      return Ok(DatValue::ForeignRow(usize::MAX)); // Null
+                  }
+                  v
              };
-             Ok(DatValue::ForeignRow(val as usize)) // Treat as foreign row index
+             Ok(DatValue::ForeignRow(val as usize))
         },
         _ => {
              let size = get_column_size(col, is_64bit);
@@ -312,7 +374,11 @@ impl DatReader {
              return Ok(Vec::new());
         }
         
-        let start = (self.data_section_offset + offset) as usize;
+        let start = if offset >= 8 {
+             (self.data_section_offset + (offset - 8)) as usize
+        } else {
+             self.data_section_offset as usize
+        };
         if start >= self.data.len() {
              return Ok(vec![DatValue::Unknown]); 
         }
@@ -325,8 +391,8 @@ impl DatReader {
             array: false, 
             unique: false,
             localized: false,
-            // until: None, // Removed
-             description: None,
+            description: None,
+            interval: false,
         };
         
         let elem_size = get_column_size(&elem_col, self.is_64bit);
@@ -405,6 +471,7 @@ mod tests {
             unique: false,
             localized: false,
             description: None,
+            interval: false,
         };
 
         assert_eq!(reader.value_to_json(&DatValue::Bool(true), &col), serde_json::json!(true));
@@ -425,11 +492,11 @@ mod tests {
         // Total list size = 16 bytes.
         let mut data = vec![0u8; 32];
         let offset = 8;
-        // Write element 1 at index 8 (offset 8)
-        data[8] = 0x2E;
-        data[9] = 0x48;
-        // Write element 2 at index 16 (offset 16)
-        data[16] = 0x2A;
+        // Write element 1 at index 0 (offset 8 - 8)
+        data[0] = 0x2E;
+        data[1] = 0x48;
+        // Write element 2 at index 8 (offset 8 - 8 + 8)
+        data[8] = 0x2A;
 
         let reader = DatReader {
             data,
@@ -448,6 +515,7 @@ mod tests {
             unique: false,
             localized: false,
             description: None,
+            interval: false,
         };
 
         let val = DatValue::List(2, offset);

@@ -340,6 +340,30 @@ impl ExplorerApp {
                     
                     // Enrich unresolved path hashes by scanning dat file @file columns
                     if let Some(mut index) = raw_index {
+                        // --- Diagnostic: Bundle Index Statistics ---
+                        let total_bundles = index.bundles.len();
+                        let folders_bundles = index.bundles.iter().filter(|b| b.name.starts_with("Folders/") || b.name.starts_with("folders/")).count();
+                        let regular_bundles = total_bundles - folders_bundles;
+                        let total_files = index.files.len();
+                        let files_with_paths = index.files.values().filter(|f| !f.path.is_empty()).count();
+                        let files_in_folders_bundles = index.files.values().filter(|f| {
+                            if let Some(b) = index.bundles.get(f.bundle_index as usize) {
+                                b.name.starts_with("Folders/") || b.name.starts_with("folders/")
+                            } else { false }
+                        }).count();
+                        println!("=== Bundle Index Stats ===");
+                        println!("  Bundles: {} total ({} regular, {} Folders/)", total_bundles, regular_bundles, folders_bundles);
+                        println!("  Files: {} total ({} with paths, {} without)", total_files, files_with_paths, total_files - files_with_paths);
+                        println!("  Files in Folders/ bundles: {} ({:.1}%)", files_in_folders_bundles, if total_files > 0 { files_in_folders_bundles as f64 / total_files as f64 * 100.0 } else { 0.0 });
+                        // Print a few sample bundle names
+                        for (i, b) in index.bundles.iter().take(5).enumerate() {
+                            println!("  Bundle[{}]: '{}' ({}B)", i, b.name, b.uncompressed_size);
+                        }
+                        if total_bundles > 5 {
+                            println!("  ... and {} more bundles", total_bundles - 5);
+                        }
+                        println!("==========================");
+
                         let unresolved = index.files.values().filter(|f| f.path.is_empty()).count();
                         if unresolved > 0 {
                             if let Some(ref schema) = schema_for_enrich {

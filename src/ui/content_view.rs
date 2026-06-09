@@ -186,23 +186,30 @@ impl ContentView {
                                  self.load_bundled_content(ui.ctx(), reader.as_deref(), index, file_info, hash);
                              }
                              
-                             if file_info.path.ends_with(".dat") || file_info.path.ends_with(".dat64") || file_info.path.ends_with(".datc64") || file_info.path.ends_with(".datl") || file_info.path.ends_with(".datl64") {
-                                  // DatViewer handles its own scrolling via TableBuilder
-                                  // If dat viewer has error, show generic hex views?
-                                  if self.dat_viewer.error_msg.is_some() || self.dat_viewer.reader.is_none() {
-                                      egui::ScrollArea::vertical().show(ui, |ui| {
-                                          if let Some(data) = self.raw_data_cache.get(&hash) {
-                                              ui.label("Dat Load Failed. Showing raw hex view:");
-                                              crate::ui::hex_viewer::HexViewer::show(ui, data);
-                                          } else {
-                                              self.dat_viewer.show(ui, is_poe2); // Show failed state
-                                          }
-                                      });
-                                  } else {
-                                      // Ensure it takes available space
-                                      self.dat_viewer.show(ui, is_poe2);
-                                  }
-                             } else if file_info.path.ends_with(".csd") {
+                              if file_info.path.ends_with(".dat") || file_info.path.ends_with(".dat64") || file_info.path.ends_with(".datc64") || file_info.path.ends_with(".datl") || file_info.path.ends_with(".datl64") {
+                                   // DatViewer handles its own scrolling via TableBuilder
+                                   // If dat viewer has error, show generic hex views?
+                                   if self.dat_viewer.error_msg.is_some() || self.dat_viewer.reader.is_none() {
+                                       egui::ScrollArea::vertical().show(ui, |ui| {
+                                           if let Some(last_err) = &self.last_error {
+                                               ui.horizontal(|ui| {
+                                                   ui.colored_label(egui::Color32::from_rgb(239, 68, 68), "❌ Failed to load DAT:");
+                                               });
+                                               ui.label(last_err);
+                                               ui.add_space(8.0);
+                                           }
+                                           if let Some(data) = self.raw_data_cache.get(&hash) {
+                                               ui.label("Showing raw hex view:");
+                                               crate::ui::hex_viewer::HexViewer::show(ui, data);
+                                           } else if self.last_error.is_none() {
+                                               self.dat_viewer.show(ui, is_poe2); // Show failed state
+                                           }
+                                       });
+                                   } else {
+                                       // Ensure it takes available space
+                                       self.dat_viewer.show(ui, is_poe2);
+                                   }
+                              } else if file_info.path.ends_with(".csd") {
                                  self.show_csd(ui, hash);
                             } else if file_info.path.ends_with(".psg") {
                                  if let Some(psg_file) = self.psg_cache.get(&hash) {
@@ -1173,226 +1180,235 @@ impl ContentView {
                  }
              }
 
+             let mut decompressed_bundle_data: Option<Vec<u8>> = None;
+
              if let Some(data) = raw_bundle_data {
-                 self.failed_loads.remove(&hash);
                  let mut cursor = std::io::Cursor::new(data);
-                 match crate::bundles::bundle::Bundle::read_header(&mut cursor) {
-                    Ok(bundle) => {
-                         println!("Bundle header read success. Uncompressed Size: {}", bundle.uncompressed_size);
-                         match bundle.decompress(&mut cursor) {
-                            Ok(decompressed_data) => {
-                                 println!("Bundle decompressed success. Size: {}", decompressed_data.len());
-                                     let start = file_info.file_offset as usize;
-                                     let end = start + file_info.file_size as usize;
-                             
-                             if end <= decompressed_data.len() {
-                                 let file_data = decompressed_data[start..end].to_vec();
-                                 let path = &file_info.path;
-                                 
-                                 // Debug print
-                                 println!("Loaded content for: {}", path);
+                 if let Ok(bundle) = crate::bundles::bundle::Bundle::read_header(&mut cursor) {
+                     if let Ok(decompressed) = bundle.decompress(&mut cursor) {
+                         decompressed_bundle_data = Some(decompressed);
+                     }
+                 }
+             }
 
-                                 if path.ends_with(".dat") || path.ends_with(".dat64") || path.ends_with(".datc64") || path.ends_with(".datl") || path.ends_with(".datl64") {
-                                      println!("Loading DAT: {} ({} bytes)", path, file_data.len());
-                                      self.dat_viewer.load_from_bytes(file_data, path);
-                                      if self.dat_viewer.reader.is_none() {
-                                          self.last_error = Some(format!("Failed to parse DAT file: {}", self.dat_viewer.error_msg.as_deref().unwrap_or("Unknown error")));
-                                          // Prevent retry loop
-                                          self.failed_loads.insert(hash);
-                                      } else {
-                                          self.last_error = None;
-                                      }
-                                  } else if path.ends_with(".dds") || path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg") || path.ends_with(".webp") {
-                                      // Try to load Image
-                                      self.last_error = None;
-                                      
-                                      println!("Image Loading: Data Length {}", file_data.len());
-                                      
-                                      // Special handling for DDS
-                                      if path.ends_with(".dds") {
-                                          if file_data.len() > 16 {
-                                              println!("DDS First 16 bytes: {:02X?}", &file_data[0..16]);
-                                              let magic = &file_data[0..4];
-                                              if magic == b"DDS " {
-                                                  println!("Magic 'DDS ' confirmed.");
-                                              } else {
-                                                  println!("WARNING: Magic bytes mismatch! Expected 'DDS ', found {:?}", magic);
-                                              }
-                                          }
-                                          
-                                          // Method 1: Try image_dds first (better support for various DXT/BC formats for DDS)
-                                          let mut loaded = false;
-                                          let mut cursor = std::io::Cursor::new(&file_data);
-                                          match ddsfile::Dds::read(&mut cursor) {
-                                              Ok(dds) => {
-                                                  println!("DDS Header Read OK.");
-                                                  match image_dds::image_from_dds(&dds, 0) {
-                                                      Ok(image) => {
-                                                          println!("image_dds conversion OK. Size: {}x{}", image.width(), image.height());
-                                                          let size = [image.width() as usize, image.height() as usize];
-                                                          let pixels = image.as_raw();
-                                                          let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                              size,
-                                                              pixels,
-                                                          );
-                                                          let texture = ctx.load_texture(
-                                                              path,
-                                                              color_image,
-                                                              egui::TextureOptions::default()
-                                                          );
-                                                          self.texture_cache.insert(hash, texture);
-                                                          loaded = true;
-                                                      },
-                                                      Err(e) => {
-                                                          println!("image_dds failed to convert: {:?}", e);
-                                                      }
-                                                  }
-                                              },
-                                              Err(e) => {
-                                                  println!("DDS Header Read Failed: {:?}", e);
-                                              }
-                                          }
-                                          
-                                          if !loaded {
-                                               // Fallback to Method 2 below
-                                          } else {
-                                              self.failed_loads.remove(&hash);
-                                              self.last_error = None;
-                                              return;
-                                          }
-                                      }
+             if decompressed_bundle_data.is_none() {
+                 if let Some(reader) = reader {
+                     println!("Bundle not found or decompression failed. Attempting direct GGPK file lookup for: {}", file_info.path);
+                     if let Ok(Some(rec)) = reader.read_file_by_path(&file_info.path) {
+                         if let Ok(data) = reader.get_data_slice(rec.data_offset, rec.data_length) {
+                             let start = file_info.file_offset as usize;
+                             let end = start + data.len();
+                             let mut fake_decompressed = vec![0u8; end];
+                             fake_decompressed[start..end].copy_from_slice(data);
+                             decompressed_bundle_data = Some(fake_decompressed);
+                             println!("Direct GGPK fallback succeeded for: {}", file_info.path);
+                         }
+                     }
+                 }
+             }
 
-                                      // Method 2: Standard image crate (supports png, jpg, webp, and some dds)
-                                      if let Ok(img) = image::load_from_memory(&file_data) {
-                                          let size = [img.width() as usize, img.height() as usize];
-                                          let image_buffer = img.to_rgba8();
-                                          let pixels = image_buffer.as_flat_samples();
-                                          let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                              size,
-                                              pixels.as_slice(),
-                                          );
-                                          
-                                          let texture = ctx.load_texture(
-                                              path,
-                                              color_image,
-                                              egui::TextureOptions::default()
-                                          );
-                                          self.texture_cache.insert(hash, texture);
-                                          self.failed_loads.remove(&hash);
-                                          self.last_error = None;
-                                      } else {
-                                          let msg = format!("Failed to decode image. File size: {}", file_data.len());
-                                          self.last_error = Some(msg);
-                                          self.failed_loads.insert(hash);
-                                      }
-                                 } else if path.ends_with(".ogg") || path.ends_with(".wav") || path.ends_with(".mp3") {
-                                      println!("Audio file selected: {}", path);
-                                      
-                                      // Initialize audio if needed
-                                      if self.audio_stream_handle.is_none() {
-                                          if let Ok(stream_handle) = rodio::OutputStream::try_default() {
-                                              self.audio_stream_handle = Some(stream_handle);
-                                          } else {
-                                              println!("Failed to get default audio output device");
-                                          }
-                                      }
-                                      
-                                      if let Some((_, stream_handle)) = &self.audio_stream_handle {
-                                          use std::io::Cursor;
-                                          let cursor = Cursor::new(file_data);
-                                          
-                                          if let Ok(decoder) = rodio::Decoder::new(cursor) {
-                                               // Recreate sink for each playback to avoid state issues
-                                               if let Ok(sink) = rodio::Sink::try_new(stream_handle) {
-                                                   sink.set_volume(self.audio_volume);
-                                                   sink.append(decoder);
-                                                   sink.play(); 
-                                                   self.audio_sink = Some(sink);
-                                               } else {
-                                                    self.last_error = Some("Failed to create audio sink".to_string());
-                                               }
-                                          } else {
-                                              self.last_error = Some("Failed to decode Audio (Might be Wwise WEM)".to_string());
-                                          }
-                                      }
-                                  } else if path.ends_with(".csd") {
-                                     println!("Loading CSD file: {}", path);
-                                     match csd::parse_csd(&file_data, path) {
-                                         Ok(csd_file) => {
-                                             println!("CSD parsed successfully: {} entries", csd_file.entries.len());
-                                             self.csd_cache.insert(hash, csd_file);
-                                             self.last_error = None;
-                                         },
-                                         Err(e) => {
-                                             println!("CSD Parse Error: {}", e);
-                                             self.last_error = Some(format!("CSD Parse Error: {}", e));
-                                             // Fallback to raw data?
-                                             self.raw_data_cache.insert(hash, file_data.clone());
-                                         }
-                                     }
-                                                                   } else if path.ends_with(".json") {
-                                      // println!("Loading JSON file: {}", path);
-                                      let json_str = decode_text_with_detection(&file_data);
-                                      match serde_json::from_str::<serde_json::Value>(&json_str) {
-                                          Ok(v) => {
-                                              Self::save_to_cache(hash, &v);
-                                              self.json_cache.insert(hash, v);
-                                              self.last_error = None;
+             if let Some(decompressed_data) = decompressed_bundle_data {
+                 self.failed_loads.remove(&hash);
+                 let start = file_info.file_offset as usize;
+                 let end = start + file_info.file_size as usize;
+                 
+                 if end <= decompressed_data.len() {
+                     let file_data = decompressed_data[start..end].to_vec();
+                     let path = &file_info.path;
+                     
+                     // Debug print
+                     println!("Loaded content for: {}", path);
+
+                     if path.ends_with(".dat") || path.ends_with(".dat64") || path.ends_with(".datc64") || path.ends_with(".datl") || path.ends_with(".datl64") {
+                          println!("Loading DAT: {} ({} bytes)", path, file_data.len());
+                          self.dat_viewer.load_from_bytes(file_data, path);
+                          if self.dat_viewer.reader.is_none() {
+                              self.last_error = Some(format!("Failed to parse DAT file: {}", self.dat_viewer.error_msg.as_deref().unwrap_or("Unknown error")));
+                              // Prevent retry loop
+                              self.failed_loads.insert(hash);
+                          } else {
+                              self.last_error = None;
+                          }
+                      } else if path.ends_with(".dds") || path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg") || path.ends_with(".webp") {
+                          // Try to load Image
+                          self.last_error = None;
+                          
+                          println!("Image Loading: Data Length {}", file_data.len());
+                          
+                          // Special handling for DDS
+                          if path.ends_with(".dds") {
+                              if file_data.len() > 16 {
+                                  println!("DDS First 16 bytes: {:02X?}", &file_data[0..16]);
+                                  let magic = &file_data[0..4];
+                                  if magic == b"DDS " {
+                                      println!("Magic 'DDS ' confirmed.");
+                                  } else {
+                                      println!("WARNING: Magic bytes mismatch! Expected 'DDS ', found {:?}", magic);
+                                  }
+                              }
+                              
+                              // Method 1: Try image_dds first (better support for various DXT/BC formats for DDS)
+                              let mut loaded = false;
+                              let mut cursor = std::io::Cursor::new(&file_data);
+                              match ddsfile::Dds::read(&mut cursor) {
+                                  Ok(dds) => {
+                                      println!("DDS Header Read OK.");
+                                      match image_dds::image_from_dds(&dds, 0) {
+                                          Ok(image) => {
+                                              println!("image_dds conversion OK. Size: {}x{}", image.width(), image.height());
+                                              let size = [image.width() as usize, image.height() as usize];
+                                              let pixels = image.as_raw();
+                                              let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                                  size,
+                                                  pixels,
+                                              );
+                                              let texture = ctx.load_texture(
+                                                  path,
+                                                  color_image,
+                                                  egui::TextureOptions::default()
+                                              );
+                                              self.texture_cache.insert(hash, texture);
+                                              loaded = true;
                                           },
                                           Err(e) => {
-                                              self.last_error = Some(format!("Invalid JSON: {}", e));
-                                              // Fallback: Store raw string as a Value::String if possible
-                                              self.json_cache.insert(hash, serde_json::Value::String(json_str));
+                                              println!("image_dds failed to convert: {:?}", e);
                                           }
                                       }
-                                  } else if path.ends_with(".psg") {
-                                      // println!("Loading PSG file: {}", path);
-                                      match psg::parse_psg(&file_data) {
-                                          Ok(psg_file) => {
-                                              self.psg_cache.insert(hash, psg_file.clone());
-                                              self.psg_viewer_state.entry(hash).or_default();
-                                              
-                                              // Convert PSG to Value for JSON view (fallback)
-                                              if let Ok(v) = serde_json::to_value(&psg_file) {
-                                                  Self::save_to_cache(hash, &v);
-                                                  self.json_cache.insert(hash, v);
-                                                  self.last_error = None;
-                                              } else {
-                                                   self.last_error = Some("Failed to serialize PSG to JSON".to_string());
-                                                   // self.failed_loads.insert(hash); // Don't fail load if graph works?
-                                              }
-                                          },
-                                          Err(e) => {
-                                              // println!("PSG Parse Error: {}", e);
-                                              self.last_error = Some(format!("PSG Parse Error: {}", e));
-                                              self.raw_data_cache.insert(hash, file_data.clone());
-                                              self.failed_loads.insert(hash);
-                                          }
-                                      }
-                                  } else if is_text_file(path) {
-                                      // Just store raw data, we decode on render
-                                      self.raw_data_cache.insert(hash, file_data);
+                                  },
+                                  Err(e) => {
+                                      println!("DDS Header Read Failed: {:?}", e);
+                                  }
+                              }
+                              
+                              if !loaded {
+                                   // Fallback to Method 2 below
+                              } else {
+                                  self.failed_loads.remove(&hash);
+                                  self.last_error = None;
+                                  return;
+                              }
+                          }
+
+                          // Method 2: Standard image crate (supports png, jpg, webp, and some dds)
+                          if let Ok(img) = image::load_from_memory(&file_data) {
+                              let size = [img.width() as usize, img.height() as usize];
+                              let image_buffer = img.to_rgba8();
+                              let pixels = image_buffer.as_flat_samples();
+                              let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                                  size,
+                                  pixels.as_slice(),
+                              );
+                              
+                              let texture = ctx.load_texture(
+                                  path,
+                                  color_image,
+                                  egui::TextureOptions::default()
+                              );
+                              self.texture_cache.insert(hash, texture);
+                              self.failed_loads.remove(&hash);
+                              self.last_error = None;
+                          } else {
+                              let msg = format!("Failed to decode image. File size: {}", file_data.len());
+                              self.last_error = Some(msg);
+                              self.failed_loads.insert(hash);
+                          }
+                     } else if path.ends_with(".ogg") || path.ends_with(".wav") || path.ends_with(".mp3") {
+                          println!("Audio file selected: {}", path);
+                          
+                          // Initialize audio if needed
+                          if self.audio_stream_handle.is_none() {
+                              if let Ok(stream_handle) = rodio::OutputStream::try_default() {
+                                  self.audio_stream_handle = Some(stream_handle);
+                              } else {
+                                  println!("Failed to get default audio output device");
+                              }
+                          }
+                          
+                          if let Some((_, stream_handle)) = &self.audio_stream_handle {
+                              use std::io::Cursor;
+                              let cursor = Cursor::new(file_data);
+                              
+                              if let Ok(decoder) = rodio::Decoder::new(cursor) {
+                                   // Recreate sink for each playback to avoid state issues
+                                   if let Ok(sink) = rodio::Sink::try_new(stream_handle) {
+                                       sink.set_volume(self.audio_volume);
+                                       sink.append(decoder);
+                                       sink.play(); 
+                                       self.audio_sink = Some(sink);
+                                   } else {
+                                        self.last_error = Some("Failed to create audio sink".to_string());
+                                   }
+                              } else {
+                                  self.last_error = Some("Failed to decode Audio (Might be Wwise WEM)".to_string());
+                              }
+                          }
+                      } else if path.ends_with(".csd") {
+                          match csd::parse_csd(&file_data, path) {
+                              Ok(csd_file) => {
+                                  self.csd_cache.insert(hash, csd_file);
+                                  self.last_error = None;
+                              },
+                              Err(e) => {
+                                  self.last_error = Some(format!("CSD Parse Error: {}", e));
+                                  self.failed_loads.insert(hash);
+                              }
+                          }
+                      } else if path.ends_with(".json") {
+                           // Read file content as string
+                           let text = decode_text_with_detection(&file_data);
+                           match serde_json::from_str::<serde_json::Value>(&text) {
+                               Ok(val) => {
+                                    self.json_cache.insert(hash, val);
+                                    self.last_error = None;
+                               },
+                               Err(e) => {
+                                    self.last_error = Some(format!("JSON Parse Error: {}", e));
+                                    self.failed_loads.insert(hash);
+                               }
+                           }
+                      } else if path.ends_with(".psg") {
+                          match psg::parse_psg(&file_data) {
+                              Ok(psg_file) => {
+                                  self.psg_cache.insert(hash, psg_file.clone());
+                                  
+                                  // Convert PSG to Value for JSON view (fallback)
+                                  if let Ok(v) = serde_json::to_value(&psg_file) {
+                                      Self::save_to_cache(hash, &v);
+                                      self.json_cache.insert(hash, v);
                                       self.last_error = None;
                                   } else {
-                                      // Fallback for unknown files - cache raw data to stop re-loading
-                                      self.raw_data_cache.insert(hash, file_data);
-                                      self.last_error = None;
+                                       self.last_error = Some("Failed to serialize PSG to JSON".to_string());
+                                       // self.failed_loads.insert(hash); // Don't fail load if graph works?
                                   }
-                             }},
-                             Err(e) => {
-                                 println!("Bundle decompression failed: {:?}", e);
-                                 self.last_error = Some(format!("Decompression failed: {}", e));
-                                 self.failed_loads.insert(hash);
-                             }
-                        }
-                     },
-                     Err(e) => {
-                         println!("Bundle header read failed: {:?}", e);
-                         self.last_error = Some(format!("Header read failed: {}", e));
-                         self.failed_loads.insert(hash);
-                     }
-                  }
-              }
+                              },
+                              Err(e) => {
+                                  // println!("PSG Parse Error: {}", e);
+                                  self.last_error = Some(format!("PSG Parse Error: {}", e));
+                                  self.raw_data_cache.insert(hash, file_data.clone());
+                                  self.failed_loads.insert(hash);
+                              }
+                          }
+                      } else if is_text_file(path) {
+                          // Just store raw data, we decode on render
+                          self.raw_data_cache.insert(hash, file_data);
+                          self.last_error = None;
+                      } else {
+                          // Fallback for unknown files - cache raw data to stop re-loading
+                          self.raw_data_cache.insert(hash, file_data);
+                          self.last_error = None;
+                      }
+                 } else {
+                     let msg = format!("Decompressed bounds check failed for '{}'", file_info.path);
+                     println!("{}", msg);
+                     self.last_error = Some(msg);
+                     self.failed_loads.insert(hash);
+                 }
+             } else {
+                 let msg = format!("Failed to load or decompress data for '{}' (bundle not found and GGPK lookup failed)", file_info.path);
+                 println!("{}", msg);
+                 self.last_error = Some(msg);
+                 self.failed_loads.insert(hash);
+             }
           }
     }
 

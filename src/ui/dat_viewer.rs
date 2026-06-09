@@ -72,11 +72,24 @@ impl DatViewer {
     
     pub fn show(&mut self, ui: &mut egui::Ui, is_poe2: bool) {
          if let Some(err) = &self.error_msg {
-             ui.colored_label(egui::Color32::RED, err);
+             ui.colored_label(egui::Color32::from_rgb(239, 68, 68), err);
+             // Show diagnostic info for failed loads
+             ui.add_space(4.0);
+             ui.label(
+                 egui::RichText::new("Diagnostics")
+                     .size(11.0)
+                     .color(egui::Color32::from_rgb(161, 161, 170)),
+             );
+             if let Some(reader) = &self.reader {
+                 ui.label(format!("File: {}", reader.filename));
+                 ui.label(format!("Data size: {} bytes", reader.get_data().len()));
+             }
          }
          
          if self.reader.is_none() {
-             ui.label("No Dat loaded");
+             if self.error_msg.is_none() {
+                 ui.label("No Dat loaded");
+             }
              return;
          }
          
@@ -205,19 +218,28 @@ impl DatViewer {
                          });
                  });
                  } else {
-                     ui.label(format!("Table not found for file: {}", reader.filename));
-                     self.show_generic_view(ui, reader);
-                 }
-             } else {
-                 if let Some(reader) = &self.reader {
-                     self.show_generic_view(ui, reader);
-                 }
-             }
-         } else {
-              if let Some(reader) = &self.reader {
-                  self.show_generic_view(ui, reader);
+                      ui.horizontal(|ui| {
+                          ui.colored_label(egui::Color32::from_rgb(245, 158, 11), "⚠️ Table not defined in schema.");
+                          ui.label("Displaying generic layout (8-byte columns).");
+                      });
+                      ui.add_space(4.0);
+                      self.show_generic_view(ui, reader);
+                  }
+              } else {
+                  if let Some(reader) = &self.reader {
+                      self.show_generic_view(ui, reader);
+                  }
               }
-         }
+          } else {
+               if let Some(reader) = &self.reader {
+                   ui.horizontal(|ui| {
+                       ui.colored_label(egui::Color32::from_rgb(239, 68, 68), "❌ Schema is not loaded.");
+                       ui.label("Displaying generic layout (8-byte columns).");
+                   });
+                   ui.add_space(4.0);
+                   self.show_generic_view(ui, reader);
+               }
+          }
          
          ui.separator();
          ui.horizontal(|ui| {

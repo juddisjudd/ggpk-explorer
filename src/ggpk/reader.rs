@@ -133,7 +133,6 @@ impl GgpkReader {
                         if sub_dir.name.eq_ignore_ascii_case(part) {
                             found_offset = Some(entry.offset);
                             is_file = false;
-                            break;
                         }
                     },
                     RecordTag::FILE => {
@@ -141,7 +140,6 @@ impl GgpkReader {
                          if file.name.eq_ignore_ascii_case(part) {
                              found_offset = Some(entry.offset);
                              is_file = true;
-                             break;
                          }
                     },
                     _ => {}
@@ -183,7 +181,6 @@ impl GgpkReader {
                       let sub_dir = self.read_directory(entry.offset)?;
                       if sub_dir.name.eq_ignore_ascii_case(part) {
                           found_offset = Some(entry.offset);
-                          break;
                       }
                   }
              }

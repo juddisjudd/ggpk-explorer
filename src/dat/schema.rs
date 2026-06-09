@@ -24,10 +24,13 @@ pub struct Column {
     pub name: Option<String>,
     pub description: Option<String>,
     pub array: bool,
-    pub r#type: String, // "bool", "string", "i32", "f32", "foreign_row", "foreign_row"
+    pub r#type: String, // "bool", "string", "i32", "f32", "foreignrow", "row", "enumrow", etc.
     pub unique: bool,
     pub localized: bool,
-    pub references: Option<TableReference>, 
+    pub references: Option<TableReference>,
+    /// If true, this column contains two consecutive values (min, max) of the same type.
+    #[serde(default)]
+    pub interval: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
