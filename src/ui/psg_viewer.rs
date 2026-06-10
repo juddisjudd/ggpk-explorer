@@ -101,8 +101,8 @@ fn get_class_bg_assets(class_name: &str) -> Option<PsgClassBg> {
 // PoE2 orbits are evenly spaced: theta = position / capacity * 2*pi.
 fn get_node_angle(radius: u32, position: u32, passives_per_orbit: &[u8]) -> f32 {
     let r_idx = radius as usize;
-    let capacity = if r_idx < passives_per_orbit.len() {
-        passives_per_orbit[r_idx] as f32
+    let capacity = if let Some(&cap) = passives_per_orbit.get(r_idx) {
+        cap as f32
     } else {
         12.0
     };

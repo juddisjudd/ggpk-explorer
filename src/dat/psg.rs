@@ -21,7 +21,7 @@ impl PsgFile {
     /// Orbit radii for this graph, selected by `graph_type` (1 = atlas).
     pub fn orbit_radii(&self) -> [f32; 10] {
         let src = if self.graph_type == 1 { ATLAS_ORBIT_RADII } else { PASSIVE_ORBIT_RADII };
-        std::array::from_fn(|i| src[i] as f32)
+        std::array::from_fn(|i| src.get(i).copied().unwrap_or(0) as f32)
     }
 }
 
@@ -35,9 +35,9 @@ impl Serialize for PsgFile {
         state.serialize_field("groups", &self.groups)?;
 
         let orbit_radii: &[i32] = if self.graph_type == 1 {
-            &ATLAS_ORBIT_RADII[..]
+            ATLAS_ORBIT_RADII.as_slice()
         } else {
-            &PASSIVE_ORBIT_RADII[..]
+            PASSIVE_ORBIT_RADII.as_slice()
         };
 
         state.serialize_field("orbitRadii", orbit_radii)?;

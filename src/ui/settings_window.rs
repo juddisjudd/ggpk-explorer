@@ -123,7 +123,7 @@ impl SettingsWindow {
                         settings.ggpk_path = if path.is_empty() { None } else { Some(path) };
                     }
                     if ui.button("Browse").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().add_filter("GGPK", &["ggpk"] as &[&str]).pick_file() {
+                        if let Some(p) = rfd::FileDialog::new().add_filter("GGPK", &["ggpk"]).pick_file() {
                             settings.ggpk_path = Some(p.to_string_lossy().to_string());
                         }
                     }

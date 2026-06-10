@@ -205,22 +205,22 @@ fn read_column_value(cursor: &mut Cursor<&[u8]>, col: &Column, file_data: &[u8],
         "bool" => {
              let mut b = [0u8; 1];
              cursor.read_exact(&mut b)?;
-             Ok(DatValue::Bool(b[0] != 0))
+             Ok(DatValue::Bool(b.first().copied().unwrap_or(0) != 0))
         },
         "byte" | "u8" => {
              let mut b = [0u8; 1];
              cursor.read_exact(&mut b)?;
-             Ok(DatValue::Int(b[0] as i64)) // Treat as int
+             Ok(DatValue::Int(b.first().copied().unwrap_or(0) as i64)) // Treat as int
         },
         "short" | "i16" => {
              let mut b = [0u8; 2];
              cursor.read_exact(&mut b)?;
-             Ok(DatValue::Int(LittleEndian::read_i16(&b[..]) as i64))
+             Ok(DatValue::Int(LittleEndian::read_i16(b.as_slice()) as i64))
         },
         "ushort" | "u16" => {
              let mut b = [0u8; 2];
              cursor.read_exact(&mut b)?;
-             Ok(DatValue::Int(LittleEndian::read_u16(&b[..]) as i64))
+             Ok(DatValue::Int(LittleEndian::read_u16(b.as_slice()) as i64))
         },
         "int" | "i32" => {
              Ok(DatValue::Int(read_u32(cursor)? as i32 as i64))
@@ -326,7 +326,7 @@ fn read_string_at(data: &[u8], offset: usize) -> String {
     let mut vec_u16 = Vec::new();
     let mut i = offset;
     while i + 1 < data.len() {
-        let u = LittleEndian::read_u16(&data[i..i+2]);
+        let u = data.get(i..i+2).map(|slice| LittleEndian::read_u16(slice)).unwrap_or(0);
         if u == 0 { break; } // Null terminator
         vec_u16.push(u);
         i += 2;
@@ -359,13 +359,13 @@ pub enum DatValue {
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> io::Result<u32> {
     let mut buf = [0u8; 4];
     cursor.read_exact(&mut buf)?;
-    Ok(LittleEndian::read_u32(&buf[..]))
+    Ok(LittleEndian::read_u32(buf.as_slice()))
 }
 
 fn read_u64(cursor: &mut Cursor<&[u8]>) -> io::Result<u64> {
     let mut buf = [0u8; 8];
     cursor.read_exact(&mut buf)?;
-    Ok(LittleEndian::read_u64(&buf[..]))
+    Ok(LittleEndian::read_u64(buf.as_slice()))
 }
 
 impl DatReader {
@@ -385,27 +385,42 @@ impl DatReader {
         
         // Element type is same as column type but `array` is false
         let elem_col = Column {
-            name: None,
+            name: Option::None,
             r#type: col.r#type.clone(),
             references: col.references.clone(),
             array: false, 
             unique: false,
             localized: false,
-            description: None,
+            description: Option::None,
             interval: false,
         };
         
         let elem_size = get_column_size(&elem_col, self.is_64bit);
         
-        // Safety check for size
-        if elem_size == 0 { return Ok(vec![DatValue::Unknown; count]); }
+        // Safety check: if elem_size is 0, we can't parse it.
+        if elem_size == 0 {
+            return Ok(vec![DatValue::Unknown; std::cmp::min(count, 1000)]);
+        }
 
-        let total_size = elem_size * count;
-        let end = (start + total_size).min(self.data.len());
+        // Validate that the list fits within the file data.
+        // If count * elem_size overflows or exceeds the file bounds, the list parameters are corrupt/invalid.
+        let total_size = match elem_size.checked_mul(count) {
+            Some(sz) => sz,
+            None => return Ok(Vec::new()),
+        };
+        let end = match start.checked_add(total_size) {
+            Some(e) => e,
+            None => return Ok(Vec::new()),
+        };
+        if end > self.data.len() {
+            // Out of bounds! Immediately return empty list rather than reading garbage or looping.
+            return Ok(Vec::new());
+        }
+
         let slice = &self.data[start..end];
         let mut cursor = Cursor::new(slice);
         
-        let mut values = Vec::new();
+        let mut values = Vec::with_capacity(count);
         for _ in 0..count {
              match read_column_value(&mut cursor, &elem_col, &self.data, self.data_section_offset, self.is_64bit) {
                  Ok(v) => values.push(v),
@@ -419,21 +434,21 @@ impl DatReader {
     pub fn value_to_json(&self, val: &DatValue, col: &Column) -> serde_json::Value {
         use serde_json::Value;
         match val {
-            DatValue::Bool(b) => Value::from(*b),
-            DatValue::Int(i) => Value::from(*i),
-            DatValue::Long(l) => Value::from(*l),
-            DatValue::Float(f) => Value::from(*f),
+            &DatValue::Bool(b) => Value::from(b),
+            &DatValue::Int(i) => Value::from(i),
+            &DatValue::Long(l) => Value::from(l),
+            &DatValue::Float(f) => Value::from(f),
             DatValue::String(s) => Value::from(s.clone()),
-            DatValue::List(count, offset) => {
-                if let Ok(items) = self.read_list_values(*offset, *count, col) {
+            &DatValue::List(count, offset) => {
+                if let Ok(items) = self.read_list_values(offset, count, col) {
                     let json_items: Vec<Value> = items.iter().map(|item| {
                         match item {
-                            DatValue::Bool(b) => Value::from(*b),
-                            DatValue::Int(i) => Value::from(*i),
-                            DatValue::Long(l) => Value::from(*l),
-                            DatValue::Float(f) => Value::from(*f),
+                            &DatValue::Bool(b) => Value::from(b),
+                            &DatValue::Int(i) => Value::from(i),
+                            &DatValue::Long(l) => Value::from(l),
+                            &DatValue::Float(f) => Value::from(f),
                             DatValue::String(s) => Value::from(s.clone()),
-                            DatValue::ForeignRow(k) => Value::from(*k),
+                            &DatValue::ForeignRow(k) => Value::from(k),
                             _ => Value::Null,
                         }
                     }).collect();
@@ -442,7 +457,7 @@ impl DatReader {
                     Value::Array(Vec::new())
                 }
             },
-            DatValue::ForeignRow(k) => Value::String(format!("Key({})", k)),
+            &DatValue::ForeignRow(k) => Value::String(format!("Key({})", k)),
             _ => Value::Null,
         }
     }

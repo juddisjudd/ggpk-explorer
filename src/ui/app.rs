@@ -184,7 +184,7 @@ impl ExplorerApp {
     }
 
     fn open_ggpk(&mut self, ctx: &egui::Context) {
-        if let Some(path) = FileDialog::new().add_filter("GGPK", &["ggpk"] as &[&str]).pick_file() {
+        if let Some(path) = FileDialog::new().add_filter("GGPK", &["ggpk"]).pick_file() {
             self.settings.ggpk_path = Some(path.to_string_lossy().to_string());
             self.settings.steam_path = None;
             self.settings.save();
