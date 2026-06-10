@@ -13,6 +13,32 @@ pub mod parsers;
 pub mod adapters;
 
 fn main() -> eframe::Result<()> {
+    std::panic::set_hook(Box::new(|info| {
+        let msg = match info.payload().downcast_ref::<&str>() {
+            Some(s) => *s,
+            Option::None => match info.payload().downcast_ref::<String>() {
+                Some(s) => &**s,
+                Option::None => "Box<dyn Any>",
+            }
+        };
+        let location = info.location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        
+        let backtrace = std::backtrace::Backtrace::capture();
+        
+        let log_content = format!(
+            "GGPK Explorer Crashed!\nLocation: {}\nMessage: {}\n\nBacktrace:\n{:?}",
+            location, msg, backtrace
+        );
+        
+        let log_dir = settings::AppSettings::get_app_data_dir();
+        let log_path = log_dir.join("crash.log");
+        let _ = std::fs::write(&log_path, log_content);
+        
+        eprintln!("Panic occurred! Crash details written to: {}", log_path.display());
+    }));
+
     env_logger::init();
     
 

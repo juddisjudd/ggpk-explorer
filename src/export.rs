@@ -93,8 +93,18 @@ pub fn run_export(
         format!("Exported {} files. {} errors occurred.", success_count, error_count)
     };
     
-    // Log errors to a file if there are many? For now just print them
+    // Log errors to a file and stdout if there are failures
     if error_count > 0 {
+        let log_path = target_dir.join("export_errors.log");
+        let mut content = String::new();
+        content.push_str("Export Errors:\n");
+        for e in &errors {
+            content.push_str(&format!("  - {}\n", e));
+        }
+        if std::fs::write(&log_path, content).is_ok() {
+            println!("Export errors logged to: {}", log_path.display());
+        }
+        
         println!("Export Errors:");
         for e in &errors {
             println!("  - {}", e);

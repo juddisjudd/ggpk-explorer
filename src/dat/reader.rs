@@ -406,11 +406,11 @@ impl DatReader {
         // If count * elem_size overflows or exceeds the file bounds, the list parameters are corrupt/invalid.
         let total_size = match elem_size.checked_mul(count) {
             Some(sz) => sz,
-            None => return Ok(Vec::new()),
+            Option::None => return Ok(Vec::new()),
         };
         let end = match start.checked_add(total_size) {
             Some(e) => e,
-            None => return Ok(Vec::new()),
+            Option::None => return Ok(Vec::new()),
         };
         if end > self.data.len() {
             // Out of bounds! Immediately return empty list rather than reading garbage or looping.
