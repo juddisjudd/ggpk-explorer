@@ -107,7 +107,7 @@ mod tests {
                 if let Ok(bundle) = crate::bundles::bundle::Bundle::read_header(&mut cursor) {
                     if let Ok(decompressed) = bundle.decompress(&mut cursor) {
                         if let Ok(idx) = crate::bundles::index::Index::read(&decompressed) {
-                            let hash = local_murmur_hash64a(b"metadata/passiveskillgraph.psg", 0x1337b33f);
+                            let hash = local_murmur_hash64a(b"metadata/passiveskillgraph.psg" as &[u8], 0x1337b33f);
                             if let Some(file_info) = idx.files.get(&hash) {
                                 if let Some(bundle_info) = idx.bundles.get(file_info.bundle_index as usize) {
                                     if let Ok(bundle_data) = steam.fetch_bundle(&bundle_info.name) {
@@ -141,7 +141,7 @@ mod tests {
                                                 Ok(decompressed) => {
                                                     match crate::bundles::index::Index::read(&decompressed) {
                                                         Ok(idx) => {
-                                                            let hash = local_murmur_hash64a(b"metadata/passiveskillgraph.psg", 0x1337b33f);
+                                                            let hash = local_murmur_hash64a(b"metadata/passiveskillgraph.psg" as &[u8], 0x1337b33f);
                                                             if let Some(file_info) = idx.files.get(&hash) {
                                                                 if let Some(bundle_info) = idx.bundles.get(file_info.bundle_index as usize) {
                                                                     let candidates = vec![
