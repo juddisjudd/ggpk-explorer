@@ -2,6 +2,8 @@
 *.cache
 /docs
 *.bin
+# Vorbis setup-header table required by the FMOD bank parser (include_bytes!)
+!assets/fsb5_vorbis_headers.bin
 *.log
 RELEASE_PROCESS.md
 /examples
