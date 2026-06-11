@@ -379,6 +379,14 @@ impl ExplorerApp {
                                 }
                             }
                         }
+
+                        // Inject loose GGPK records (FMOD/*.bank, Media/*.bk2, ...)
+                        // so they show up in the tree. Runs after enrichment and
+                        // is never persisted to the index cache (idempotent).
+                        let start_loose = std::time::Instant::now();
+                        let loose_added = index.add_ggpk_loose_files(&reader);
+                        println!("Injected {} loose GGPK files into index in {:?}", loose_added, start_loose.elapsed());
+
                         bundle_index = Some(Arc::new(index));
                     }
 
@@ -386,7 +394,7 @@ impl ExplorerApp {
                     
                     let mut tree_view = None;
                     if loaded_from_cache {
-                        let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.tree.cache");
+                        let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.tree.v2.cache");
                         if tree_cache_path.exists() {
                             eprintln!("Found tree cache file, attempting to load...");
                             let start_tree_cache = std::time::Instant::now();
@@ -408,7 +416,7 @@ impl ExplorerApp {
                         let start_tree = std::time::Instant::now();
                         let tv = if let Some(idx) = &bundle_index {
                             let built_tv = TreeView::new_bundled(Some(reader.clone()), idx);
-                            let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.tree.cache");
+                            let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.tree.v2.cache");
                             eprintln!("Saving TreeView to cache...");
                             if let Err(e) = built_tv.save_nodes_to_cache(&tree_cache_path) {
                                 println!("Failed to save tree cache: {}", e);

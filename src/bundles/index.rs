@@ -32,6 +32,11 @@ pub struct Index {
     pub files: HashMap<u64, FileInfo>,
 }
 
+/// Sentinel bundle_index value meaning "read this file as a loose FILE record
+/// from the GGPK itself" (e.g. FMOD/*.bank, Media/*.bk2). Distinct from
+/// `crate::bundles::steam::LOOSE_FILE_SENTINEL` (loose file on disk).
+pub const GGPK_LOOSE_FILE_SENTINEL: u32 = u32::MAX - 1;
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HashAlgorithm {
@@ -127,6 +132,33 @@ impl Index {
         println!("Index::read: {}/{} files have paths", populated_count, files_map.len());
         
         Ok(Self { bundles, files: files_map })
+    }
+
+    /// Injects loose GGPK FILE records (FMOD/, Media/, root files, ...) into
+    /// the index with `bundle_index = GGPK_LOOSE_FILE_SENTINEL` so they appear
+    /// in the tree and can be viewed/exported. Idempotent: files already in
+    /// the index (bundled or previously injected) are skipped.
+    pub fn add_ggpk_loose_files(&mut self, reader: &crate::ggpk::reader::GgpkReader) -> usize {
+        let mut added = 0;
+        for (path, size) in reader.collect_loose_files() {
+            if path.is_empty() {
+                continue;
+            }
+            let lower = path.to_ascii_lowercase();
+            let hash = murmur_hash64a(lower.as_bytes());
+            if self.files.contains_key(&hash) {
+                continue;
+            }
+            self.files.insert(hash, FileInfo {
+                path_hash: hash,
+                bundle_index: GGPK_LOOSE_FILE_SENTINEL,
+                file_offset: 0,
+                file_size: size.min(u32::MAX as u64) as u32,
+                path,
+            });
+            added += 1;
+        }
+        added
     }
 
     pub fn save_to_cache<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {

@@ -132,7 +132,18 @@ fn export_single_file(
         let file_info = idx.files.get(&hash).ok_or("File hash not found in bundle index")?;
         let path = file_info.path.clone();
 
-        if file_info.bundle_index == crate::bundles::steam::LOOSE_FILE_SENTINEL {
+        if file_info.bundle_index == crate::bundles::index::GGPK_LOOSE_FILE_SENTINEL {
+            let r = reader.ok_or("GGPK reader required for loose GGPK file export")?;
+            let rec = r
+                .read_file_by_path(&path)
+                .map_err(|e| format!("Failed to look up loose GGPK file {}: {}", path, e))?
+                .ok_or_else(|| format!("Loose GGPK file not found: {}", path))?;
+            let bytes = r
+                .get_data_slice(rec.data_offset, rec.data_length)
+                .map_err(|e| format!("Failed to read loose GGPK file data: {}", e))?
+                .to_vec();
+            (path, bytes)
+        } else if file_info.bundle_index == crate::bundles::steam::LOOSE_FILE_SENTINEL {
             if let Some(steam) = steam_loader {
                 if let Some(loose_path) = steam.loose_file_path(&path) {
                     let bytes = std::fs::read(&loose_path)

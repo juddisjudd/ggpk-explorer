@@ -112,58 +112,103 @@ impl GgpkReader {
         false
     }
 
-    pub fn read_file_by_path(&self, path: &str) -> io::Result<Option<FileRecord>> {
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.is_empty() {
-            return Ok(None);
-        }
-
-        let mut current_offset = self.root_offset;
-        
-        for (i, part) in parts.iter().enumerate() {
-            let dir = self.read_directory(current_offset)?;
-            let mut found_offset = None;
-            let mut is_file = false;
-
-            for entry in dir.entries {
-                let header = self.read_record_header(entry.offset)?;
+    /// Collects all loose FILE records stored directly in the GGPK (outside
+    /// Bundles2/) as (virtual_path, data_length) pairs — e.g. FMOD/ sound
+    /// banks and Media/ videos, which are not part of the bundle index.
+    pub fn collect_loose_files(&self) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        if let Ok(root) = self.read_directory(self.root_offset) {
+            for entry in root.entries {
+                let header = match self.read_record_header(entry.offset) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
                 match header.tag {
                     RecordTag::PDIR => {
-                        let sub_dir = self.read_directory(entry.offset)?;
-                        if sub_dir.name.eq_ignore_ascii_case(part) {
-                            found_offset = Some(entry.offset);
-                            is_file = false;
+                        if let Ok(dir) = self.read_directory(entry.offset) {
+                            if dir.name.eq_ignore_ascii_case("Bundles2") {
+                                continue;
+                            }
+                            let prefix = dir.name.clone();
+                            self.collect_loose_dir(&dir, &prefix, &mut out);
                         }
-                    },
+                    }
                     RecordTag::FILE => {
-                         let file = self.read_file_record(entry.offset)?;
-                         if file.name.eq_ignore_ascii_case(part) {
-                             found_offset = Some(entry.offset);
-                             is_file = true;
-                         }
-                    },
+                        if let Ok(file) = self.read_file_record(entry.offset) {
+                            out.push((file.name, file.data_length));
+                        }
+                    }
                     _ => {}
                 }
             }
-            
-            if let Some(offset) = found_offset {
-                if i == parts.len() - 1 {
-                    if is_file {
-                        return Ok(Some(self.read_file_record(offset)?));
-                    } else {
-                        return Ok(None);
+        }
+        out
+    }
+
+    fn collect_loose_dir(&self, dir: &DirectoryRecord, prefix: &str, out: &mut Vec<(String, u64)>) {
+        for entry in &dir.entries {
+            let header = match self.read_record_header(entry.offset) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            match header.tag {
+                RecordTag::PDIR => {
+                    if let Ok(sub) = self.read_directory(entry.offset) {
+                        let sub_prefix = format!("{}/{}", prefix, sub.name);
+                        self.collect_loose_dir(&sub, &sub_prefix, out);
                     }
-                } else {
-                    if is_file {
-                        return Ok(None);
-                    }
-                    current_offset = offset;
                 }
-            } else {
-                return Ok(None);
+                RecordTag::FILE => {
+                    if let Ok(file) = self.read_file_record(entry.offset) {
+                        out.push((format!("{}/{}", prefix, file.name), file.data_length));
+                    }
+                }
+                _ => {}
             }
         }
-        Ok(None)
+    }
+
+    pub fn read_file_by_path(&self, path: &str) -> io::Result<Option<FileRecord>> {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.find_file_in_dir(self.root_offset, &parts))
+    }
+
+    /// Recursive path resolution with backtracking: the GGPK can contain
+    /// multiple sibling directories with the same name (e.g. two root Art/
+    /// records), so on a dead end the search continues with the next match.
+    fn find_file_in_dir(&self, dir_offset: u64, parts: &[&str]) -> Option<FileRecord> {
+        let (part, rest) = parts.split_first()?;
+        let dir = self.read_directory(dir_offset).ok()?;
+
+        for entry in dir.entries {
+            let header = match self.read_record_header(entry.offset) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            match header.tag {
+                RecordTag::PDIR if !rest.is_empty() => {
+                    if let Ok(sub_dir) = self.read_directory(entry.offset) {
+                        if sub_dir.name.eq_ignore_ascii_case(part) {
+                            if let Some(found) = self.find_file_in_dir(entry.offset, rest) {
+                                return Some(found);
+                            }
+                        }
+                    }
+                }
+                RecordTag::FILE if rest.is_empty() => {
+                    if let Ok(file) = self.read_file_record(entry.offset) {
+                        if file.name.eq_ignore_ascii_case(part) {
+                            return Some(file);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     pub fn list_files_in_directory(&self, path: &str) -> io::Result<Vec<String>> {

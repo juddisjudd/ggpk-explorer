@@ -61,6 +61,24 @@ pub struct ContentView {
     folder_cache_index_size: usize,
 
     pub parsed_content_cache: HashMap<u64, crate::parsers::ParsedContent>,
+
+    // FMOD .bank viewer state: parsed stream listings, decoded streams
+    // (keyed by (file hash, stream index)), and the in-flight background
+    // decode / export-all jobs.
+    pub bank_info_cache: HashMap<u64, crate::parsers::fmod_bank::FmodBankInfo>,
+    bank_stream_cache: HashMap<(u64, usize), Vec<u8>>,
+    bank_decode_rx: Option<std::sync::mpsc::Receiver<(u64, usize, Result<Vec<u8>, String>)>>,
+    bank_decoding: Option<(u64, usize)>,
+    bank_decode_intent: BankStreamIntent,
+    bank_playing: Option<(u64, usize)>,
+    bank_export_rx: Option<std::sync::mpsc::Receiver<String>>,
+    bank_export_status: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BankStreamIntent {
+    Play,
+    Export,
 }
 
 impl Default for ContentView {
@@ -92,6 +110,15 @@ impl Default for ContentView {
             folder_children_cache: HashMap::new(),
             folder_cache_index_size: 0,
             parsed_content_cache: HashMap::new(),
+
+            bank_info_cache: HashMap::new(),
+            bank_stream_cache: HashMap::new(),
+            bank_decode_rx: None,
+            bank_decoding: None,
+            bank_decode_intent: BankStreamIntent::Play,
+            bank_playing: None,
+            bank_export_rx: None,
+            bank_export_status: None,
         }
     }
 }
@@ -204,6 +231,11 @@ impl ContentView {
                                  }
                              } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") || file_info.path.ends_with(".mp3") {
                                  // Audio: play on demand, no auto-load needed
+                             } else if file_info.path.ends_with(".bank") {
+                                 // FMOD bank: load bytes + parse stream listing (no decode)
+                                 if !self.bank_info_cache.contains_key(&hash) && !self.raw_data_cache.contains_key(&hash) {
+                                     perform_load = true;
+                                 }
                              } else if is_non_playable_media(&file_info.path) {
                                  // Non-playable media (bk2/wem/bank/mp4): never auto-load
                              } else if is_text_file(&file_info.path) {
@@ -475,6 +507,12 @@ impl ContentView {
                 }
             } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") || file_info.path.ends_with(".mp3") {
                                            self.show_audio_player(ui, reader.as_deref(), index, file_info, hash);
+                                      } else if file_info.path.ends_with(".bank") {
+                                           if self.bank_info_cache.contains_key(&hash) {
+                                               self.show_bank_viewer(ui, file_info, hash);
+                                           } else {
+                                               self.show_media_stub(ui, file_info, hash, reader.as_deref(), bundle_index.as_ref().map(|i| i.as_ref()));
+                                           }
                                       } else if is_non_playable_media(&file_info.path) {
                                            self.show_media_stub(ui, file_info, hash, reader.as_deref(), bundle_index.as_ref().map(|i| i.as_ref()));
                                       } else if is_text_file(&file_info.path) {
@@ -1036,6 +1074,300 @@ impl ContentView {
         );
     }
 
+    /// Starts a background decode of one bank stream (Vorbis transcode is too
+    /// slow for the UI thread). Result arrives via `bank_decode_rx`.
+    fn start_bank_stream_decode(&mut self, hash: u64, index: usize, intent: BankStreamIntent) {
+        if self.bank_decoding.is_some() {
+            return; // one decode at a time
+        }
+        let raw = match self.raw_data_cache.get(&hash) {
+            Some(r) => r.clone(),
+            None => {
+                self.last_error = Some("Bank data no longer cached — re-select the file".to_string());
+                return;
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bank_decode_rx = Some(rx);
+        self.bank_decoding = Some((hash, index));
+        self.bank_decode_intent = intent;
+        std::thread::spawn(move || {
+            let result = crate::parsers::fmod_bank::decode_stream(&raw, index);
+            let _ = tx.send((hash, index, result));
+        });
+    }
+
+    fn play_audio_bytes(&mut self, bytes: Vec<u8>) {
+        if self.audio_stream_handle.is_none() {
+            if let Ok(stream_handle) = rodio::OutputStream::try_default() {
+                self.audio_stream_handle = Some(stream_handle);
+            }
+        }
+        if let Some((_, stream_handle)) = &self.audio_stream_handle {
+            match rodio::Decoder::new(std::io::Cursor::new(bytes)) {
+                Ok(decoder) => match rodio::Sink::try_new(stream_handle) {
+                    Ok(sink) => {
+                        sink.set_volume(self.audio_volume);
+                        sink.append(decoder);
+                        sink.play();
+                        self.audio_sink = Some(sink);
+                    }
+                    Err(_) => self.last_error = Some("Failed to create audio sink".to_string()),
+                },
+                Err(e) => self.last_error = Some(format!("Failed to decode audio stream: {}", e)),
+            }
+        } else {
+            self.last_error = Some("No audio output device available".to_string());
+        }
+    }
+
+    fn save_bank_stream(&mut self, hash: u64, index: usize, bytes: &[u8]) {
+        let (name, ext) = self
+            .bank_info_cache
+            .get(&hash)
+            .and_then(|info| info.streams.get(index).map(|s| (s.name.clone(), info.extension)))
+            .unwrap_or_else(|| (format!("stream_{:03}", index), "ogg"));
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("{}.{}", sanitize_filename(&name), ext))
+            .save_file()
+        {
+            if let Err(e) = std::fs::write(&path, bytes) {
+                self.last_error = Some(format!("Save failed: {}", e));
+            }
+        }
+    }
+
+    fn show_bank_viewer(&mut self, ui: &mut egui::Ui, _file_info: &crate::bundles::index::FileInfo, hash: u64) {
+        // Poll the in-flight stream decode
+        if let Some(rx) = &self.bank_decode_rx {
+            if let Ok((h, idx, result)) = rx.try_recv() {
+                self.bank_decode_rx = None;
+                self.bank_decoding = None;
+                match result {
+                    Ok(bytes) => {
+                        // Decoded WAVs are large (a music track is ~50MB) —
+                        // only keep streams of the bank currently in view.
+                        self.bank_stream_cache.retain(|(h2, _), _| *h2 == h);
+                        self.bank_stream_cache.insert((h, idx), bytes.clone());
+                        match self.bank_decode_intent {
+                            BankStreamIntent::Play => {
+                                self.play_audio_bytes(bytes);
+                                self.bank_playing = Some((h, idx));
+                            }
+                            BankStreamIntent::Export => self.save_bank_stream(h, idx, &bytes),
+                        }
+                    }
+                    Err(e) => self.last_error = Some(e),
+                }
+            }
+        }
+
+        // Poll the export-all job
+        if let Some(rx) = &self.bank_export_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => self.bank_export_status = Some(msg),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.bank_export_rx = None;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let info = match self.bank_info_cache.get(&hash) {
+            Some(i) => i.clone(),
+            None => return,
+        };
+
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.horizontal_wrapped(|ui| {
+            crate::ui::components::badge(ui, "FMOD BANK");
+            crate::ui::components::badge(ui, &info.format.to_uppercase());
+            crate::ui::components::badge(ui, &format!("{} STREAMS", info.streams.len()));
+        });
+
+        if info.streams.is_empty() {
+            ui.add_space(8.0);
+            ui.label(
+                egui::RichText::new(
+                    "This bank contains no audio streams — it holds FMOD event/mixer metadata \
+                     (or GUID strings for a .strings.bank).",
+                )
+                .size(11.5)
+                .color(egui::Color32::from_rgb(113, 113, 122))
+                .italics(),
+            );
+            return;
+        }
+
+        let is_playing = self.audio_sink.as_ref().map(|s| !s.empty()).unwrap_or(false);
+        if !is_playing {
+            self.bank_playing = None;
+        }
+
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("VOLUME")
+                    .size(10.5)
+                    .monospace()
+                    .color(egui::Color32::from_rgb(113, 113, 122)),
+            );
+            ui.add_space(6.0);
+            if ui
+                .add_sized(
+                    [140.0, 18.0],
+                    egui::Slider::new(&mut self.audio_volume, 0.0..=1.0).show_value(false),
+                )
+                .changed()
+            {
+                if let Some(sink) = &self.audio_sink {
+                    sink.set_volume(self.audio_volume);
+                }
+            }
+            ui.add_space(12.0);
+            if self.bank_export_rx.is_none() {
+                if ui.button("Export All Streams...").clicked() {
+                    self.export_all_bank_streams(hash, &info);
+                }
+            }
+            if let Some(status) = &self.bank_export_status {
+                if self.bank_export_rx.is_some() {
+                    ui.spinner();
+                }
+                ui.label(
+                    egui::RichText::new(status)
+                        .size(11.0)
+                        .color(egui::Color32::from_rgb(161, 161, 170)),
+                );
+            }
+        });
+
+        if let Some(err) = &self.last_error {
+            ui.label(
+                egui::RichText::new(err)
+                    .size(11.5)
+                    .color(egui::Color32::from_rgb(239, 68, 68)),
+            );
+        }
+
+        ui.add_space(4.0);
+        ui.separator();
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for (i, stream) in info.streams.iter().enumerate() {
+                let row_playing = is_playing && self.bank_playing == Some((hash, i));
+                let row_decoding = self.bank_decoding == Some((hash, i));
+
+                ui.horizontal(|ui| {
+                    if row_decoding {
+                        ui.add_sized([26.0, 18.0], egui::Spinner::new());
+                    } else if row_playing {
+                        if ui.add_sized([26.0, 18.0], egui::Button::new("■")).clicked() {
+                            if let Some(sink) = &self.audio_sink {
+                                sink.stop();
+                            }
+                            self.audio_sink = None;
+                            self.bank_playing = None;
+                        }
+                    } else if ui.add_sized([26.0, 18.0], egui::Button::new("▶")).clicked() {
+                        if let Some(sink) = &self.audio_sink {
+                            sink.stop();
+                        }
+                        self.audio_sink = None;
+                        if let Some(bytes) = self.bank_stream_cache.get(&(hash, i)).cloned() {
+                            self.play_audio_bytes(bytes);
+                            self.bank_playing = Some((hash, i));
+                        } else {
+                            self.start_bank_stream_decode(hash, i, BankStreamIntent::Play);
+                        }
+                    }
+
+                    if ui
+                        .add_sized([26.0, 18.0], egui::Button::new("💾"))
+                        .on_hover_text(format!("Save as .{}", info.extension))
+                        .clicked()
+                    {
+                        if let Some(bytes) = self.bank_stream_cache.get(&(hash, i)).cloned() {
+                            self.save_bank_stream(hash, i, &bytes);
+                        } else {
+                            self.start_bank_stream_decode(hash, i, BankStreamIntent::Export);
+                        }
+                    }
+
+                    ui.label(egui::RichText::new(&stream.name).monospace().size(12.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let secs = stream.duration_secs();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}:{:05.2}  {}ch  {:.1}kHz  {}",
+                                (secs / 60.0) as u32,
+                                secs % 60.0,
+                                stream.channels,
+                                stream.sample_rate as f32 / 1000.0,
+                                format_file_size(stream.size as u64),
+                            ))
+                            .size(10.5)
+                            .monospace()
+                            .color(egui::Color32::from_rgb(113, 113, 122)),
+                        );
+                    });
+                });
+            }
+        });
+
+        if is_playing || self.bank_decoding.is_some() || self.bank_export_rx.is_some() {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn export_all_bank_streams(&mut self, hash: u64, info: &crate::parsers::fmod_bank::FmodBankInfo) {
+        let raw = match self.raw_data_cache.get(&hash) {
+            Some(r) => r.clone(),
+            None => {
+                self.last_error = Some("Bank data no longer cached — re-select the file".to_string());
+                return;
+            }
+        };
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let info = info.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.bank_export_rx = Some(rx);
+        self.bank_export_status = Some("Exporting...".to_string());
+        std::thread::spawn(move || {
+            let total = info.streams.len();
+            let mut ok = 0;
+            let mut failed = 0;
+            for (i, stream) in info.streams.iter().enumerate() {
+                let _ = tx.send(format!("Exporting {}/{}: {}", i + 1, total, stream.name));
+                match crate::parsers::fmod_bank::decode_stream(&raw, i) {
+                    Ok(bytes) => {
+                        let path = dir.join(format!(
+                            "{}.{}",
+                            sanitize_filename(&stream.name),
+                            info.extension
+                        ));
+                        if std::fs::write(&path, bytes).is_ok() {
+                            ok += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    Err(_) => failed += 1,
+                }
+            }
+            let _ = tx.send(if failed == 0 {
+                format!("Exported {} streams.", ok)
+            } else {
+                format!("Exported {} streams ({} failed).", ok, failed)
+            });
+        });
+    }
+
     fn show_ggpk_file(&mut self, ui: &mut egui::Ui, reader: &GgpkReader, offset: u64, is_poe2: bool) {
             match reader.read_file_record(offset) {
                 Ok(file) => {
@@ -1162,9 +1494,9 @@ impl ContentView {
              if let Some(loose_path) = loose_path {
                  match std::fs::read(&loose_path) {
                      Ok(data) => {
-                         self.insert_raw(hash, data);
                          self.failed_loads.remove(&hash);
                          self.last_error = None;
+                         self.route_file_data(ctx, &file_info.path, hash, data);
                      }
                      Err(e) => {
                          self.last_error = Some(format!("Failed to read loose file: {}", e));
@@ -1174,6 +1506,28 @@ impl ContentView {
              } else if self.steam_loader.is_some() {
                  self.last_error = Some(format!("Loose file not found on disk: {}", file_info.path));
                  self.failed_loads.insert(hash);
+             }
+             return;
+         }
+
+         // Loose GGPK record (FMOD/*.bank, Media/*.bk2, ...) — read directly
+         // from the GGPK file records instead of a bundle.
+         if file_info.bundle_index == crate::bundles::index::GGPK_LOOSE_FILE_SENTINEL {
+             let data = reader.and_then(|r| {
+                 r.read_file_by_path(&file_info.path).ok().flatten().and_then(|rec| {
+                     r.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec())
+                 })
+             });
+             match data {
+                 Some(data) => {
+                     self.failed_loads.remove(&hash);
+                     self.last_error = None;
+                     self.route_file_data(ctx, &file_info.path, hash, data);
+                 }
+                 None => {
+                     self.last_error = Some(format!("Failed to read loose GGPK file: {}", file_info.path));
+                     self.failed_loads.insert(hash);
+                 }
              }
              return;
          }
@@ -1275,9 +1629,25 @@ impl ContentView {
                  
                  if end <= decompressed_data.len() {
                      let file_data = decompressed_data[start..end].to_vec();
-                     let path = &file_info.path;
-                     
-                     // Debug print
+                     self.route_file_data(ctx, &file_info.path, hash, file_data);
+                 } else {
+                     let msg = format!("Decompressed bounds check failed for '{}'", file_info.path);
+                     println!("{}", msg);
+                     self.last_error = Some(msg);
+                     self.failed_loads.insert(hash);
+                 }
+             } else {
+                 let msg = format!("Failed to load or decompress data for '{}' (bundle not found and GGPK lookup failed)", file_info.path);
+                 println!("{}", msg);
+                 self.last_error = Some(msg);
+                 self.failed_loads.insert(hash);
+             }
+          }
+    }
+
+    /// Routes raw file bytes into the appropriate viewer state based on the
+    /// file extension. Shared by bundled, Steam-loose, and GGPK-loose loads.
+    fn route_file_data(&mut self, ctx: &egui::Context, path: &str, hash: u64, file_data: Vec<u8>) {
                      println!("Loaded content for: {}", path);
 
                      if path.ends_with(".dat") || path.ends_with(".dat64") || path.ends_with(".datc64") || path.ends_with(".datl") || path.ends_with(".datl64") {
@@ -1453,24 +1823,23 @@ impl ContentView {
                           // Just store raw data, we decode on render
                           self.insert_raw(hash, file_data);
                           self.last_error = None;
+                      } else if path.ends_with(".bank") {
+                          match crate::parsers::fmod_bank::parse_bank_info(&file_data) {
+                              Ok(info) => {
+                                  self.bank_info_cache.insert(hash, info);
+                                  self.last_error = None;
+                              }
+                              Err(e) => {
+                                  self.last_error = Some(format!("Bank parse failed: {}", e));
+                              }
+                          }
+                          // Keep raw bytes for on-demand stream decode (and to stop re-loading)
+                          self.insert_raw(hash, file_data);
                       } else {
                           // Fallback for unknown files - cache raw data to stop re-loading
                           self.insert_raw(hash, file_data);
                           self.last_error = None;
                       }
-                 } else {
-                     let msg = format!("Decompressed bounds check failed for '{}'", file_info.path);
-                     println!("{}", msg);
-                     self.last_error = Some(msg);
-                     self.failed_loads.insert(hash);
-                 }
-             } else {
-                 let msg = format!("Failed to load or decompress data for '{}' (bundle not found and GGPK lookup failed)", file_info.path);
-                 println!("{}", msg);
-                 self.last_error = Some(msg);
-                 self.failed_loads.insert(hash);
-             }
-          }
     }
 
     fn show_csd(&mut self, ui: &mut egui::Ui, hash: u64) {
@@ -1670,6 +2039,15 @@ fn display_name_from_path(path: &str) -> String {
         .to_string()
 }
 
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c => c,
+        })
+        .collect()
+}
+
 fn format_file_size(size: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
@@ -1828,6 +2206,12 @@ fn extract_bundle_file_sync(
     reader: Option<&GgpkReader>,
     steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
 ) -> Option<Vec<u8>> {
+    if file_info.bundle_index == crate::bundles::index::GGPK_LOOSE_FILE_SENTINEL {
+        let r = reader?;
+        let rec = r.read_file_by_path(&file_info.path).ok().flatten()?;
+        return r.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec());
+    }
+
     let bundle_info = index.bundles.get(file_info.bundle_index as usize)?;
 
     let raw = if let Some(reader) = reader {
