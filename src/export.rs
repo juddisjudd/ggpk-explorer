@@ -13,6 +13,38 @@ pub enum ExportStatus {
     Error(String),
 }
 
+/// Keeps the most recently decompressed bundles so bulk exports don't
+/// re-decompress the same bundle for every file it contains.
+struct BundleCache {
+    entries: Vec<(u32, Vec<u8>)>,
+}
+
+impl BundleCache {
+    // Two entries is enough once hashes are sorted by bundle; the second
+    // slot absorbs files whose paths interleave two bundles.
+    const MAX_ENTRIES: usize = 2;
+
+    fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    fn get(&mut self, bundle_index: u32) -> Option<&[u8]> {
+        let pos = self.entries.iter().position(|(b, _)| *b == bundle_index)?;
+        // Move to the back (most recently used)
+        let entry = self.entries.remove(pos);
+        self.entries.push(entry);
+        Some(&self.entries.last().unwrap().1)
+    }
+
+    fn insert(&mut self, bundle_index: u32, data: Vec<u8>) -> &[u8] {
+        while self.entries.len() >= Self::MAX_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.entries.push((bundle_index, data));
+        &self.entries.last().unwrap().1
+    }
+}
+
 pub fn run_export(
     hashes: Vec<u64>,
     reader: Option<Arc<GgpkReader>>,
@@ -29,6 +61,20 @@ pub fn run_export(
     let mut success_count = 0;
     let mut error_count = 0;
     let mut errors = Vec::new();
+    let mut error_log: Option<std::fs::File> = None;
+    let mut bundle_cache = BundleCache::new();
+
+    // Group files by bundle so each bundle is decompressed once, not once
+    // per contained file.
+    let mut hashes = hashes;
+    if let Some(idx) = &bundle_index {
+        hashes.sort_by_key(|h| {
+            idx.files
+                .get(h)
+                .map(|f| (f.bundle_index, f.file_offset))
+                .unwrap_or((u32::MAX, 0))
+        });
+    }
 
     for (i, hash) in hashes.iter().enumerate() {
         // Send progress
@@ -36,14 +82,15 @@ pub fn run_export(
         
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             match export_single_file(
-                *hash, 
-                reader.as_deref(), 
-                bundle_index.as_deref(), 
-                &settings, 
-                &target_dir, 
-                &cdn_loader, 
+                *hash,
+                reader.as_deref(),
+                bundle_index.as_deref(),
+                &settings,
+                &target_dir,
+                &cdn_loader,
                 &steam_loader,
-                &schema
+                &schema,
+                &mut bundle_cache,
             ) {
                 Ok(name) => Ok(name),
                 Err(e) => Err(format!("Export failed: {}", e)),
@@ -62,9 +109,10 @@ pub fn run_export(
             Ok(Err(e)) => {
                 error_count += 1;
                 errors.push(e.clone());
-                 let _ = tx.send(ExportStatus::Progress { 
-                    current: i + 1, 
-                    total, 
+                append_error_log(&mut error_log, &target_dir, &e);
+                 let _ = tx.send(ExportStatus::Progress {
+                    current: i + 1,
+                    total,
                     filename: format!("Error: {}", e)
                 });
             },
@@ -78,9 +126,10 @@ pub fn run_export(
                     "PANIC: Unknown error".to_string()
                 };
                 errors.push(msg.clone());
-                 let _ = tx.send(ExportStatus::Progress { 
-                    current: i + 1, 
-                    total, 
+                append_error_log(&mut error_log, &target_dir, &msg);
+                 let _ = tx.send(ExportStatus::Progress {
+                    current: i + 1,
+                    total,
                     filename: msg
                 });
             }
@@ -93,19 +142,15 @@ pub fn run_export(
         format!("Exported {} files. {} errors occurred.", success_count, error_count)
     };
     
-    // Log errors to a file and stdout if there are failures
+    // Errors were appended to export_errors.log as they happened (so a crash
+    // mid-export still leaves a log); finish with a summary line.
     if error_count > 0 {
-        let log_path = target_dir.join("export_errors.log");
-        let mut content = String::new();
-        content.push_str("Export Errors:\n");
-        for e in &errors {
-            content.push_str(&format!("  - {}\n", e));
-        }
-        if std::fs::write(&log_path, content).is_ok() {
-            println!("Export errors logged to: {}", log_path.display());
-        }
-        
-        println!("Export Errors:");
+        append_error_log(
+            &mut error_log,
+            &target_dir,
+            &format!("--- {} of {} files failed ---", error_count, total),
+        );
+        println!("Export Errors (also in {}):", target_dir.join("export_errors.log").display());
         for e in &errors {
             println!("  - {}", e);
         }
@@ -118,6 +163,83 @@ pub fn run_export(
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reproduces the reported crash: bulk-export the whole
+    // Art/Models/Items/Armours/ tree from the configured GGPK.
+    // Run with: cargo test --release export_armours -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_export_armours_folder() {
+        let settings = crate::settings::AppSettings::load();
+        let ggpk_path = settings.ggpk_path.expect("no ggpk_path configured");
+        let reader = Arc::new(GgpkReader::open(&ggpk_path).unwrap());
+
+        let cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.cache");
+        let index = Arc::new(BundleIndex::load_from_cache(&cache_path).expect("run the app once to build the index cache"));
+
+        let hashes: Vec<u64> = index
+            .files
+            .iter()
+            .filter(|(_, f)| f.path.starts_with("art/models/items/armours/"))
+            .map(|(h, _)| *h)
+            .collect();
+        println!("exporting {} files", hashes.len());
+        assert!(!hashes.is_empty());
+
+        let target = std::env::temp_dir().join("ggpk_export_armours_test");
+        let _ = std::fs::create_dir_all(&target);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = std::time::Instant::now();
+        run_export(
+            hashes,
+            Some(reader),
+            Some(index),
+            ExportSettings::default(),
+            target.clone(),
+            None,
+            None,
+            None,
+            tx,
+            None,
+        );
+        let mut last = None;
+        while let Ok(status) = rx.try_recv() {
+            if let ExportStatus::Complete { .. } = &status {
+                last = Some(status);
+            }
+        }
+        println!("export took {:?}", t.elapsed());
+        match last {
+            Some(ExportStatus::Complete { count, errors, message }) => {
+                println!("complete: {} exported, {} errors — {}", count, errors, message);
+                assert!(count > 0);
+            }
+            other => panic!("export did not complete: {:?}", other),
+        }
+    }
+}
+
+/// Appends one line to export_errors.log in the export destination,
+/// creating the file on first use and flushing immediately.
+fn append_error_log(log: &mut Option<std::fs::File>, target_dir: &Path, msg: &str) {
+    use std::io::Write;
+    if log.is_none() {
+        *log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(target_dir.join("export_errors.log"))
+            .ok();
+    }
+    if let Some(f) = log {
+        let _ = writeln!(f, "{}", msg);
+        let _ = f.flush();
+    }
+}
+
 fn export_single_file(
     hash: u64,
     reader: Option<&GgpkReader>,
@@ -127,6 +249,7 @@ fn export_single_file(
     cdn_loader: &Option<crate::bundles::cdn::CdnBundleLoader>,
     steam_loader: &Option<crate::bundles::steam::SteamBundleLoader>,
     schema: &Option<Schema>,
+    bundle_cache: &mut BundleCache,
 ) -> Result<String, String> {
     let (path_str, file_data) = if let Some(idx) = bundle_index {
         let file_info = idx.files.get(&hash).ok_or("File hash not found in bundle index")?;
@@ -161,53 +284,60 @@ fn export_single_file(
                 .get(file_info.bundle_index as usize)
                 .ok_or("Bundle info not found")?;
 
-            let mut raw_bundle_data = None;
-            let candidates = vec![
-                format!("Bundles2/{}", bundle_info.name),
-                format!("Bundles2/{}.bundle.bin", bundle_info.name),
-                bundle_info.name.clone(),
-                format!("{}.bundle.bin", bundle_info.name),
-            ];
+            if bundle_cache.get(file_info.bundle_index).is_none() {
+                let mut raw_bundle_data = None;
+                let candidates = vec![
+                    format!("Bundles2/{}", bundle_info.name),
+                    format!("Bundles2/{}.bundle.bin", bundle_info.name),
+                    bundle_info.name.clone(),
+                    format!("{}.bundle.bin", bundle_info.name),
+                ];
 
-            if let Some(r) = reader {
-                for cand in &candidates {
-                    if let Ok(Some(file_record)) = r.read_file_by_path(cand) {
-                        if let Ok(data) = r.get_data_slice(file_record.data_offset, file_record.data_length) {
-                            raw_bundle_data = Some(data.to_vec());
-                            break;
+                if let Some(r) = reader {
+                    for cand in &candidates {
+                        if let Ok(Some(file_record)) = r.read_file_by_path(cand) {
+                            if let Ok(data) = r.get_data_slice(file_record.data_offset, file_record.data_length) {
+                                raw_bundle_data = Some(data.to_vec());
+                                break;
+                            }
                         }
                     }
                 }
-            }
 
-            if raw_bundle_data.is_none() {
-                if let Some(steam) = steam_loader {
-                    if let Ok(data) = steam.fetch_bundle(&bundle_info.name) {
-                        raw_bundle_data = Some(data);
+                if raw_bundle_data.is_none() {
+                    if let Some(steam) = steam_loader {
+                        if let Ok(data) = steam.fetch_bundle(&bundle_info.name) {
+                            raw_bundle_data = Some(data);
+                        }
                     }
                 }
-            }
 
-            if raw_bundle_data.is_none() {
-                if let Some(cdn) = cdn_loader {
-                    let fetch_name = if bundle_info.name.ends_with(".bundle.bin") {
-                        bundle_info.name.clone()
-                    } else {
-                        format!("{}.bundle.bin", bundle_info.name)
-                    };
-                    if let Ok(data) = cdn.fetch_bundle(&fetch_name) {
-                        raw_bundle_data = Some(data);
+                if raw_bundle_data.is_none() {
+                    if let Some(cdn) = cdn_loader {
+                        let fetch_name = if bundle_info.name.ends_with(".bundle.bin") {
+                            bundle_info.name.clone()
+                        } else {
+                            format!("{}.bundle.bin", bundle_info.name)
+                        };
+                        if let Ok(data) = cdn.fetch_bundle(&fetch_name) {
+                            raw_bundle_data = Some(data);
+                        }
                     }
                 }
+
+                let data = raw_bundle_data.ok_or("Failed to load bundle data (local, Steam, or CDN)")?;
+                let mut cursor = std::io::Cursor::new(data);
+                let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor)
+                    .map_err(|e| format!("Bundle Header: {}", e))?;
+                let decompressed_data = bundle
+                    .decompress(&mut cursor)
+                    .map_err(|e| format!("Decompress: {}", e))?;
+                bundle_cache.insert(file_info.bundle_index, decompressed_data);
             }
 
-            let data = raw_bundle_data.ok_or("Failed to load bundle data (local, Steam, or CDN)")?;
-            let mut cursor = std::io::Cursor::new(data);
-            let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor)
-                .map_err(|e| format!("Bundle Header: {}", e))?;
-            let decompressed_data = bundle
-                .decompress(&mut cursor)
-                .map_err(|e| format!("Decompress: {}", e))?;
+            let decompressed_data = bundle_cache
+                .get(file_info.bundle_index)
+                .ok_or("Bundle cache miss")?;
 
             let start = file_info.file_offset as usize;
             let end = start + file_info.file_size as usize;

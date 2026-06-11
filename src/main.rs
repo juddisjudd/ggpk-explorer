@@ -25,16 +25,24 @@ fn main() -> eframe::Result<()> {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "unknown".to_string());
         
-        let backtrace = std::backtrace::Backtrace::capture();
-        
+        // force_capture: Backtrace::capture() is disabled unless RUST_BACKTRACE
+        // is set, which end users never have.
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
         let log_content = format!(
-            "GGPK Explorer Crashed!\nLocation: {}\nMessage: {}\n\nBacktrace:\n{:?}",
+            "=== GGPK Explorer crash at {} ===\nVersion: {}\nLocation: {}\nMessage: {}\n\nBacktrace:\n{}\n\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+            env!("CARGO_PKG_VERSION"),
             location, msg, backtrace
         );
-        
+
         let log_dir = settings::AppSettings::get_app_data_dir();
         let log_path = log_dir.join("crash.log");
-        let _ = std::fs::write(&log_path, log_content);
+        // Append so a crash never erases evidence of the previous one.
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+            let _ = f.write_all(log_content.as_bytes());
+        }
         
         eprintln!("Panic occurred! Crash details written to: {}", log_path.display());
     }));

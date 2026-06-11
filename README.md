@@ -24,6 +24,7 @@ A high-performance Path of Exile asset explorer for both the standalone (GGPK) a
 - **DAT / DAT64**: Full schema support for PoE 1 & 2, cross-referencing, foreign key resolution, JSON export.
 - **Textures**: DDS (all BC/DXT variants), PNG, JPG, WebP — with zoom, pan, and fit-to-window controls.
 - **Audio**: Built-in OGG/WAV/MP3 player with volume control.
+- **FMOD Banks**: `.bank` files (`FMOD/` folder) open with a full stream listing — play any stream in-app, save individual streams as WAV, or export the whole bank at once.
 - **Video (BK2)**: Header metadata display (codec, resolution, FPS, duration, audio tracks). Playback via RAD Video Tools `binkplay.exe`, `ffplay`, or your system default.
 - **CSD**: Client String Data viewer with language filtering and JSON export.
 - **PSG**: Particle/graph file viewer with tree visualization.
@@ -55,6 +56,17 @@ A high-performance Path of Exile asset explorer for both the standalone (GGPK) a
 
 [RAD Video Tools](https://www.radgametools.com/bnkdown.htm) — free download from RAD Game Tools.  
 [FFmpeg](https://ffmpeg.org/download.html) — includes `ffplay`, free and open source.
+
+## Troubleshooting
+
+### Where are the logs?
+
+| Log | Location | Contents |
+|-----|----------|----------|
+| `crash.log` | Windows: `%APPDATA%\ggpk-explorer\crash.log`<br>Linux: the directory the app was launched from | Appended on every crash (panic) with version, location, message, and a backtrace. Attach this when reporting a crash. |
+| `export_errors.log` | The destination folder you exported to | Written incrementally during an export — one line per file that failed, plus a summary. |
+
+Release builds hide the console window, so errors are never printed to a terminal — the files above are the only place they land. If the app dies with no new `crash.log` entry, it was likely killed by the OS (e.g. out of memory); please report what you were doing along with your `crash.log` anyway.
 
 ## Building
 

@@ -59,7 +59,14 @@ impl Bundle {
     }
 
     pub fn decompress<R: Read + Seek>(&self, mut reader: R) -> io::Result<Vec<u8>> {
-        let mut output = vec![0u8; self.uncompressed_size as usize]; // Using u32 size for now
+        // ooz decoders may write up to 64 bytes past the destination end
+        // ("The buffer supplied must have an additional 64 bytes of scratch
+        // space at the end" — ooz/bun.h). Without this slack the final chunk
+        // corrupts the heap, crashing the app with no trace during bulk
+        // exports.
+        const SAFE_SPACE: usize = 64;
+        let size = self.uncompressed_size as usize;
+        let mut output = vec![0u8; size + SAFE_SPACE];
         let output_ptr = output.as_mut_ptr();
         let mut output_offset = 0;
         
@@ -95,7 +102,8 @@ impl Bundle {
             
             output_offset += dst_len;
         }
-        
+
+        output.truncate(size);
         Ok(output)
     }
 }
