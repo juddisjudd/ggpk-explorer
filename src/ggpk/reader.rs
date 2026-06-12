@@ -116,9 +116,12 @@ impl GgpkReader {
     /// Bundles2/) as (virtual_path, data_length) pairs — e.g. FMOD/ sound
     /// banks and Media/ videos, which are not part of the bundle index.
     pub fn collect_loose_files(&self) -> Vec<(String, u64)> {
+        // Reverse order so the live record of a stale/live duplicate pair is
+        // collected first and wins the first-occurrence dedup in
+        // `Index::add_ggpk_loose_files` (see `find_file_in_dir`).
         let mut out = Vec::new();
         if let Ok(root) = self.read_directory(self.root_offset) {
-            for entry in root.entries {
+            for entry in root.entries.iter().rev() {
                 let header = match self.read_record_header(entry.offset) {
                     Ok(h) => h,
                     Err(_) => continue,
@@ -146,7 +149,7 @@ impl GgpkReader {
     }
 
     fn collect_loose_dir(&self, dir: &DirectoryRecord, prefix: &str, out: &mut Vec<(String, u64)>) {
-        for entry in &dir.entries {
+        for entry in dir.entries.iter().rev() {
             let header = match self.read_record_header(entry.offset) {
                 Ok(h) => h,
                 Err(_) => continue,
@@ -179,11 +182,16 @@ impl GgpkReader {
     /// Recursive path resolution with backtracking: the GGPK can contain
     /// multiple sibling directories with the same name (e.g. two root Art/
     /// records), so on a dead end the search continues with the next match.
+    ///
+    /// Entries are scanned in REVERSE order: when the patcher leaves a stale
+    /// duplicate behind, the live record is the later entry. Resolving the
+    /// stale copy returns bundle data that no longer matches the index —
+    /// corrupted/truncated files (issue #10).
     fn find_file_in_dir(&self, dir_offset: u64, parts: &[&str]) -> Option<FileRecord> {
         let (part, rest) = parts.split_first()?;
         let dir = self.read_directory(dir_offset).ok()?;
 
-        for entry in dir.entries {
+        for entry in dir.entries.iter().rev() {
             let header = match self.read_record_header(entry.offset) {
                 Ok(h) => h,
                 Err(_) => continue,
@@ -256,5 +264,63 @@ impl GgpkReader {
               }
          }
          Ok(entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for issue #10: GGPKs patched over time contain stale
+    // duplicate records (e.g. two Bundles2/folders/ dirs); path resolution
+    // must return the live (last) one or bundle contents no longer match the
+    // index and every file inside reads corrupted/truncated.
+    //
+    // Needs a local PoE2 install configured in the app settings.
+    // Run with: cargo test ggpk_resolves_live_bundle_records -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn ggpk_resolves_live_bundle_records() {
+        let settings = crate::settings::AppSettings::load();
+        let ggpk_path = settings.ggpk_path.expect("no ggpk_path configured");
+        let reader = GgpkReader::open(&ggpk_path).unwrap();
+
+        let index_rec = reader
+            .read_file_by_path("Bundles2/_.index.bin")
+            .unwrap()
+            .expect("_.index.bin not found");
+        let data = reader
+            .get_data_slice(index_rec.data_offset, index_rec.data_length)
+            .unwrap();
+        let mut cursor = std::io::Cursor::new(data);
+        let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor).unwrap();
+        let decompressed = bundle.decompress(&mut cursor).unwrap();
+        let index = crate::bundles::index::Index::read(&decompressed).unwrap();
+
+        let mut checked = 0;
+        let mut mismatches = Vec::new();
+        for info in &index.bundles {
+            let path = format!("Bundles2/{}.bundle.bin", info.name);
+            let Ok(Some(rec)) = reader.read_file_by_path(&path) else {
+                continue; // bundle not in GGPK (fetched from Steam/CDN)
+            };
+            let Ok(data) = reader.get_data_slice(rec.data_offset, rec.data_length) else {
+                continue;
+            };
+            let mut cursor = std::io::Cursor::new(data);
+            let Ok(header) = crate::bundles::bundle::Bundle::read_header(&mut cursor) else {
+                continue;
+            };
+            checked += 1;
+            if header.uncompressed_size != info.uncompressed_size {
+                mismatches.push(format!(
+                    "{}: header says {} bytes, index expects {} bytes (stale record resolved)",
+                    info.name, header.uncompressed_size, info.uncompressed_size
+                ));
+            }
+        }
+        println!("checked {} bundles, {} mismatches", checked, mismatches.len());
+        assert!(checked > 0, "no bundles could be resolved from the GGPK");
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 }
