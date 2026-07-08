@@ -60,6 +60,12 @@ pub struct ContentView {
     // without keeping a full navigation history.
     back_target: Option<(u64, crate::ui::app::FileSelection)>,
 
+    // Extension filter for the search-results view. Keyed to the search
+    // term so a brand-new search starts unfiltered, but persists across a
+    // "back to results" round trip for the same search.
+    search_filter_term: String,
+    search_filter_exts: std::collections::HashSet<String>,
+
     pub psg_cache: HashMap<u64, crate::dat::psg::PsgFile>,
     pub psg_viewer_state: HashMap<u64, crate::ui::psg_viewer::PsgViewerState>,
     pub fxgraph_cache: HashMap<u64, crate::parsers::fxgraph::FxGraph>,
@@ -112,6 +118,8 @@ impl Default for ContentView {
             export_requested: None,
             selection_requested: None,
             back_target: None,
+            search_filter_term: String::new(),
+            search_filter_exts: std::collections::HashSet::new(),
 
             psg_cache: HashMap::new(),
             psg_viewer_state: HashMap::new(),
@@ -863,6 +871,14 @@ impl ContentView {
         );
         ui.add_space(4.0);
 
+        // A brand-new search starts with no filter; returning to the same
+        // search (e.g. via "Back to search results") keeps whatever the
+        // user had selected.
+        if self.search_filter_term != term {
+            self.search_filter_term = term.clone();
+            self.search_filter_exts.clear();
+        }
+
         let mut files = Vec::new();
         if let Some(index) = bundle_index {
             for hash in &hashes {
@@ -873,8 +889,55 @@ impl ContentView {
         }
         files.sort_by(|a, b| a.1.path.cmp(&b.1.path));
 
+        fn extension_of(path: &str) -> String {
+            path.rsplit('.').next().unwrap_or("").to_lowercase()
+        }
+
+        let mut ext_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (_, file) in &files {
+            *ext_counts.entry(extension_of(&file.path)).or_insert(0) += 1;
+        }
+        // Drop filter selections for extensions no longer present (e.g. after
+        // returning to a search whose result set can't change, this is a no-op,
+        // but keeps things correct if this is ever fed a live-updating list).
+        self.search_filter_exts.retain(|e| ext_counts.contains_key(e));
+
+        if ext_counts.len() > 1 {
+            ui.horizontal_wrapped(|ui| {
+                let mut sorted_exts: Vec<(&String, &usize)> = ext_counts.iter().collect();
+                sorted_exts.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+
+                let all_selected = self.search_filter_exts.is_empty();
+                if ui.selectable_label(all_selected, format!("All ({})", files.len())).clicked() {
+                    self.search_filter_exts.clear();
+                }
+                for (ext, count) in sorted_exts {
+                    let selected = self.search_filter_exts.contains(ext);
+                    let label = if ext.is_empty() { format!("(none) ({})", count) } else { format!(".{} ({})", ext, count) };
+                    if ui.selectable_label(selected, label).clicked() {
+                        if selected {
+                            self.search_filter_exts.remove(ext);
+                        } else {
+                            self.search_filter_exts.insert(ext.clone());
+                        }
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        }
+
+        let filtered: Vec<(u64, &crate::bundles::index::FileInfo)> = if self.search_filter_exts.is_empty() {
+            files
+        } else {
+            files.into_iter().filter(|(_, f)| self.search_filter_exts.contains(&extension_of(&f.path))).collect()
+        };
+
         ui.label(
-            egui::RichText::new(format!("MATCHES · {}", files.len()))
+            egui::RichText::new(if filtered.len() == ext_counts.values().sum::<usize>() {
+                format!("MATCHES · {}", filtered.len())
+            } else {
+                format!("MATCHES · {} of {}", filtered.len(), ext_counts.values().sum::<usize>())
+            })
                 .monospace()
                 .size(10.5)
                 .color(if ui.visuals().dark_mode {
@@ -885,7 +948,7 @@ impl ContentView {
         );
         ui.separator();
 
-        if files.is_empty() {
+        if filtered.is_empty() {
             ui.add_space(16.0);
             ui.centered_and_justified(|ui| {
                 ui.label(
@@ -899,6 +962,8 @@ impl ContentView {
             });
             return;
         }
+
+        let files = filtered;
 
         TableBuilder::new(ui)
             .striped(false)
