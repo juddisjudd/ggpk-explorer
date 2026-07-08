@@ -265,7 +265,7 @@ impl ExplorerApp {
                     let mut found_bundle_index = false;
 
 
-                    let cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.cache");
+                    let cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
                     let mut loaded_from_cache = false;
 
                     if cache_path.exists() {
@@ -394,7 +394,7 @@ impl ExplorerApp {
                     
                     let mut tree_view = None;
                     if loaded_from_cache {
-                        let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.tree.v2.cache");
+                        let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::TREE_CACHE_FILENAME);
                         if tree_cache_path.exists() {
                             eprintln!("Found tree cache file, attempting to load...");
                             let start_tree_cache = std::time::Instant::now();
@@ -416,7 +416,7 @@ impl ExplorerApp {
                         let start_tree = std::time::Instant::now();
                         let tv = if let Some(idx) = &bundle_index {
                             let built_tv = TreeView::new_bundled(Some(reader.clone()), idx);
-                            let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.tree.v2.cache");
+                            let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::TREE_CACHE_FILENAME);
                             eprintln!("Saving TreeView to cache...");
                             if let Err(e) = built_tv.save_nodes_to_cache(&tree_cache_path) {
                                 println!("Failed to save tree cache: {}", e);
@@ -948,10 +948,26 @@ impl eframe::App for ExplorerApp {
             match rx.try_recv() {
                 Ok(Ok(version)) => {
                     if self.settings.poe2_patch_version != version {
+                        let old_version = self.settings.poe2_patch_version.clone();
                         self.settings.poe2_patch_version = version.clone();
                         self.settings.save();
                         self.content_view.update_cdn_version(&version);
-                        self.status_msg = format!("Updated PoE 2 patch version to {}", version);
+
+                        // A new patch can change bundle contents under unchanged
+                        // names/hashes, so the cached index, tree, CDN bundles,
+                        // and parsed-content cache from the old patch can no
+                        // longer be trusted — wipe them so the next load rebuilds
+                        // from scratch against the new patch.
+                        match crate::settings::AppSettings::clear_cache() {
+                            Ok(()) => {
+                                println!("Cleared disk cache after patch change: {} -> {}", old_version, version);
+                                self.status_msg = format!("Updated PoE 2 patch version to {} (cache cleared)", version);
+                            }
+                            Err(e) => {
+                                println!("Failed to clear cache after patch change: {}", e);
+                                self.status_msg = format!("Updated PoE 2 patch version to {}", version);
+                            }
+                        }
                     }
                     self.patch_version_rx = None;
                 },

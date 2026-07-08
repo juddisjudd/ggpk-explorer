@@ -1443,9 +1443,12 @@ impl ContentView {
     }
 
     // Caching helpers
+    //
+    // Stored under the app's managed `cache/` dir (not the system temp dir)
+    // so it's included in Settings' cache size display and "Clear Cache",
+    // and gets wiped along with everything else on a patch-version change.
     fn get_cache_path(hash: u64) -> std::path::PathBuf {
-        let mut path = std::env::temp_dir();
-        path.push("ggpk-explorer-cache");
+        let mut path = crate::settings::AppSettings::get_app_data_dir().join("cache").join("parsed");
         let _ = std::fs::create_dir_all(&path);
         path.push(format!("{:x}.bin", hash));
         path

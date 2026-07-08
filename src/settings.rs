@@ -1,6 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
+/// Filename for the cached, parsed `Bundles2/_.index.bin` (bincode).
+pub const INDEX_CACHE_FILENAME: &str = "bundles2.cache";
+/// Filename for the cached tree-view node list built from the index.
+/// The `.v2.` marks the tree node schema version — bump it if `TreeView`'s
+/// cached node layout changes so old caches are ignored rather than
+/// deserialized into the wrong shape.
+pub const TREE_CACHE_FILENAME: &str = "bundles2.tree.v2.cache";
+
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AppSettings {
@@ -238,8 +246,8 @@ impl AppSettings {
     pub fn get_cache_size() -> u64 {
         let dir = Self::get_app_data_dir();
         let cache_dir = dir.join("cache");
-        let cache_file = dir.join("bundles2.cache");
-        let tree_cache = dir.join("bundles2.tree.cache");
+        let cache_file = dir.join(INDEX_CACHE_FILENAME);
+        let tree_cache = dir.join(TREE_CACHE_FILENAME);
         let mut size = 0;
 
         if cache_dir.exists() {
@@ -270,8 +278,8 @@ impl AppSettings {
     pub fn clear_cache() -> std::io::Result<()> {
         let dir = Self::get_app_data_dir();
         let cache_dir = dir.join("cache");
-        let cache_file = dir.join("bundles2.cache");
-        let tree_cache = dir.join("bundles2.tree.cache");
+        let cache_file = dir.join(INDEX_CACHE_FILENAME);
+        let tree_cache = dir.join(TREE_CACHE_FILENAME);
 
         if cache_dir.exists() {
             std::fs::remove_dir_all(&cache_dir)?;

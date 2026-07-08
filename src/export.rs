@@ -496,7 +496,7 @@ mod tests {
         let ggpk_path = settings.ggpk_path.expect("no ggpk_path configured");
         let reader = Arc::new(GgpkReader::open(&ggpk_path).unwrap());
 
-        let cache_path = crate::settings::AppSettings::get_app_data_dir().join("bundles2.cache");
+        let cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
         let index = Arc::new(
             BundleIndex::load_from_cache(&cache_path)
                 .expect("run the app once to build the index cache"),
