@@ -1,4 +1,5 @@
 pub mod fmod_bank;
+pub mod fxgraph;
 pub mod graphics;
 pub mod skeletal;
 pub mod text_config;

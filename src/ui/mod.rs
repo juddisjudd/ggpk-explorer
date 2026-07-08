@@ -14,6 +14,7 @@ pub mod status_bar;
 pub mod theme;
 pub mod text_config_viewer;
 pub mod graphics_viewer;
+pub mod fxgraph_viewer;
 pub mod skeletal_viewer;
 pub mod components;
 pub mod command_palette;

@@ -62,6 +62,8 @@ pub struct ContentView {
 
     pub psg_cache: HashMap<u64, crate::dat::psg::PsgFile>,
     pub psg_viewer_state: HashMap<u64, crate::ui::psg_viewer::PsgViewerState>,
+    pub fxgraph_cache: HashMap<u64, crate::parsers::fxgraph::FxGraph>,
+    pub fxgraph_viewer_state: HashMap<u64, crate::ui::fxgraph_viewer::FxGraphViewerState>,
     folder_children_cache: HashMap<String, Vec<(String, String, Vec<u64>)>>,
     folder_cache_index_size: usize,
 
@@ -113,6 +115,8 @@ impl Default for ContentView {
 
             psg_cache: HashMap::new(),
             psg_viewer_state: HashMap::new(),
+            fxgraph_cache: HashMap::new(),
+            fxgraph_viewer_state: HashMap::new(),
             folder_children_cache: HashMap::new(),
             folder_cache_index_size: 0,
             parsed_content_cache: HashMap::new(),
@@ -234,6 +238,10 @@ impl ContentView {
                                  if !self.psg_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
+                             } else if file_info.path.ends_with(".fxgraph") {
+                                 if !self.fxgraph_cache.contains_key(&hash) {
+                                     perform_load = true;
+                                 }
                              } else if file_info.path.ends_with(".json") {
                                  if !self.json_cache.contains_key(&hash) && !self.raw_data_cache.contains_key(&hash) {
                                      perform_load = true;
@@ -350,6 +358,45 @@ impl ContentView {
                                     } else {
                                          ui.spinner();
                                          ui.label("Loading PSG...");
+                                    }
+                                }
+                            } else if file_info.path.ends_with(".fxgraph") {
+                                if let Some(graph) = self.fxgraph_cache.get(&hash) {
+                                    let state = self.fxgraph_viewer_state.entry(hash).or_default();
+                                    let show_graph = state.show_graph;
+                                    let mut viewer = crate::ui::fxgraph_viewer::FxGraphViewer::new(state, graph);
+                                    let opened_texture = if show_graph {
+                                        viewer.show(ui)
+                                    } else {
+                                        let opened = viewer.show(ui);
+                                        if let Some(json) = self.json_cache.get(&hash) {
+                                            crate::ui::json_viewer::JsonTreeViewer::show(ui, json);
+                                        } else {
+                                            ui.label("JSON representation not available.");
+                                        }
+                                        opened
+                                    };
+                                    if let Some(path) = opened_texture {
+                                        if let Some(target_hash) = index.files.iter()
+                                            .find(|(_, f)| f.path.eq_ignore_ascii_case(&path))
+                                            .map(|(h, _)| *h)
+                                        {
+                                            self.selection_requested = Some(crate::ui::app::FileSelection::BundleFile(target_hash));
+                                        } else {
+                                            self.last_error = Some(format!("Texture not found in index: {}", path));
+                                        }
+                                    }
+                                } else if let Some(json) = self.json_cache.get(&hash) {
+                                    crate::ui::json_viewer::JsonTreeViewer::show(ui, json);
+                                } else {
+                                    if let Some(err) = &self.last_error {
+                                        ui.colored_label(egui::Color32::RED, err);
+                                    }
+                                    if self.failed_loads.contains(&hash) {
+                                        ui.colored_label(egui::Color32::RED, "Failed to load FX graph.");
+                                    } else {
+                                         ui.spinner();
+                                         ui.label("Loading FX graph...");
                                     }
                                 }
                             } else if file_info.path.ends_with(".json") {
@@ -1621,7 +1668,7 @@ impl ContentView {
          self.last_error = None;
 
          // Check persistent cache for JSON/PSG
-         if file_info.path.ends_with(".json") || file_info.path.ends_with(".psg") {
+         if file_info.path.ends_with(".json") || file_info.path.ends_with(".psg") || file_info.path.ends_with(".fxgraph") {
              if self.try_load_from_cache(hash) {
                  println!("Loaded {} from disk cache.", file_info.path);
                  return;
@@ -1962,6 +2009,26 @@ impl ContentView {
                                   self.failed_loads.insert(hash);
                               }
                           }
+                      } else if path.ends_with(".fxgraph") {
+                          match crate::parsers::fxgraph::parse_fxgraph(&file_data) {
+                              Ok(graph) => {
+                                  self.fxgraph_cache.insert(hash, graph.clone());
+
+                                  // Convert to Value for the JSON fallback/toggle view
+                                  if let Ok(v) = serde_json::to_value(&graph) {
+                                      Self::save_to_cache(hash, &v);
+                                      self.json_cache.insert(hash, v);
+                                      self.last_error = None;
+                                  } else {
+                                       self.last_error = Some("Failed to serialize FX graph to JSON".to_string());
+                                  }
+                              },
+                              Err(e) => {
+                                  self.last_error = Some(format!("FX Graph Parse Error: {}", e));
+                                  self.insert_raw(hash, file_data.clone());
+                                  self.failed_loads.insert(hash);
+                              }
+                          }
                       } else if is_text_file(path) {
                           // Just store raw data, we decode on render
                           self.insert_raw(hash, file_data);
@@ -2114,7 +2181,11 @@ fn is_text_file(path: &str) -> bool {
     p.ends_with(".env") || p.ends_with(".ffx") || p.ends_with(".ot") || p.ends_with(".otc") ||
     p.ends_with(".tgt") || p.ends_with(".ui") || p.ends_with(".dgr") || p.ends_with(".sm") ||
     p.ends_with(".tmo") || p.ends_with(".arl") || p.ends_with(".atlas") || p.ends_with(".filter") ||
-    p.ends_with(".chr") || p.ends_with(".tdf") || p.ends_with(".ot") || p.ends_with(".ais")
+    p.ends_with(".chr") || p.ends_with(".tdf") || p.ends_with(".ot") || p.ends_with(".ais") ||
+    // Plain UTF-16LE text formats that were previously falling through to the
+    // hex viewer despite being fully readable (confirmed against real game data).
+    p.ends_with(".tdt") || p.ends_with(".tmd") || p.ends_with(".epk") ||
+    p.ends_with(".it") || p.ends_with(".fgp") || p.ends_with(".tgr")
 }
 
 fn is_non_playable_media(path: &str) -> bool {
@@ -2220,7 +2291,7 @@ fn file_kind_label(path: &str) -> &'static str {
         "DATA"
     } else if p.ends_with(".json") || is_text_file(&p) {
         "TEXT"
-    } else if p.ends_with(".psg") {
+    } else if p.ends_with(".psg") || p.ends_with(".fxgraph") {
         "GRAPH"
     } else {
         "BINARY"
