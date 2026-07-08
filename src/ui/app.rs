@@ -14,6 +14,10 @@ pub enum FileSelection {
         name: String,
         path: String,
     },
+    SearchResults {
+        term: String,
+        hashes: Vec<u64>,
+    },
 }
 
 use std::path::PathBuf;
@@ -536,6 +540,7 @@ impl ExplorerApp {
                 .map(|file| file.path.clone())
                 .unwrap_or_else(|| format!("Bundle {:016x}", hash)),
             Some(FileSelection::Folder { path, .. }) => path.clone(),
+            Some(FileSelection::SearchResults { term, .. }) => format!("Search: \"{}\"", term),
             Some(FileSelection::GgpkOffset(offset)) => self
                 .reader
                 .as_ref()
@@ -648,6 +653,16 @@ impl ExplorerApp {
                             ui.add_space(10.0);
                             inspector_kv(ui, "Type", "folder");
                             inspector_kv(ui, "Items", &hashes.len().to_string());
+                        }
+                        Some(FileSelection::SearchResults { term, hashes }) => {
+                            ui.label(
+                                egui::RichText::new(format!("Search: \"{}\"", term))
+                                    .monospace()
+                                    .size(11.5),
+                            );
+                            ui.add_space(10.0);
+                            inspector_kv(ui, "Type", "search results");
+                            inspector_kv(ui, "Matches", &hashes.len().to_string());
                         }
                         Some(FileSelection::GgpkOffset(offset)) => {
                             ui.label(

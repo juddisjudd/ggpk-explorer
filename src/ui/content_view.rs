@@ -55,6 +55,11 @@ pub struct ContentView {
     pub export_requested: Option<(Vec<u64>, String, Option<crate::ui::export_window::ExportSettings>)>,
     pub selection_requested: Option<crate::ui::app::FileSelection>,
 
+    // Remembers the search-results view a file was opened from (keyed by
+    // that file's hash) so a "Back to results" link can return to it
+    // without keeping a full navigation history.
+    back_target: Option<(u64, crate::ui::app::FileSelection)>,
+
     pub psg_cache: HashMap<u64, crate::dat::psg::PsgFile>,
     pub psg_viewer_state: HashMap<u64, crate::ui::psg_viewer::PsgViewerState>,
     folder_children_cache: HashMap<String, Vec<(String, String, Vec<u64>)>>,
@@ -104,7 +109,8 @@ impl Default for ContentView {
             audio_volume: 0.5,
             export_requested: None,
             selection_requested: None,
-            
+            back_target: None,
+
             psg_cache: HashMap::new(),
             psg_viewer_state: HashMap::new(),
             folder_children_cache: HashMap::new(),
@@ -197,6 +203,9 @@ impl ContentView {
                  FileSelection::Folder { hashes, name, path } => {
                      self.show_folder_list(ui, bundle_index, hashes, name, path);
                 },
+                FileSelection::SearchResults { term, hashes } => {
+                    self.show_search_results(ui, bundle_index, term, hashes);
+                },
                 FileSelection::BundleFile(hash) => {
                     if let Some(index) = bundle_index {
                         if let Some(file_info) = index.files.get(&hash) {
@@ -252,7 +261,20 @@ impl ContentView {
                              if self.failed_loads.contains(&hash) {
                                  perform_load = false;
                              }
-                             
+
+                             if let Some((back_hash, _)) = &self.back_target {
+                                 if *back_hash == hash {
+                                     let response = ui.selectable_label(
+                                         false,
+                                         egui::RichText::new("← Back to search results").size(11.5),
+                                     );
+                                     if response.clicked() {
+                                         self.selection_requested = self.back_target.take().map(|(_, sel)| sel);
+                                     }
+                                     ui.add_space(4.0);
+                                 }
+                             }
+
                              let label = egui::RichText::new(&file_info.path).heading();
                              let response = ui.label(label);
                              response.context_menu(|ui| {
@@ -778,6 +800,124 @@ impl ContentView {
                             );
                         });
                     }
+                });
+            });
+    }
+
+    fn show_search_results(&mut self, ui: &mut egui::Ui, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>, term: String, hashes: Vec<u64>) {
+        ui.label(
+            egui::RichText::new(format!("Search: \"{}\"", term))
+                .heading()
+                .color(if ui.visuals().dark_mode {
+                    egui::Color32::from_rgb(236, 236, 240)
+                } else {
+                    egui::Color32::from_rgb(24, 24, 28)
+                }),
+        );
+        ui.add_space(4.0);
+
+        let mut files = Vec::new();
+        if let Some(index) = bundle_index {
+            for hash in &hashes {
+                if let Some(file) = index.files.get(hash) {
+                    files.push((*hash, file));
+                }
+            }
+        }
+        files.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+
+        ui.label(
+            egui::RichText::new(format!("MATCHES · {}", files.len()))
+                .monospace()
+                .size(10.5)
+                .color(if ui.visuals().dark_mode {
+                    egui::Color32::from_rgb(113, 113, 122)
+                } else {
+                    egui::Color32::from_rgb(80, 80, 90)
+                }),
+        );
+        ui.separator();
+
+        if files.is_empty() {
+            ui.add_space(16.0);
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("No files match \"{}\".", term))
+                        .color(if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(126, 126, 134)
+                        } else {
+                            egui::Color32::from_rgb(80, 80, 90)
+                        }),
+                );
+            });
+            return;
+        }
+
+        TableBuilder::new(ui)
+            .striped(false)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::remainder().at_least(240.0))
+            .column(Column::exact(84.0))
+            .column(Column::exact(88.0))
+            .column(Column::exact(132.0))
+            .header(24.0, |mut header| {
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("PATH").monospace().size(10.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                });
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("TYPE").monospace().size(10.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                });
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("SIZE").monospace().size(10.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                });
+                header.col(|ui| {
+                    ui.label(egui::RichText::new("HASH").monospace().size(10.5).color(egui::Color32::from_rgb(113, 113, 122)));
+                });
+            })
+            .body(|body| {
+                body.rows(22.0, files.len(), |mut row| {
+                    let row_index = row.index();
+                    let (hash, file_info) = files[row_index];
+
+                    row.col(|ui| {
+                        let response = ui.selectable_label(
+                            false,
+                            egui::RichText::new(&file_info.path).monospace().size(11.5),
+                        );
+                        if response.clicked() {
+                            self.back_target = Some((hash, crate::ui::app::FileSelection::SearchResults {
+                                term: term.clone(),
+                                hashes: hashes.clone(),
+                            }));
+                            self.selection_requested = Some(crate::ui::app::FileSelection::BundleFile(hash));
+                        }
+                    });
+
+                    row.col(|ui| {
+                        ui.label(
+                            egui::RichText::new(file_kind_label(&file_info.path).to_uppercase())
+                                .monospace()
+                                .size(10.0)
+                                .color(egui::Color32::from_rgb(120, 170, 210)),
+                        );
+                    });
+
+                    row.col(|ui| {
+                        ui.label(
+                            egui::RichText::new(format_file_size(file_info.file_size as u64))
+                                .size(10.8)
+                                .color(egui::Color32::from_rgb(161, 161, 170)),
+                        );
+                    });
+
+                    row.col(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:016x}", hash))
+                                .monospace()
+                                .size(10.5)
+                                .color(egui::Color32::from_rgb(161, 161, 170)),
+                        );
+                    });
                 });
             });
     }

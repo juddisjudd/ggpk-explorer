@@ -16,8 +16,8 @@ pub struct TreeView {
     active_search_term: String,
     
     // Search State
-    search_tx: Option<Sender<(Vec<bool>, Vec<bool>, usize, u64)>>, 
-    search_rx: Option<Receiver<(Vec<bool>, Vec<bool>, usize, u64)>>,
+    search_tx: Option<Sender<(Vec<bool>, Vec<bool>, usize, u64, Vec<u64>)>>,
+    search_rx: Option<Receiver<(Vec<bool>, Vec<bool>, usize, u64, Vec<u64>)>>,
     matched_results: Vec<bool>, 
     matched_descendants: Vec<bool>,
     match_count: usize,
@@ -364,12 +364,20 @@ impl TreeView {
 
         // Handle Search Results (Async)
         if let Some(rx) = &self.search_rx {
-            if let Ok((results, descendants, count, gen)) = rx.try_recv() {
+            if let Ok((results, descendants, count, gen, matched_hashes)) = rx.try_recv() {
                 if gen == self.search_generation {
                     self.matched_results = results;
                     self.matched_descendants = descendants;
                     self.match_count = count;
                     self.is_searching = false;
+
+                    // Route the full, uncapped match list to the main content
+                    // area instead of relying on the tree's truncated render
+                    // (capped at 2000 nodes for paint performance).
+                    *selected_file = Some(crate::ui::app::FileSelection::SearchResults {
+                        term: self.active_search_term.clone(),
+                        hashes: matched_hashes,
+                    });
                 }
             }
         }
@@ -394,25 +402,25 @@ impl TreeView {
                      // Let's create a lightweight search index on the fly or cached?
                      // For now, let's just clone the basic data: Vec<(bool, String, usize)> -> (is_file, name, parent)
                      
-                     let search_data: Vec<(bool, String, usize)> = self.nodes.iter().enumerate().map(|(_i, n)| {
-                         (n.file_hash.is_some(), n.name.to_lowercase(), n.parent.unwrap_or(0))
+                     let search_data: Vec<(bool, String, usize, Option<u64>)> = self.nodes.iter().enumerate().map(|(_i, n)| {
+                         (n.file_hash.is_some(), n.name.to_lowercase(), n.parent.unwrap_or(0), n.file_hash)
                      }).collect();
 
                      self.is_searching = true;
-                     
+
                      thread::spawn(move || {
                          let start_time = std::time::Instant::now();
                          let max_id = search_data.len();
                          let mut results = vec![false; max_id];
                          let mut count = 0;
-                         
-                         for (id, (_is_file, name_lower, _)) in search_data.iter().enumerate() {
+
+                         for (id, (_is_file, name_lower, _, _)) in search_data.iter().enumerate() {
                              if name_lower.contains(&term_lower) {
                                  results[id] = true;
                                  count += 1;
                              }
                          }
-                         
+
                          let mut descendants = vec![false; max_id];
                          for id in (1..max_id).rev() {
                              if results[id] || descendants[id] {
@@ -423,8 +431,15 @@ impl TreeView {
                              }
                          }
 
+                         // Flat list of matching files (not folders) for the
+                         // uncapped results view in the main content area.
+                         let matched_hashes: Vec<u64> = search_data.iter().enumerate()
+                             .filter(|(id, _)| results[*id])
+                             .filter_map(|(_, (_, _, _, hash))| *hash)
+                             .collect();
+
                          println!("Search Finished (Gen {}) in {:?}. Found {} matches.", gen_id, start_time.elapsed(), count);
-                         let _ = tx.send((results, descendants, count, gen_id));
+                         let _ = tx.send((results, descendants, count, gen_id, matched_hashes));
                      });
                  }
              }
