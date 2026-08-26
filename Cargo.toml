@@ -38,7 +38,7 @@ chrono = { version = "0.4", features = ["serde"] }
 hound = "3.5.1"
 semver = "1.0"
 open = "5"
-lru = "0.12"
+lru = "0.18"
 winnow = "0.6"
 regex = "1.12"
 serde_with = "3.18"
