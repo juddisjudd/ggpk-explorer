@@ -7,6 +7,12 @@ updates:
     groups:
       cargo-minor:
         update-types: [minor, patch]
+    ignore:
+      # 3.0.0 is a tombstone release (compile_error only) left by the
+      # maintainer after being doxxed/harassed off the project; staying
+      # on 1.3.x.
+      - dependency-name: "bincode"
+        versions: [">=2.0.0"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
