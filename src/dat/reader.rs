@@ -160,11 +160,16 @@ impl DatReader {
     }
 }
 
-fn get_column_size(col: &Column, is_64bit: bool) -> usize {
+pub fn get_column_size(col: &Column, is_64bit: bool) -> usize {
     if col.array {
         // Arrays are always (length: u64, pointer: u64) = 16 bytes in 64-bit dat files
         return if is_64bit { 16 } else { 8 };
     }
+    let scalar = scalar_column_size(col, is_64bit);
+    if col.interval { scalar * 2 } else { scalar }
+}
+
+fn scalar_column_size(col: &Column, is_64bit: bool) -> usize {
     match col.r#type.as_str() {
         "bool" => 1,
         "byte" | "u8" => 1,
@@ -188,6 +193,12 @@ fn get_column_size(col: &Column, is_64bit: bool) -> usize {
 }
 
 fn read_column_value(cursor: &mut Cursor<&[u8]>, col: &Column, file_data: &[u8], var_data_offset: u64, is_64bit: bool) -> io::Result<DatValue> {
+    if col.interval && !col.array {
+        let elem = Column { interval: false, ..col.clone() };
+        let a = read_column_value(cursor, &elem, file_data, var_data_offset, is_64bit)?;
+        let b = read_column_value(cursor, &elem, file_data, var_data_offset, is_64bit)?;
+        return Ok(DatValue::Interval(Box::new(a), Box::new(b)));
+    }
     if col.array {
         let (count, offset) = if is_64bit {
              let c = read_u32(cursor)? as u64;
@@ -353,6 +364,8 @@ pub enum DatValue {
     String(String),
     ForeignRow(usize),
     List(usize, u64), // Count, Offset
+    /// Two consecutive values of the same type (`@interval` columns: min, max).
+    Interval(Box<DatValue>, Box<DatValue>),
     Unknown,
 }
 
@@ -393,6 +406,8 @@ impl DatReader {
             localized: false,
             description: Option::None,
             interval: false,
+            file: Option::None,
+            files: Option::None,
         };
         
         let elem_size = get_column_size(&elem_col, self.is_64bit);
@@ -448,6 +463,7 @@ impl DatReader {
                             &DatValue::Long(l) => Value::from(l),
                             &DatValue::Float(f) => Value::from(f),
                             DatValue::String(s) => Value::from(s.clone()),
+                            &DatValue::ForeignRow(usize::MAX) => Value::Null,
                             &DatValue::ForeignRow(k) => Value::from(k),
                             _ => Value::Null,
                         }
@@ -457,7 +473,12 @@ impl DatReader {
                     Value::Array(Vec::new())
                 }
             },
+            &DatValue::ForeignRow(usize::MAX) => Value::Null,
             &DatValue::ForeignRow(k) => Value::String(format!("Key({})", k)),
+            DatValue::Interval(a, b) => {
+                let elem = Column { interval: false, ..col.clone() };
+                Value::Array(vec![self.value_to_json(a, &elem), self.value_to_json(b, &elem)])
+            }
             _ => Value::Null,
         }
     }
@@ -487,6 +508,8 @@ mod tests {
             localized: false,
             description: None,
             interval: false,
+            file: Option::None,
+            files: Option::None,
         };
 
         assert_eq!(reader.value_to_json(&DatValue::Bool(true), &col), serde_json::json!(true));
@@ -531,6 +554,8 @@ mod tests {
             localized: false,
             description: None,
             interval: false,
+            file: Option::None,
+            files: Option::None,
         };
 
         let val = DatValue::List(2, offset);

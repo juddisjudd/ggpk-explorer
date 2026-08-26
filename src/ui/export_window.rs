@@ -33,6 +33,7 @@ pub struct ExportSettings {
     pub data_format: DataFormat,
     pub psg_format: PsgFormat,
     pub recursive: bool,
+    pub is_poe2: bool,
 }
 
 impl Default for ExportSettings {
@@ -43,6 +44,7 @@ impl Default for ExportSettings {
             data_format: DataFormat::Original,
             psg_format: PsgFormat::Original,
             recursive: true,
+            is_poe2: false,
         }
     }
 }
@@ -94,7 +96,7 @@ impl ExportWindow {
 
         let is_dds = self.target_name.ends_with(".dds");
         let is_ogg = self.target_name.ends_with(".ogg");
-        let is_dat = self.target_name.contains(".dat");
+        let is_dat = self.target_name.contains(".dat") || self.target_name.ends_with(".csd");
         let is_psg = self.target_name.ends_with(".psg");
         let show_all = self.is_folder;
 
@@ -140,7 +142,7 @@ impl ExportWindow {
 
                 if show_all || is_dat {
                     ui.separator();
-                    modal_section(ui, "DATA");
+                    modal_section(ui, "DATA (.dat / .csd)");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.data_format, DataFormat::Original, "Original");
                         ui.radio_value(&mut self.settings.data_format, DataFormat::Json, "JSON");

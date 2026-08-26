@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../../POE2-Extracted"
+		},
+		{
+			"path": "../poe2-skilltree-export"
+		},
+		{
+			"path": "../PathOfBuilding-PoE2"
+		}
+	],
+	"settings": {}
+}

@@ -12,8 +12,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Compare versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          echo "tag=$TAG cargo=$CARGO"
+          if [ "$TAG" != "$CARGO" ]; then
+            echo "::error::Tag v$TAG does not match Cargo.toml version $CARGO"
+            exit 1
+          fi
+
   build-windows:
     name: Build Windows
+    needs: verify
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
@@ -28,19 +44,25 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: "release-build-windows"
-          save-if: ${{ github.ref_name == 'master' }}
 
       - name: Build Release
-        run: cargo build --release --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/ggpk-explorer.exe "dist/ggpk-explorer-${GITHUB_REF_NAME}-windows-x64.exe"
 
       - name: Upload Windows Binary
         uses: actions/upload-artifact@v7
         with:
           name: windows-binary
-          path: target/x86_64-pc-windows-msvc/release/ggpk-explorer.exe
+          path: dist/*
 
   build-linux:
     name: Build Linux
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -70,16 +92,23 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: "release-build-linux"
-          save-if: ${{ github.ref_name == 'master' }}
+
+      - name: Test
+        run: cargo test --release --locked
 
       - name: Build Release
-        run: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
 
       - name: Package .deb
         run: |
-          cargo install cargo-deb
           cargo deb --no-build
-          cp target/debian/*.deb ggpk-explorer-linux.deb
+          mkdir -p dist
+          cp target/debian/*.deb "dist/ggpk-explorer-${GITHUB_REF_NAME}-linux-x64.deb"
 
       - name: Package AppImage
         env:
@@ -95,42 +124,97 @@ jobs:
             -i AppDir/usr/share/icons/hicolor/256x256/apps/ggpk-explorer.png \
             -d assets/ggpk-explorer.desktop \
             --output appimage
-          mv GGPK_Explorer*.AppImage ggpk-explorer-linux.AppImage
+          mv GGPK_Explorer*.AppImage "dist/ggpk-explorer-${GITHUB_REF_NAME}-linux-x64.AppImage"
 
       - name: Upload Linux Artifacts
         uses: actions/upload-artifact@v7
         with:
           name: linux-artifacts
-          path: |
-            ggpk-explorer-linux.deb
-            ggpk-explorer-linux.AppImage
+          path: dist/*
+
+  build-macos:
+    name: Build macOS
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: "release-build-macos"
+
+      - name: Build Release (arm64 + x86_64)
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Bundle .app
+        run: |
+          APP="GGPK Explorer.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" iconset.iconset
+          lipo -create \n            target/aarch64-apple-darwin/release/ggpk-explorer \n            target/x86_64-apple-darwin/release/ggpk-explorer \n            -output "$APP/Contents/MacOS/ggpk-explorer"
+          for s in 16 32 64 128 256; do
+            sips -z $s $s assets/icon-256x256.png --out "iconset.iconset/icon_${s}x${s}.png" >/dev/null
+          done
+          cp iconset.iconset/icon_32x32.png iconset.iconset/icon_16x16@2x.png
+          cp iconset.iconset/icon_64x64.png iconset.iconset/icon_32x32@2x.png
+          cp iconset.iconset/icon_256x256.png iconset.iconset/icon_128x128@2x.png
+          iconutil -c icns iconset.iconset -o "$APP/Contents/Resources/icon.icns"
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>GGPK Explorer</string>
+            <key>CFBundleDisplayName</key><string>GGPK Explorer</string>
+            <key>CFBundleIdentifier</key><string>com.juddisjudd.ggpk-explorer</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleExecutable</key><string>ggpk-explorer</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict></plist>
+          EOF
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" "dist/ggpk-explorer-${GITHUB_REF_NAME}-macos-universal.zip"
+
+      - name: Upload macOS Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-artifacts
+          path: dist/*
 
   create-release:
     name: Create Release
-    needs: [build-windows, build-linux]
+    needs: [build-windows, build-linux, build-macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Download Windows Artifacts
+      - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
-          name: windows-binary
-          path: windows-artifacts
+          path: artifacts
+          merge-multiple: true
 
-      - name: Download Linux Artifacts
-        uses: actions/download-artifact@v8
-        with:
-          name: linux-artifacts
-          path: linux-artifacts
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          ls -la
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: |
-            windows-artifacts/ggpk-explorer.exe
-            linux-artifacts/ggpk-explorer-linux.deb
-            linux-artifacts/ggpk-explorer-linux.AppImage
+          generate_release_notes: true
+          files: artifacts/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

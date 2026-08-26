@@ -184,6 +184,25 @@ impl SettingsWindow {
 
                 ui.separator();
 
+                // ── File tree ─────────────────────────────────────────
+                modal_section(ui, "FILE TREE");
+                ui.checkbox(&mut settings.hide_shader_cache, "Hide shader cache files")
+                    .on_hover_text("shadercache*/ holds ~2.8 million compiled shader blobs (two thirds of the index). Hiding them cuts memory and search time.");
+                {
+                    let note_color = if ui.visuals().dark_mode {
+                        egui::Color32::from_rgb(113, 113, 122)
+                    } else {
+                        egui::Color32::from_rgb(80, 80, 90)
+                    };
+                    ui.label(
+                        egui::RichText::new("Takes effect the next time the data source is opened.")
+                            .size(11.5)
+                            .color(note_color),
+                    );
+                }
+
+                ui.separator();
+
                 // ── Schema ────────────────────────────────────────────
                 modal_section(ui, "SCHEMA");
                 ui.horizontal(|ui| {

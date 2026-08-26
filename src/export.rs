@@ -879,11 +879,7 @@ fn export_file_data(
                         .file_stem()
                         .and_then(|s| s.to_str())
                         .unwrap_or("");
-                    if let Some(table_def) = schema
-                        .tables
-                        .iter()
-                        .find(|t| t.name.eq_ignore_ascii_case(stem))
-                    {
+                    if let Some(table_def) = schema.find_table(stem, settings.is_poe2) {
                         if let Ok(r) =
                             crate::dat::reader::DatReader::new(file_data.to_vec(), path_str)
                         {
@@ -944,6 +940,24 @@ fn export_file_data(
                 std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
             }
         }
+    } else if path_lower.ends_with(".csd") {
+        match settings.data_format {
+            DataFormat::Json => {
+                let mut converted = false;
+                if let Ok(csd_file) = crate::dat::csd::parse_csd(file_data, path_str) {
+                    let dest = full_path.with_extension("json");
+                    let s = serde_json::to_string_pretty(&csd_file).map_err(|e| e.to_string())?;
+                    std::fs::write(dest, s).map_err(|e| e.to_string())?;
+                    converted = true;
+                }
+                if !converted {
+                    std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                }
+            }
+            DataFormat::Original => {
+                std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+            }
+        }
     } else if path_lower.ends_with(".png")
         || path_lower.ends_with(".jpg")
         || path_lower.ends_with(".jpeg")
@@ -956,3 +970,4 @@ fn export_file_data(
 
     Ok(())
 }
+

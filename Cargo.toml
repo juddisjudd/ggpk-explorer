@@ -1,6 +1,6 @@
 [package]
 name = "ggpk-explorer"
-version = "1.3.8"
+version = "1.3.9"
 edition = "2021"
 
 [package.metadata.deb]
@@ -17,7 +17,7 @@ assets = [
 eframe = "0.29"
 egui = "0.29"
 egui_extras = { version = "0.29", features = ["all_loaders"] }
-image = { version = "0.25", features = ["dds", "webp", "png", "jpeg"] }
+image = { version = "0.25", features = ["dds", "webp", "png", "jpeg", "bmp"] }
 image_dds = "0.7"
 ddsfile = "0.5"
 memmap2 = "0.9"

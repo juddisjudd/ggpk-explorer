@@ -8,6 +8,12 @@ pub const INDEX_CACHE_FILENAME: &str = "bundles2.cache";
 /// cached node layout changes so old caches are ignored rather than
 /// deserialized into the wrong shape.
 pub const TREE_CACHE_FILENAME: &str = "bundles2.tree.v2.cache";
+/// Tree cache built with shader-cache entries filtered out (see `AppSettings::hide_shader_cache`).
+pub const TREE_CACHE_NOSHADER_FILENAME: &str = "bundles2.tree.v2.noshader.cache";
+
+pub fn tree_cache_filename(hide_shader_cache: bool) -> &'static str {
+    if hide_shader_cache { TREE_CACHE_NOSHADER_FILENAME } else { TREE_CACHE_FILENAME }
+}
 
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -27,6 +33,13 @@ pub struct AppSettings {
     pub schema_local_path: Option<String>,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Drop the ~2.8M `shadercache*/` blobs from the index at load time.
+    #[serde(default = "default_hide_shader_cache")]
+    pub hide_shader_cache: bool,
+}
+
+fn default_hide_shader_cache() -> bool {
+    true
 }
 
 fn default_theme() -> String {
@@ -61,6 +74,7 @@ impl Default for AppSettings {
             auto_update_schema: default_auto_update_schema(),
             schema_local_path: None,
             theme: default_theme(),
+            hide_shader_cache: default_hide_shader_cache(),
         }
     }
 }
@@ -247,7 +261,7 @@ impl AppSettings {
         let dir = Self::get_app_data_dir();
         let cache_dir = dir.join("cache");
         let cache_file = dir.join(INDEX_CACHE_FILENAME);
-        let tree_cache = dir.join(TREE_CACHE_FILENAME);
+        let tree_caches = [dir.join(TREE_CACHE_FILENAME), dir.join(TREE_CACHE_NOSHADER_FILENAME)];
         let mut size = 0;
 
         if cache_dir.exists() {
@@ -266,10 +280,10 @@ impl AppSettings {
              }
         }
 
-        if tree_cache.exists() {
-             if let Ok(metadata) = std::fs::metadata(&tree_cache) {
-                 size += metadata.len();
-             }
+        for tree_cache in &tree_caches {
+            if let Ok(metadata) = std::fs::metadata(tree_cache) {
+                size += metadata.len();
+            }
         }
         
         size
@@ -279,7 +293,7 @@ impl AppSettings {
         let dir = Self::get_app_data_dir();
         let cache_dir = dir.join("cache");
         let cache_file = dir.join(INDEX_CACHE_FILENAME);
-        let tree_cache = dir.join(TREE_CACHE_FILENAME);
+        let tree_caches = [dir.join(TREE_CACHE_FILENAME), dir.join(TREE_CACHE_NOSHADER_FILENAME)];
 
         if cache_dir.exists() {
             std::fs::remove_dir_all(&cache_dir)?;
@@ -290,8 +304,10 @@ impl AppSettings {
             std::fs::remove_file(&cache_file)?;
         }
 
-        if tree_cache.exists() {
-            std::fs::remove_file(&tree_cache)?;
+        for tree_cache in &tree_caches {
+            if tree_cache.exists() {
+                std::fs::remove_file(tree_cache)?;
+            }
         }
         Ok(())
     }

@@ -252,6 +252,7 @@ impl ExplorerApp {
             let ctx_clone = ctx.clone();
             let schema_for_enrich = self.content_view.dat_viewer.schema.clone();
             let cdn_for_enrich = self.content_view.cdn_loader.clone();
+            let hide_shader_cache = self.settings.hide_shader_cache;
 
             thread::spawn(move || {
                 let start_total = std::time::Instant::now();
@@ -391,6 +392,11 @@ impl ExplorerApp {
                         let loose_added = index.add_ggpk_loose_files(&reader);
                         println!("Injected {} loose GGPK files into index in {:?}", loose_added, start_loose.elapsed());
 
+                        if hide_shader_cache {
+                            let dropped = index.drop_shader_cache();
+                            println!("Dropped {} shader cache entries from index", dropped);
+                        }
+
                         bundle_index = Some(Arc::new(index));
                     }
 
@@ -398,7 +404,7 @@ impl ExplorerApp {
                     
                     let mut tree_view = None;
                     if loaded_from_cache {
-                        let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::TREE_CACHE_FILENAME);
+                        let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::tree_cache_filename(hide_shader_cache));
                         if tree_cache_path.exists() {
                             eprintln!("Found tree cache file, attempting to load...");
                             let start_tree_cache = std::time::Instant::now();
@@ -420,7 +426,7 @@ impl ExplorerApp {
                         let start_tree = std::time::Instant::now();
                         let tv = if let Some(idx) = &bundle_index {
                             let built_tv = TreeView::new_bundled(Some(reader.clone()), idx);
-                            let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::TREE_CACHE_FILENAME);
+                            let tree_cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::tree_cache_filename(hide_shader_cache));
                             eprintln!("Saving TreeView to cache...");
                             if let Err(e) = built_tv.save_nodes_to_cache(&tree_cache_path) {
                                 println!("Failed to save tree cache: {}", e);
@@ -481,6 +487,7 @@ impl ExplorerApp {
         let ctx_clone = ctx.clone();
         let path_clone = bundles2_dir.clone();
         let schema_for_enrich = self.content_view.dat_viewer.schema.clone();
+        let hide_shader_cache = self.settings.hide_shader_cache;
 
         thread::spawn(move || {
             let result = (|| -> Result<(Option<Arc<GgpkReader>>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String> {
@@ -514,6 +521,11 @@ impl ExplorerApp {
 
                 // Inject loose files from the game root (Art/, etc.) so they appear in the tree
                 steam.add_loose_files_to_index(&mut index);
+
+                if hide_shader_cache {
+                    let dropped = index.drop_shader_cache();
+                    println!("Dropped {} shader cache entries from index", dropped);
+                }
 
                 let tree_view = TreeView::new_bundled(None, &index);
                 let bundle_index = Some(Arc::new(index));
@@ -914,7 +926,8 @@ impl eframe::App for ExplorerApp {
         if self.export_window.confirmed {
              self.export_window.confirmed = false;
              if let Some(target_dir) = rfd::FileDialog::new().set_directory("/").pick_folder() {
-                 let settings = self.export_window.settings.clone();
+                 let mut settings = self.export_window.settings.clone();
+                 settings.is_poe2 = self.is_poe2;
                  let hashes = if self.export_window.settings.recursive {
                      self.export_window.hashes.clone()
                  } else {

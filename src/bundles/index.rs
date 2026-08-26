@@ -388,3 +388,18 @@ fn read_u64<R: Read>(reader: &mut R) -> io::Result<u64> {
 
 
 
+
+/// `shadercache*/xx/<hash>` blobs: two thirds of the PoE 2 index and never useful to browse.
+pub fn is_shader_cache_path(path: &str) -> bool {
+    path.get(..11).map(|p| p.eq_ignore_ascii_case("shadercache")).unwrap_or(false)
+}
+
+impl Index {
+    /// Removes shader-cache entries; returns how many were dropped.
+    pub fn drop_shader_cache(&mut self) -> usize {
+        let before = self.files.len();
+        self.files.retain(|_, f| !is_shader_cache_path(&f.path));
+        self.files.shrink_to_fit();
+        before - self.files.len()
+    }
+}

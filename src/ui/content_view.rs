@@ -74,6 +74,8 @@ pub struct ContentView {
     folder_cache_index_size: usize,
 
     pub parsed_content_cache: HashMap<u64, crate::parsers::ParsedContent>,
+    /// Parsed `.ast/.fmt/.tgm/.smd` files plus their display summary.
+    pub model_cache: HashMap<u64, (std::sync::Arc<crate::parsers::model::ModelFile>, serde_json::Value)>,
 
     // FMOD .bank viewer state: parsed stream listings, decoded streams
     // (keyed by (file hash, stream index)), and the in-flight background
@@ -86,6 +88,23 @@ pub struct ContentView {
     bank_playing: Option<(u64, usize)>,
     bank_export_rx: Option<std::sync::mpsc::Receiver<String>>,
     bank_export_status: Option<String>,
+
+    // Atlas skill graph node database (PassiveSkillGraphId -> name/stats),
+    // resolved once in the background from PassiveSkills/Stats DAT tables +
+    // the atlas stat-description CSD files, shared by every open atlas .psg.
+    pub skill_graph_db: Option<std::sync::Arc<crate::ui::atlas_node_db::SkillGraphDatabase>>,
+    skill_graph_db_rx: Option<std::sync::mpsc::Receiver<Result<crate::ui::atlas_node_db::SkillGraphDatabase, String>>>,
+    skill_graph_db_loading: bool,
+
+    // DDS textures referenced by skill graph art (node icons, frames,
+    // connectors, group backgrounds) — path-keyed, shared across every open
+    // .psg viewer. Fetched/decoded lazily in small batches as `psg_viewer`
+    // discovers which paths the currently-open tree actually needs.
+    pub psg_texture_cache: HashMap<String, egui::TextureHandle>,
+    psg_texture_pending: std::collections::HashSet<String>,
+    /// Paths that could not be resolved/decoded — never re-requested.
+    psg_texture_failed: std::collections::HashSet<String>,
+    psg_texture_rx: Option<std::sync::mpsc::Receiver<Vec<(String, Option<egui::ColorImage>)>>>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -128,6 +147,7 @@ impl Default for ContentView {
             folder_children_cache: HashMap::new(),
             folder_cache_index_size: 0,
             parsed_content_cache: HashMap::new(),
+            model_cache: HashMap::new(),
 
             bank_info_cache: HashMap::new(),
             bank_stream_cache: HashMap::new(),
@@ -137,6 +157,15 @@ impl Default for ContentView {
             bank_playing: None,
             bank_export_rx: None,
             bank_export_status: None,
+
+            skill_graph_db: None,
+            skill_graph_db_rx: None,
+            skill_graph_db_loading: false,
+
+            psg_texture_cache: HashMap::new(),
+            psg_texture_pending: std::collections::HashSet::new(),
+            psg_texture_failed: std::collections::HashSet::new(),
+            psg_texture_rx: None,
         }
     }
 }
@@ -205,6 +234,39 @@ impl ContentView {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, reader: Option<std::sync::Arc<crate::ggpk::reader::GgpkReader>>, selection: Option<FileSelection>, is_poe2: bool, bundle_index: &Option<std::sync::Arc<crate::bundles::index::Index>>) {
+        if let Some(rx) = &self.skill_graph_db_rx {
+            if let Ok(result) = rx.try_recv() {
+                self.skill_graph_db_rx = None;
+                self.skill_graph_db_loading = false;
+                match result {
+                    Ok(db) => self.skill_graph_db = Some(std::sync::Arc::new(db)),
+                    Err(e) => println!("Atlas skill DB build failed: {}", e),
+                }
+            }
+        }
+
+        if let Some(rx) = &self.psg_texture_rx {
+            if let Ok(batch) = rx.try_recv() {
+                self.psg_texture_rx = None;
+                for (path, img) in batch {
+                    self.psg_texture_pending.remove(&path);
+                    if img.is_none() {
+                        self.psg_texture_failed.insert(path.clone());
+                    }
+                    if let Some(color_image) = img {
+                        // Connector sheets are tiled along straight lines.
+                        let options = if crate::ui::psg_viewer::is_connector_sheet(&path) {
+                            egui::TextureOptions { wrap_mode: egui::TextureWrapMode::Repeat, ..Default::default() }
+                        } else {
+                            egui::TextureOptions::default()
+                        };
+                        let handle = ui.ctx().load_texture(&path, color_image, options);
+                        self.psg_texture_cache.insert(path, handle);
+                    }
+                }
+            }
+        }
+
         if let Some(selection) = selection {
             match selection {
                 FileSelection::GgpkOffset(offset) => {
@@ -226,11 +288,7 @@ impl ContentView {
                              // Auto-load logic
                              let mut perform_load = false;
                              
-                             if file_info.path.ends_with(".dds") {
-                                 if !self.texture_cache.contains_key(&hash) {
-                                     perform_load = true;
-                                 }
-                             } else if file_info.path.ends_with(".png") || file_info.path.ends_with(".jpg") || file_info.path.ends_with(".jpeg") || file_info.path.ends_with(".webp") {
+                             if is_image_path(&file_info.path) {
                                  if !self.texture_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
@@ -250,8 +308,12 @@ impl ContentView {
                                  if !self.fxgraph_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
-                             } else if file_info.path.ends_with(".json") {
+                             } else if is_json_path(&file_info.path) {
                                  if !self.json_cache.contains_key(&hash) && !self.raw_data_cache.contains_key(&hash) {
+                                     perform_load = true;
+                                 }
+                             } else if crate::parsers::model::is_model_path(&file_info.path) {
+                                 if !self.model_cache.contains_key(&hash) && !self.raw_data_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
                              } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") || file_info.path.ends_with(".mp3") {
@@ -327,21 +389,40 @@ impl ContentView {
                                                ui.label("Showing raw hex view:");
                                                crate::ui::hex_viewer::HexViewer::show(ui, data);
                                            } else if self.last_error.is_none() {
-                                               self.dat_viewer.show(ui, is_poe2); // Show failed state
+                                               self.dat_viewer.show(ui, is_poe2, None); // Show failed state
                                            }
                                        });
                                    } else {
-                                       // Ensure it takes available space
-                                       self.dat_viewer.show(ui, is_poe2);
+                                       let index_arc = index.clone();
+                                       let reader_arc = reader.clone();
+                                       let steam = self.steam_loader.clone();
+                                       let mut loader = |p: &str| -> Option<Vec<u8>> {
+                                           let fi = find_file_info_by_path(&index_arc, p)?;
+                                           extract_bundle_file_sync(fi, &index_arc, reader_arc.as_deref(), steam.as_ref())
+                                       };
+                                       self.dat_viewer.show(ui, is_poe2, Some(&mut loader));
+                                       self.handle_dat_nav(index);
                                    }
                               } else if file_info.path.ends_with(".csd") {
                                  self.show_csd(ui, hash);
                             } else if file_info.path.ends_with(".psg") {
+                                 if self.psg_cache.contains_key(&hash) {
+                                     self.ensure_skill_graph_db_loading(reader.clone(), index);
+                                     if let Some(db) = self.skill_graph_db.clone() {
+                                         let needed = self.psg_cache.get(&hash).map(|psg| collect_needed_texture_paths(psg, &db));
+                                         if let Some(needed) = needed {
+                                             self.ensure_psg_textures_loading(reader.clone(), index, needed);
+                                         }
+                                     }
+                                 }
+                                 let is_loading_art = self.is_psg_art_loading();
                                  if let Some(psg_file) = self.psg_cache.get(&hash) {
                                      let state = self.psg_viewer_state.entry(hash).or_default();
+                                     state.skill_db = self.skill_graph_db.clone();
                                      let show_graph = state.show_graph;
-                                     let mut viewer = crate::ui::psg_viewer::PsgViewer::new(state, psg_file);
-                                     
+                                     let mut viewer = crate::ui::psg_viewer::PsgViewer::new(state, psg_file, &self.psg_texture_cache, is_loading_art);
+                                     viewer.art_pending = self.psg_texture_pending.len();
+
                                      if show_graph {
                                          viewer.show(ui);
                                      } else {
@@ -407,7 +488,23 @@ impl ContentView {
                                          ui.label("Loading FX graph...");
                                     }
                                 }
-                            } else if file_info.path.ends_with(".json") {
+                            } else if crate::parsers::model::is_model_path(&file_info.path) {
+                                 if let Some((model, summary)) = self.model_cache.get(&hash) {
+                                     crate::ui::model_viewer::ModelViewer::show(ui, &file_info.path, model, summary);
+                                 } else if let Some(data) = self.raw_data_cache.get(&hash) {
+                                     egui::ScrollArea::vertical().show(ui, |ui| {
+                                         if let Some(err) = &self.last_error {
+                                             ui.colored_label(egui::Color32::from_rgb(239, 68, 68), format!("❌ {}", err));
+                                         }
+                                         ui.label("Showing raw hex view:");
+                                         crate::ui::hex_viewer::HexViewer::show(ui, data);
+                                     });
+                                 } else if self.failed_loads.contains(&hash) {
+                                     ui.colored_label(egui::Color32::RED, self.last_error.as_deref().unwrap_or("Failed to load."));
+                                 } else {
+                                     ui.spinner();
+                                 }
+                            } else if is_json_path(&file_info.path) {
                                  if let Some(job) = self.json_cache.get(&hash) {
                                      egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
                                          JsonTreeViewer::show(ui, job);
@@ -419,7 +516,7 @@ impl ContentView {
                                  }
                             } else {
                                  // For other content, use ScrollArea
-                                      if file_info.path.ends_with(".dds") || file_info.path.ends_with(".png") || file_info.path.ends_with(".jpg") || file_info.path.ends_with(".jpeg") || file_info.path.ends_with(".webp") {
+                                      if is_image_path(&file_info.path) {
                                           let texture_info = self.texture_cache.get(&hash)
                                               .map(|t| (t.id(), t.size_vec2()));
                                           if let Some((texture_id, texture_size)) = texture_info {
@@ -551,10 +648,13 @@ impl ContentView {
                                               ui.centered_and_justified(|ui| { ui.spinner(); });
                                           }
                                       } else if file_info.path.ends_with(".psg") {
+                let is_loading_art = self.is_psg_art_loading();
                 if let Some(psg_file) = self.psg_cache.get(&hash) {
                      let state = self.psg_viewer_state.entry(hash).or_default();
+                     state.skill_db = self.skill_graph_db.clone();
                      let show_graph = state.show_graph;
-                     let mut viewer = crate::ui::psg_viewer::PsgViewer::new(state, psg_file);
+                     let mut viewer = crate::ui::psg_viewer::PsgViewer::new(state, psg_file, &self.psg_texture_cache, is_loading_art);
+                     viewer.art_pending = self.psg_texture_pending.len();
                      
                      if show_graph {
                          viewer.show(ui);
@@ -597,7 +697,7 @@ impl ContentView {
                                                 if let Some(data) = self.raw_data_cache.get(&hash) {
                                                      let text = decode_text_with_detection(data);
                                                       // Show read-only text edit
-                                                      let language = if file_info.path.ends_with(".hlsl") || file_info.path.ends_with(".vshader") || file_info.path.ends_with(".pshader") || file_info.path.ends_with(".fx") {
+                                                      let language = if is_shader_source(&file_info.path) {
                                                           "hlsl"
                                                       } else {
                                                           "text"
@@ -1666,8 +1766,10 @@ impl ContentView {
                              }
                         }
                     } else if file.name.ends_with(".dat") || file.name.ends_with(".dat64") {
-                         self.dat_viewer.load(reader, offset);
-                         self.dat_viewer.show(ui, is_poe2);
+                         if self.dat_viewer.loaded_filename() != Some(file.name.as_str()) {
+                             self.dat_viewer.load(reader, offset);
+                         }
+                         self.dat_viewer.show(ui, is_poe2, None);
                     } else {
                         // Try new format parsers
                         match reader.get_data_slice(file.data_offset, file.data_length) {
@@ -1726,6 +1828,22 @@ impl ContentView {
         }
     }
 
+    /// Turns a foreign-key / file-path click in the DAT viewer into a file selection.
+    fn handle_dat_nav(&mut self, index: &crate::bundles::index::Index) {
+        let Some(req) = self.dat_viewer.nav_request.take() else { return };
+        let (path, row) = match req {
+            crate::ui::dat_viewer::DatNavRequest::Table { path, row } => (path, row),
+            crate::ui::dat_viewer::DatNavRequest::File(p) => (p, None),
+        };
+        match find_file_info_by_path(index, &path) {
+            Some(fi) => {
+                self.dat_viewer.pending_scroll_row = row;
+                self.selection_requested = Some(crate::ui::app::FileSelection::BundleFile(fi.path_hash));
+            }
+            None => self.last_error = Some(format!("Not found in index: {}", path)),
+        }
+    }
+
     pub fn load_bundled_content(&mut self, ctx: &egui::Context, reader: Option<&GgpkReader>, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
          // Reset previous state
          self.dat_viewer.reader = None;
@@ -1733,7 +1851,7 @@ impl ContentView {
          self.last_error = None;
 
          // Check persistent cache for JSON/PSG
-         if file_info.path.ends_with(".json") || file_info.path.ends_with(".psg") || file_info.path.ends_with(".fxgraph") {
+         if is_json_path(&file_info.path) || file_info.path.ends_with(".psg") || file_info.path.ends_with(".fxgraph") {
              if self.try_load_from_cache(hash) {
                  println!("Loaded {} from disk cache.", file_info.path);
                  return;
@@ -1900,6 +2018,76 @@ impl ContentView {
           }
     }
 
+    /// Kicks off a background build of the atlas skill node database (name +
+    /// stat text per `PassiveSkillGraphId`), the first time an atlas `.psg`
+    /// is opened. No-op if already loaded/loading or the DAT schema isn't
+    /// ready yet (retried next frame in that case).
+    fn ensure_skill_graph_db_loading(&mut self, reader: Option<std::sync::Arc<GgpkReader>>, index: &std::sync::Arc<crate::bundles::index::Index>) {
+        if self.skill_graph_db.is_some() || self.skill_graph_db_loading {
+            return;
+        }
+        let schema = match self.dat_viewer.schema.clone() {
+            Some(s) => s,
+            None => return,
+        };
+
+        self.skill_graph_db_loading = true;
+        let index = index.clone();
+        let steam_loader = self.steam_loader.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.skill_graph_db_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = build_skill_graph_db(reader.as_deref(), &index, steam_loader.as_ref(), &schema);
+            let _ = tx.send(result);
+        });
+    }
+
+    /// True while the shared skill graph database and/or any of its art
+    /// textures are still being fetched/decoded in the background.
+    pub fn is_psg_art_loading(&self) -> bool {
+        self.skill_graph_db_loading || self.psg_texture_rx.is_some() || !self.psg_texture_pending.is_empty()
+    }
+
+    /// Requests background fetch+decode of any of `paths` not already cached
+    /// or in flight. Only one batch is ever in flight at a time — a caller
+    /// asking again next frame with a still-missing path just gets it picked
+    /// up once the current batch completes (textures are cached forever
+    /// once loaded, so this converges within a couple of frames).
+    pub fn ensure_psg_textures_loading(
+        &mut self,
+        reader: Option<std::sync::Arc<GgpkReader>>,
+        index: &std::sync::Arc<crate::bundles::index::Index>,
+        paths: Vec<String>,
+    ) {
+        if self.psg_texture_rx.is_some() {
+            return;
+        }
+        let missing: Vec<String> = paths
+            .into_iter()
+            .filter(|p| {
+                !p.is_empty()
+                    && !self.psg_texture_cache.contains_key(p)
+                    && !self.psg_texture_pending.contains(p)
+                    && !self.psg_texture_failed.contains(p)
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        for p in &missing {
+            self.psg_texture_pending.insert(p.clone());
+        }
+
+        let index = index.clone();
+        let steam_loader = self.steam_loader.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.psg_texture_rx = Some(rx);
+        std::thread::spawn(move || {
+            let batch = fetch_and_decode_dds_batch(reader.as_deref(), &index, steam_loader.as_ref(), missing);
+            let _ = tx.send(batch);
+        });
+    }
+
     /// Routes raw file bytes into the appropriate viewer state based on the
     /// file extension. Shared by bundled, Steam-loose, and GGPK-loose loads.
     fn route_file_data(&mut self, ctx: &egui::Context, path: &str, hash: u64, file_data: Vec<u8>) {
@@ -1915,27 +2103,25 @@ impl ContentView {
                           } else {
                               self.last_error = None;
                           }
-                      } else if path.ends_with(".dds") || path.ends_with(".png") || path.ends_with(".jpg") || path.ends_with(".jpeg") || path.ends_with(".webp") {
+                      } else if is_image_path(path) {
                           // Try to load Image
                           self.last_error = None;
-                          
+
                           println!("Image Loading: Data Length {}", file_data.len());
-                          
+
                           // Special handling for DDS
-                          if path.ends_with(".dds") {
-                              if file_data.len() > 16 {
-                                  println!("DDS First 16 bytes: {:02X?}", &file_data[0..16]);
-                                  let magic = &file_data[0..4];
-                                  if magic == b"DDS " {
-                                      println!("Magic 'DDS ' confirmed.");
-                                  } else {
+                          if path.ends_with(".dds") || path.ends_with(".dds.header") {
+                              let dds_bytes = dds_payload(&file_data);
+                              if dds_bytes.len() > 16 {
+                                  let magic = &dds_bytes[0..4];
+                                  if magic != b"DDS " {
                                       println!("WARNING: Magic bytes mismatch! Expected 'DDS ', found {:?}", magic);
                                   }
                               }
-                              
+
                               // Method 1: Try image_dds first (better support for various DXT/BC formats for DDS)
                               let mut loaded = false;
-                              let mut cursor = std::io::Cursor::new(&file_data);
+                              let mut cursor = std::io::Cursor::new(dds_bytes);
                               match ddsfile::Dds::read(&mut cursor) {
                                   Ok(dds) => {
                                       println!("DDS Header Read OK.");
@@ -2039,7 +2225,19 @@ impl ContentView {
                                   self.failed_loads.insert(hash);
                               }
                           }
-                      } else if path.ends_with(".json") {
+                      } else if crate::parsers::model::is_model_path(path) {
+                          match crate::parsers::model::parse_model(path, &file_data) {
+                              Ok(model) => {
+                                  let summary = model.summary();
+                                  self.model_cache.insert(hash, (std::sync::Arc::new(model), summary));
+                                  self.last_error = None;
+                              }
+                              Err(e) => {
+                                  self.last_error = Some(format!("Model parse error: {}", e));
+                              }
+                          }
+                          self.insert_raw(hash, file_data);
+                      } else if is_json_path(path) {
                            // Read file content as string
                            let text = decode_text_with_detection(&file_data);
                            match serde_json::from_str::<serde_json::Value>(&text) {
@@ -2250,7 +2448,32 @@ fn is_text_file(path: &str) -> bool {
     // Plain UTF-16LE text formats that were previously falling through to the
     // hex viewer despite being fully readable (confirmed against real game data).
     p.ends_with(".tdt") || p.ends_with(".tmd") || p.ends_with(".epk") ||
-    p.ends_with(".it") || p.ends_with(".fgp") || p.ends_with(".tgr")
+    p.ends_with(".it") || p.ends_with(".fgp") || p.ends_with(".tgr") ||
+    p.ends_with(".atl") || p.ends_with(".geal") || is_shader_source(&p)
+}
+
+/// Shader sources (and their includes) get HLSL highlighting.
+fn is_shader_source(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.ends_with(".hlsl") || p.ends_with(".vshader") || p.ends_with(".pshader") ||
+    p.ends_with(".fx") || p.ends_with(".inc") || p.ends_with(".h")
+}
+
+/// Files parsed and shown as a JSON tree. `.hideout` decoration files are UTF-8 JSON.
+fn is_json_path(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.ends_with(".json") || p.ends_with(".hideout")
+}
+
+/// PoE 2 `.dds.header` files carry a small streaming prefix before a regular
+/// DDS (header + lowest mips). Returns the slice starting at the `DDS ` magic.
+fn dds_payload(data: &[u8]) -> &[u8] {
+    let scan = data.len().min(64);
+    data[..scan]
+        .windows(4)
+        .position(|w| w == b"DDS ")
+        .map(|off| &data[off..])
+        .unwrap_or(data)
 }
 
 fn is_non_playable_media(path: &str) -> bool {
@@ -2307,7 +2530,8 @@ fn parse_bink_meta(data: &[u8]) -> Option<BinkMeta> {
 
 fn is_image_path(path: &str) -> bool {
     let p = path.to_lowercase();
-    p.ends_with(".dds") || p.ends_with(".png") || p.ends_with(".jpg") || p.ends_with(".jpeg") || p.ends_with(".webp")
+    p.ends_with(".dds") || p.ends_with(".dds.header") || p.ends_with(".png") || p.ends_with(".jpg") ||
+    p.ends_with(".jpeg") || p.ends_with(".webp") || p.ends_with(".bmp")
 }
 
 fn display_name_from_path(path: &str) -> String {
@@ -2354,8 +2578,10 @@ fn file_kind_label(path: &str) -> &'static str {
         "AUDIO"
     } else if p.ends_with(".dat") || p.ends_with(".dat64") || p.ends_with(".datc64") || p.ends_with(".datl") || p.ends_with(".datl64") {
         "DATA"
-    } else if p.ends_with(".json") || is_text_file(&p) {
+    } else if is_json_path(&p) || is_text_file(&p) {
         "TEXT"
+    } else if crate::parsers::model::is_model_path(&p) {
+        "MODEL"
     } else if p.ends_with(".psg") || p.ends_with(".fxgraph") {
         "GRAPH"
     } else {
@@ -2401,10 +2627,7 @@ fn decode_text_with_detection(data: &[u8]) -> String {
 
 fn parse_with_new_formats(path: &str, data: &[u8]) -> Option<crate::parsers::ParsedContent> {
     if let Some(format) = is_supported_format(path) {
-        match crate::parsers::parse(format, data) {
-            Ok(content) => Some(content),
-            Err(_) => None, // Fallback to other viewers
-        }
+        crate::parsers::parse(format, data).ok()
     } else {
         None
     }
@@ -2479,7 +2702,7 @@ fn launch_bink_player(path: &std::path::Path, _game_root: Option<&std::path::Pat
 }
 
 /// Synchronously extracts one file from the bundle system without going through the cache.
-fn extract_bundle_file_sync(
+pub(crate) fn extract_bundle_file_sync(
     file_info: &crate::bundles::index::FileInfo,
     index: &crate::bundles::index::Index,
     reader: Option<&GgpkReader>,
@@ -2516,6 +2739,310 @@ fn extract_bundle_file_sync(
     if end <= data.len() { Some(data[start..end].to_vec()) } else { None }
 }
 
+fn find_file_info_by_path<'a>(
+    index: &'a crate::bundles::index::Index,
+    path: &str,
+) -> Option<&'a crate::bundles::index::FileInfo> {
+    index.files.values().find(|f| f.path.eq_ignore_ascii_case(path))
+}
+
+/// Every DDS path the given `.psg`'s art (icons + tree-context frames,
+/// connectors, group backgrounds) will need, deduplicated. Only 771 unique
+/// node icons exist across the *entire* game's passive skill data, so a
+/// single tree's subset is small enough to bulk-request in one go.
+pub(crate) fn collect_needed_texture_paths(
+    psg: &crate::dat::psg::PsgFile,
+    db: &crate::ui::atlas_node_db::SkillGraphDatabase,
+) -> Vec<String> {
+    use crate::ui::psg_viewer as pv;
+    let tree_context = crate::ui::atlas_node_db::tree_context_for_graph_type(psg.graph_type);
+    let mut paths = Vec::new();
+
+    let push_art_set = |art: &crate::ui::skill_tree_art::SkillTreeArtSet, paths: &mut Vec<String>| {
+        paths.push(art.group_background.small.clone());
+        paths.push(art.group_background.medium.clone());
+        paths.push(art.group_background.large.clone());
+        paths.push(art.connection.normal.clone());
+        paths.push(art.connection.active.clone());
+        for frame in art.frames.values() {
+            paths.push(frame.normal.clone());
+            paths.push(frame.active.clone());
+        }
+    };
+
+    match psg.graph_type {
+        1 => {
+            paths.push(crate::ui::atlas_node_db::ATLAS_MAIN_TREE_BG_PATH.to_string());
+            paths.push(pv::ATLAS_START.to_string());
+            for d in &db.decorators {
+                paths.push(d.background.clone());
+                paths.push(d.blocked.clone());
+            }
+        }
+        2 => {
+            paths.push(pv::BREACH_BACKDROP.to_string());
+            paths.push(pv::BREACH_START.to_string());
+        }
+        _ => {
+            paths.push(pv::MAIN_CIRCLE.to_string());
+            paths.push(pv::MAIN_CIRCLE_ACTIVE.to_string());
+            paths.push(pv::PLUS_FRAME_NORMAL.to_string());
+            paths.push(pv::PLUS_FRAME_ACTIVE.to_string());
+            for &c in &db.playable_characters() {
+                let ch = &db.characters[c];
+                if let Some(i) = &ch.illustration {
+                    paths.push(i.clone());
+                }
+            }
+            for (i, a) in db.ascendancies.iter().enumerate() {
+                if !a.is_enabled() {
+                    continue;
+                }
+                if let Some(img) = &a.illustration {
+                    paths.push(img.clone());
+                }
+                if let Some(art) = db.ui_art_for_ascendancy(i) {
+                    push_art_set(art, &mut paths);
+                }
+            }
+            for frame in &db.node_frames {
+                paths.push(frame.normal.clone());
+                paths.push(frame.active.clone());
+            }
+        }
+    }
+
+    if let Some(art) = db.art_sets.get(tree_context) {
+        push_art_set(art, &mut paths);
+    }
+
+    for group in &psg.groups {
+        for node in &group.nodes {
+            if let Some(info) = db.nodes.get(&node.skill_id) {
+                if let Some(icon) = &info.icon {
+                    paths.push(icon.clone());
+                }
+                if let Some((bg, _, _)) = &info.atlas_subtree_background {
+                    paths.push(bg.clone());
+                }
+                if let Some(icon) = &info.atlas_subtree_icon {
+                    paths.push(icon.clone());
+                }
+            }
+        }
+    }
+
+    paths.retain(|p| !p.is_empty());
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Fetches the DAT/CSD files needed to resolve skill graph nodes (passive
+/// tree, atlas, and league/Brequel trees all share the `PassiveSkills` table,
+/// just with different stat-description sources) and builds the resolved
+/// database. Runs on a background thread — these files total several MB and
+/// parsing them synchronously would stall a frame.
+pub(crate) fn build_skill_graph_db(
+    reader: Option<&GgpkReader>,
+    index: &crate::bundles::index::Index,
+    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+    schema: &crate::dat::schema::Schema,
+) -> Result<crate::ui::atlas_node_db::SkillGraphDatabase, String> {
+    let fetch = |path: &str| -> Result<Vec<u8>, String> {
+        let info = find_file_info_by_path(index, path)
+            .ok_or_else(|| format!("File not found in bundle index: {}", path))?;
+        extract_bundle_file_sync(info, index, reader, steam_loader)
+            .ok_or_else(|| format!("Failed to read file: {}", path))
+    };
+    let fetch_optional = |path: &str| -> Option<Vec<u8>> { fetch(path).ok() };
+    let passiveskills_bytes = fetch("data/balance/passiveskills.datc64")?;
+    let stats_bytes = fetch("data/balance/stats.datc64")?;
+
+    // Covers all three known graph types: character/ascendancy, atlas, and
+    // Brequel (Chayula league tree). `stat_descriptions.csd` is the generic
+    // fallback every tree can fall back to for shared/uncommon stat ids.
+    let csd_paths = [
+        "data/statdescriptions/passive_skill_stat_descriptions.csd",
+        "data/statdescriptions/passive_skill_variant_stat_descriptions.csd",
+        "data/statdescriptions/atlas_stat_descriptions.csd",
+        "data/statdescriptions/atlas_variant_stat_descriptions.csd",
+        "data/statdescriptions/stat_descriptions.csd",
+    ];
+    let mut stat_csd_sources = Vec::new();
+    for path in csd_paths {
+        let bytes = fetch(path)?;
+        stat_csd_sources.push(crate::ui::atlas_node_db::StatCsdSource {
+            path: path.to_string(),
+            bytes,
+        });
+    }
+
+    let extra = crate::ui::atlas_node_db::ExtraTables {
+        ascendancy: fetch_optional("data/balance/ascendancy.datc64"),
+        atlas_subtrees: fetch_optional("data/balance/atlaspassiveskillsubtrees.datc64"),
+        characters: fetch_optional("data/balance/characters.datc64"),
+        decorators: fetch_optional("data/balance/passivetreedecorators.datc64"),
+    };
+
+    let mut db = crate::ui::atlas_node_db::build(
+        passiveskills_bytes,
+        stats_bytes,
+        &stat_csd_sources,
+        extra,
+        schema,
+    )?;
+
+    let node_frame_bytes = fetch("data/balance/passiveskilltreenodeframeart.datc64")?;
+    let connection_bytes = fetch("data/balance/passiveskilltreeconnectionart.datc64")?;
+    let ui_art_bytes = fetch("data/balance/passiveskilltreeuiart.datc64")?;
+    let node_frames = crate::ui::skill_tree_art::parse_node_frame_art(node_frame_bytes, schema)?;
+    let connections = crate::ui::skill_tree_art::parse_connection_art(connection_bytes, schema)?;
+    let (art_sets, ui_art_ids) = crate::ui::skill_tree_art::parse_ui_art(ui_art_bytes, &node_frames, &connections)?;
+    db.art_sets = art_sets;
+    db.ui_art_ids = ui_art_ids;
+    db.node_frames = node_frames;
+
+    Ok(db)
+}
+
+fn rgba_to_color_image(img: &image::RgbaImage) -> egui::ColorImage {
+    let size = [img.width() as usize, img.height() as usize];
+    egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw())
+}
+
+/// Decodes DDS (or PNG/JPG/WebP) bytes, picking a mip that fits the tree-art budget.
+fn decode_dds_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
+    /// Tree art is drawn at world scale, never 1:1, so pick the first mip that
+    /// fits — the 4000² centre ring and 9960² Breach backdrop would otherwise
+    /// cost hundreds of MB of GPU memory each.
+    const MAX_DIM: u32 = 1024;
+    let mut cursor = std::io::Cursor::new(bytes);
+    if let Ok(dds) = ddsfile::Dds::read(&mut cursor) {
+        let mips = dds.get_num_mipmap_levels().max(1);
+        let mut mip = 0u32;
+        let mut dim = dds.get_width().max(dds.get_height());
+        while dim > MAX_DIM && mip + 1 < mips {
+            mip += 1;
+            dim /= 2;
+        }
+        if let Ok(image) = image_dds::image_from_dds(&dds, mip) {
+            return Some(image);
+        }
+    }
+    image::load_from_memory(bytes).ok().map(|img| img.to_rgba8())
+}
+
+/// Decoded skill-tree art is cached on disk as PNG, keyed by the file's index
+/// entry (path, size, bundle) so it is refreshed when the game updates.
+fn tree_art_cache_path(path: &str, info: &crate::bundles::index::FileInfo) -> std::path::PathBuf {
+    let key = crate::bundles::index::murmur_hash64a(
+        format!("{}|{}|{}", path.to_ascii_lowercase(), info.file_size, info.bundle_index).as_bytes(),
+    );
+    crate::settings::AppSettings::get_app_data_dir()
+        .join("cache")
+        .join("tree_art")
+        .join(format!("{:016x}.png", key))
+}
+
+/// Decompresses a whole bundle (the raw payload for `bundle_index`).
+fn decompress_bundle(
+    bundle_index: u32,
+    index: &crate::bundles::index::Index,
+    reader: Option<&GgpkReader>,
+    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+) -> Option<Vec<u8>> {
+    let bundle_info = index.bundles.get(bundle_index as usize)?;
+    let raw = reader
+        .and_then(|reader| {
+            [format!("Bundles2/{}", bundle_info.name), format!("Bundles2/{}.bundle.bin", bundle_info.name)]
+                .iter()
+                .find_map(|c| {
+                    reader.read_file_by_path(c).ok().flatten().and_then(|rec| {
+                        reader.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec())
+                    })
+                })
+        })
+        .or_else(|| steam_loader.and_then(|s| s.fetch_bundle(&bundle_info.name).ok()))?;
+    let mut cursor = std::io::Cursor::new(raw);
+    let header = crate::bundles::bundle::Bundle::read_header(&mut cursor).ok()?;
+    header.decompress(&mut cursor).ok()
+}
+
+/// DAT-stored texture paths under `Art/2DArt/UIImages/...` (group
+/// backgrounds, node frames) are missing a `Textures/Interface/2D/` segment
+/// that the actual bundle path has — confirmed against the real index:
+/// `Art/2DArt/UIImages/InGame/PassiveSkillScreenGroupBackgroundSmall` in the
+/// DAT resolves to
+/// `Art/Textures/Interface/2D/2DArt/UIImages/InGame/PassiveSkillScreenGroupBackgroundSmall.dds`
+/// on disk. Icon (`SkillIcons`) and connector (`PassiveTree`) paths don't
+/// need this — only try it for the `UIImages` case.
+fn dds_path_candidates(path: &str) -> Vec<String> {
+    let mut candidates = vec![path.to_string(), format!("{}.dds", path)];
+    let lower = path.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("art/2dart/uiimages") {
+        let suffix = &path[path.len() - rest.len()..];
+        let corrected = format!("Art/Textures/Interface/2D/2DArt/UIImages{}", suffix);
+        candidates.push(format!("{}.dds", corrected));
+        candidates.push(corrected);
+    }
+    candidates
+}
+
+/// Fetches and decodes a batch of skill-graph art textures by path.
+fn fetch_and_decode_dds_batch(
+    reader: Option<&GgpkReader>,
+    index: &crate::bundles::index::Index,
+    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+    paths: Vec<String>,
+) -> Vec<(String, Option<egui::ColorImage>)> {
+    let cache_dir = crate::settings::AppSettings::get_app_data_dir().join("cache").join("tree_art");
+    let _ = std::fs::create_dir_all(&cache_dir);
+
+    // Group by bundle so each bundle is decompressed once per batch.
+    let mut jobs: Vec<(String, Option<&crate::bundles::index::FileInfo>)> =
+        paths.into_iter().map(|p| { let info = resolve_texture_path(index, &p); (p, info) }).collect();
+    jobs.sort_by_key(|(_, info)| info.map(|i| (i.bundle_index, i.file_offset)).unwrap_or((u32::MAX, 0)));
+
+    let mut current_bundle: Option<(u32, Vec<u8>)> = None;
+    jobs.into_iter()
+        .map(|(path, info)| {
+            let Some(info) = info else { return (path, None) };
+            let cache_file = tree_art_cache_path(&path, info);
+            if let Ok(img) = image::open(&cache_file) {
+                return (path, Some(rgba_to_color_image(&img.to_rgba8())));
+            }
+            let bytes = if info.bundle_index == crate::bundles::index::GGPK_LOOSE_FILE_SENTINEL
+                || info.bundle_index == crate::bundles::steam::LOOSE_FILE_SENTINEL
+            {
+                extract_bundle_file_sync(info, index, reader, steam_loader)
+            } else {
+                if current_bundle.as_ref().map(|(b, _)| *b != info.bundle_index).unwrap_or(true) {
+                    current_bundle = decompress_bundle(info.bundle_index, index, reader, steam_loader).map(|d| (info.bundle_index, d));
+                }
+                current_bundle.as_ref().and_then(|(_, data)| {
+                    let start = info.file_offset as usize;
+                    let end = start + info.file_size as usize;
+                    (end <= data.len()).then(|| data[start..end].to_vec())
+                })
+            };
+            let img = bytes.and_then(|b| decode_dds_rgba(&b));
+            if let Some(img) = &img {
+                let _ = img.save(&cache_file);
+            }
+            (path, img.map(|i| rgba_to_color_image(&i)))
+        })
+        .collect()
+}
+
+/// Index entry for a DAT-style texture path (with or without `.dds`, with or
+/// without the `Textures/Interface/2D` segment).
+pub(crate) fn resolve_texture_path<'a>(index: &'a crate::bundles::index::Index, path: &str) -> Option<&'a crate::bundles::index::FileInfo> {
+    dds_path_candidates(path)
+        .iter()
+        .find_map(|candidate| find_file_info_by_path(index, candidate))
+}
+
 fn render_parsed_content(ui: &mut egui::Ui, file_name: &str, parsed: &crate::parsers::ParsedContent) {
     let format = crate::parsers::FileFormat::from_extension(file_name);
 
@@ -2532,4 +3059,85 @@ fn render_parsed_content(ui: &mut egui::Ui, file_name: &str, parsed: &crate::par
     }
 }
 
+#[cfg(test)]
+mod skill_graph_pipeline_tests {
+    use super::*;
+    use crate::bundles::index::Index as BundleIndex;
+    use std::sync::Arc;
 
+    /// End-to-end check against the real GGPK: builds the full skill graph
+    /// database (nodes + art) for a given `.psg`, derives the texture paths
+    /// it needs, and fetches+decodes a sample of them — catching any
+    /// regression in the fetch/decode wiring that a GUI click can't easily
+    /// be automated to exercise in CI.
+    fn check_tree(psg_path: &str, min_nodes: usize) {
+        let settings = crate::settings::AppSettings::load();
+        let ggpk_path = settings.ggpk_path.expect("no ggpk_path configured");
+        let reader = Arc::new(GgpkReader::open(&ggpk_path).unwrap());
+        let cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
+        let index = Arc::new(BundleIndex::load_from_cache(&cache_path).expect("run the app once to build the index cache"));
+        let schema_text = std::fs::read_to_string(crate::settings::AppSettings::get_app_data_dir().join("schema.min.json"))
+            .expect("schema.min.json not found (run the app once first)");
+        let schema: crate::dat::schema::Schema = serde_json::from_str(&schema_text).unwrap();
+
+        let db = build_skill_graph_db(Some(&reader), &index, None, &schema).expect("skill graph db build failed");
+        assert!(db.nodes.len() > 1000, "expected the shared PassiveSkills table to have >1000 rows");
+        assert!(!db.art_sets.is_empty(), "expected at least one resolved UIArt tree context");
+
+        let psg_info = find_file_info_by_path(&index, psg_path).expect("psg file not found in index");
+        let psg_bytes = extract_bundle_file_sync(psg_info, &index, Some(&reader), None).expect("failed to read psg");
+        let psg = crate::dat::psg::parse_psg(&psg_bytes).expect("failed to parse psg");
+
+        let node_count = psg.groups.iter().flat_map(|g| &g.nodes).filter(|n| db.nodes.contains_key(&n.skill_id)).count();
+        assert!(node_count >= min_nodes, "{}: expected >= {} resolved nodes, got {}", psg_path, min_nodes, node_count);
+
+        let needed = collect_needed_texture_paths(&psg, &db);
+        assert!(!needed.is_empty(), "{}: expected at least one texture path to fetch", psg_path);
+
+        // Test each texture "family" separately — icons (SkillIcons),
+        // connectors (PassiveTree), and UI chrome (UIImages: group
+        // backgrounds + node frames) resolve via different path rules (see
+        // `dds_path_candidates`), so a plain alphabetical sample could
+        // silently skip one family entirely.
+        for (label, filter) in [
+            ("icons", "skillicons"),
+            ("connectors", "passivetree"),
+            ("ui chrome (backgrounds/frames)", "uiimages"),
+        ] {
+            let family: Vec<String> = needed
+                .iter()
+                .filter(|p| p.to_ascii_lowercase().contains(filter))
+                .take(10)
+                .cloned()
+                .collect();
+            if family.is_empty() {
+                continue; // not every tree references every family (e.g. atlas has no jewel sockets)
+            }
+            let decoded = fetch_and_decode_dds_batch(Some(&reader), &index, None, family.clone());
+            let ok_count = decoded.iter().filter(|(_, img)| img.is_some()).count();
+            assert!(
+                ok_count * 2 >= family.len(),
+                "{}: expected at least half of the sampled {} textures to decode, got {}/{} ({:?})",
+                psg_path, label, ok_count, family.len(), family
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn atlas_tree_art_pipeline() {
+        check_tree("metadata/atlasskillgraphs/atlasskillgraph.psg", 100);
+    }
+
+    #[test]
+    #[ignore]
+    fn chayula_tree_art_pipeline() {
+        check_tree("metadata/leagueskillgraphs/chayulatreepassiveskillgraph.psg", 100);
+    }
+
+    #[test]
+    #[ignore]
+    fn passive_tree_art_pipeline() {
+        check_tree("metadata/passiveskillgraph.psg", 100);
+    }
+}

@@ -1,6 +1,6 @@
 mod app;
 pub mod tree_view; // pub needed for actions
-mod content_view;
+pub mod content_view;
 mod dat_viewer;
 pub mod hex_viewer;
 pub mod settings_window;
@@ -9,11 +9,15 @@ pub mod json_viewer;
 pub mod syntax;
 pub mod chrome;
 pub mod psg_viewer;
+pub mod atlas_node_db;
+pub mod skill_tree_art;
+pub mod skill_tree_layout;
 pub mod sidebar;
 pub mod status_bar;
 pub mod theme;
 pub mod text_config_viewer;
 pub mod graphics_viewer;
+pub mod model_viewer;
 pub mod fxgraph_viewer;
 pub mod skeletal_viewer;
 pub mod components;

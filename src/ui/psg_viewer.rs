@@ -1,226 +1,148 @@
 #![allow(dead_code)]
-use eframe::egui;
 use crate::dat::psg::PsgFile;
-use serde::Deserialize;
+use crate::ui::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo};
+use crate::ui::skill_tree_art::{FrameArt, NodeFrameKind, SkillTreeArtSet};
+use crate::ui::skill_tree_layout::{self, TreeLayout, ASCENDANCY_PLATE_SIZE, CLASS_ILLUSTRATION_SIZE, MAIN_CIRCLE_SIZE};
+use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Vec2};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-// Embedded Skill Tree Assets
-const SKILLS_WEBP: &[u8] = include_bytes!("../../assets/skilltree/skills.webp");
-const SKILLS_DISABLED_WEBP: &[u8] = include_bytes!("../../assets/skilltree/skills-disabled.webp");
-const FRAME_WEBP: &[u8] = include_bytes!("../../assets/skilltree/frame.webp");
+// Art the client hardcodes rather than referencing from a DAT row.
+pub const PLUS_FRAME_NORMAL: &str = "Art/2DArt/UIImages/InGame/PassiveSkillScreenPlusFrameNormal";
+pub const PLUS_FRAME_ACTIVE: &str = "Art/2DArt/UIImages/InGame/PassiveSkillScreenPlusFrameActive";
+pub const MAIN_CIRCLE: &str = "Art/2DArt/UIImages/InGame/PassiveTree/PassiveTreeMainCircle";
+pub const MAIN_CIRCLE_ACTIVE: &str = "Art/2DArt/UIImages/InGame/PassiveTree/PassiveTreeMainCircleActive";
+pub const ATLAS_START: &str = "Art/2DArt/UIImages/InGame/AtlasScreen/AtlasPassiveSkillScreenStart";
+pub const BREACH_BACKDROP: &str = "Art/2DArt/UIImages/InGame/BreachLeague/BreachTreePassiveBackground";
+pub const BREACH_START: &str = "Art/2DArt/UIImages/InGame/BreachLeague/BreachTreePassiveSkillScreenStartingPoint";
 
-const SKILLS_COMPACT_JSON: &str = include_str!("../../assets/skilltree/skills_compact.json");
-const NODES_COMPACT_JSON: &str = include_str!("../../assets/skilltree/nodes_compact.json");
-const FRAME_JSON: &str = include_str!("../../assets/skilltree/frame.json");
-
-// Embedded Class Background Assets
-const BG_DRUID_WEBP: &[u8] = include_bytes!("../../assets/skilltree/background-druid.webp");
-const BG_HUNTRESS_WEBP: &[u8] = include_bytes!("../../assets/skilltree/background-huntress.webp");
-const BG_MERCENARY_WEBP: &[u8] = include_bytes!("../../assets/skilltree/background-mercenary.webp");
-const BG_MONK_WEBP: &[u8] = include_bytes!("../../assets/skilltree/background-monk.webp");
-const BG_RANGER_WEBP: &[u8] = include_bytes!("../../assets/skilltree/background-ranger.webp");
-const BG_SORCERESS_WEBP: &[u8] = include_bytes!("../../assets/skilltree/background-sorceress.webp");
-const BG_WARRIOR_WEBP: &[u8] = include_bytes!("../../assets/skilltree/background-warrior.webp");
-const BG_WITCH_WEBP: &[u8] = include_bytes!("../../assets/skilltree/background-witch.webp");
-
-const BG_DRUID_JSON: &str = include_str!("../../assets/skilltree/background-druid.json");
-const BG_HUNTRESS_JSON: &str = include_str!("../../assets/skilltree/background-huntress.json");
-const BG_MERCENARY_JSON: &str = include_str!("../../assets/skilltree/background-mercenary.json");
-const BG_MONK_JSON: &str = include_str!("../../assets/skilltree/background-monk.json");
-const BG_RANGER_JSON: &str = include_str!("../../assets/skilltree/background-ranger.json");
-const BG_SORCERESS_JSON: &str = include_str!("../../assets/skilltree/background-sorceress.json");
-const BG_WARRIOR_JSON: &str = include_str!("../../assets/skilltree/background-warrior.json");
-const BG_WITCH_JSON: &str = include_str!("../../assets/skilltree/background-witch.json");
-
-#[allow(dead_code)]
-#[derive(Deserialize, Debug, Clone)]
-pub(crate) struct CompactNode {
-    pub(crate) n: String,           // name
-    pub(crate) i: String,           // icon path
-    pub(crate) t: String,           // type: "normal", "notable", "keystone", "jewel", "mastery"
-    pub(crate) s: Vec<String>,      // stats description
-    #[serde(default)]
-    pub(crate) a: Option<String>,   // ascendancyId
-    #[serde(rename = "as")]
-    #[serde(default)]
-    pub(crate) as_start: bool,      // isAscendancyStart
+/// `Art/2DArt/PassiveTree/*CurvesTogether.dds`: nine quarter-arcs (one per
+/// orbit radius, centred on the sheet's bottom-right corner) plus a straight
+/// strip along the top. Tiled for straight connectors, so it needs wrapping.
+pub fn is_connector_sheet(path: &str) -> bool {
+    path.to_ascii_lowercase().contains("2dart/passivetree/")
 }
 
-#[derive(Deserialize, Debug, Clone)]
-struct FrameMeta {
-    frames: HashMap<String, FrameInfo>,
-}
+const SHEET_SIZE: f32 = 1436.0;
+/// Rows of the straight strip inside the sheet and the world height it is drawn at.
+const SHEET_LINE_ROWS: (f32, f32) = (32.0, 56.0);
+const LINE_WORLD_HEIGHT: f32 = 24.0;
+/// Half-width of the band sampled around an orbit ring (stroke is ~12 px).
+const ARC_BAND: f32 = 12.0;
 
-#[derive(Deserialize, Debug, Clone)]
-struct FrameInfo {
-    frame: FrameRect,
-}
+/// Frame textures are authored at one pixel per world unit (the official web
+/// tree draws them that way); icons sit inside at this fraction of the frame.
+const ICON_TO_FRAME: f32 = 0.69;
+/// Fallback frame sizes (px) when a texture hasn't loaded yet.
+const FRAME_PASSIVE: f32 = 104.0;
+const FRAME_NOTABLE: f32 = 152.0;
+const FRAME_KEYSTONE: f32 = 220.0;
+const FRAME_JEWEL: f32 = 104.0;
+const FRAME_ASC_SMALL: f32 = 160.0;
+const FRAME_ASC_NOTABLE: f32 = 208.0;
+const FRAME_ASC_MIDDLE: f32 = 92.0;
+/// `PassiveTreeMainCircleActive` (356 px) lights up one class-start roundel.
+/// It is authored for the roundel at the top of the ring — the ring segment
+/// arcs over the quatrefoil, which sits 47 px below the texture centre — so it
+/// is rotated by the start node's own polar angle and pushed outward to match.
+/// Sizes are in centre-ring pixels (see [`skill_tree_layout::RING_PX`]).
+const ACTIVE_MARKER_SIZE: f32 = 356.0 * skill_tree_layout::RING_PX;
+const ACTIVE_MARKER_OFFSET: f32 = 47.0 * skill_tree_layout::RING_PX;
 
-#[derive(Deserialize, Debug, Clone, Copy)]
-pub(crate) struct FrameRect {
-    pub(crate) x: u32,
-    pub(crate) y: u32,
-    pub(crate) w: u32,
-    pub(crate) h: u32,
-}
+const DIM: Color32 = Color32::from_rgb(120, 120, 120);
+const FULL: Color32 = Color32::WHITE;
 
-pub struct PsgDatabase {
-    pub nodes: HashMap<u32, CompactNode>,
-    pub skills: HashMap<String, [u32; 4]>,
-    pub frames: HashMap<String, FrameRect>,
-}
-
-pub struct PsgTextures {
-    pub skills: egui::TextureHandle,
-    pub skills_disabled: egui::TextureHandle,
-    pub frame: egui::TextureHandle,
-}
-
-struct PsgClassBg {
-    webp: &'static [u8],
-    json: &'static str,
-}
-
-fn get_class_bg_assets(class_name: &str) -> Option<PsgClassBg> {
-    match class_name {
-        "Druid" => Some(PsgClassBg { webp: BG_DRUID_WEBP, json: BG_DRUID_JSON }),
-        "Huntress" => Some(PsgClassBg { webp: BG_HUNTRESS_WEBP, json: BG_HUNTRESS_JSON }),
-        "Mercenary" => Some(PsgClassBg { webp: BG_MERCENARY_WEBP, json: BG_MERCENARY_JSON }),
-        "Monk" => Some(PsgClassBg { webp: BG_MONK_WEBP, json: BG_MONK_JSON }),
-        "Ranger" => Some(PsgClassBg { webp: BG_RANGER_WEBP, json: BG_RANGER_JSON }),
-        "Sorceress" => Some(PsgClassBg { webp: BG_SORCERESS_WEBP, json: BG_SORCERESS_JSON }),
-        "Warrior" => Some(PsgClassBg { webp: BG_WARRIOR_WEBP, json: BG_WARRIOR_JSON }),
-        "Witch" => Some(PsgClassBg { webp: BG_WITCH_WEBP, json: BG_WITCH_JSON }),
-        _ => None,
-    }
-}
-
-
-// Angle (radians) of a node on its orbit, measured clockwise from north.
-// PoE2 orbits are evenly spaced: theta = position / capacity * 2*pi.
-fn get_node_angle(radius: u32, position: u32, passives_per_orbit: &[u8]) -> f32 {
-    let r_idx = radius as usize;
-    let capacity = if let Some(&cap) = passives_per_orbit.get(r_idx) {
-        cap as f32
+/// Fallback frame size (world units) by node type.
+fn frame_size(info: &SkillGraphNodeInfo, in_ascendancy: bool) -> f32 {
+    if info.is_ascendancy_start {
+        FRAME_ASC_MIDDLE
+    } else if info.is_keystone {
+        FRAME_KEYSTONE
+    } else if info.is_jewel_socket {
+        FRAME_JEWEL
+    } else if info.is_notable {
+        if in_ascendancy { FRAME_ASC_NOTABLE } else { FRAME_NOTABLE }
+    } else if in_ascendancy {
+        FRAME_ASC_SMALL
     } else {
-        12.0
-    };
-
-    if capacity <= 0.0 {
-        return 0.0;
+        FRAME_PASSIVE
     }
-    (position as f32 / capacity) * std::f32::consts::TAU
+}
+
+fn node_frame_kind(info: &SkillGraphNodeInfo) -> NodeFrameKind {
+    if info.is_ascendancy_start {
+        NodeFrameKind::AscendancyStart
+    } else if info.is_keystone {
+        NodeFrameKind::Keystone
+    } else if info.is_notable {
+        NodeFrameKind::Notable
+    } else if info.is_jewel_socket {
+        NodeFrameKind::Jewel
+    } else if info.is_multiple_choice {
+        NodeFrameKind::MultipleChoice
+    } else {
+        NodeFrameKind::Passive
+    }
 }
 
 pub struct PsgViewerState {
     pub pan: egui::Vec2,
     pub zoom: f32,
-    // Toggle for JSON view vs Graph view
     pub show_graph: bool,
     pub hovered_node: Option<u32>,
-    pub textures: Option<Arc<PsgTextures>>,
-    pub db: Option<Arc<PsgDatabase>>,
-    pub selected_class: String,
-    pub selected_ascendancy: usize,
-    pub active_bg_textures: HashMap<String, (egui::TextureHandle, HashMap<String, FrameRect>)>,
-    pub autoloaded: bool,
+    /// Skill graph node database (name/stats/art by PassiveSkillGraphId),
+    /// shared across passive/atlas/league trees, set by content_view once
+    /// resolved.
+    pub skill_db: Option<Arc<SkillGraphDatabase>>,
+    /// `Characters` row shown in the centre and highlighted at its start.
+    pub selected_class: Option<usize>,
+    /// `Ascendancy` row drawn at full colour; the others are dimmed.
+    pub selected_ascendancy: Option<usize>,
+    pub dim_other_ascendancies: bool,
+    layout: Option<(usize, Arc<TreeLayout>)>,
 }
 
 impl Default for PsgViewerState {
     fn default() -> Self {
         Self {
-            pan: egui::Vec2::new(0.0, 0.0),
-            zoom: 0.2, // Start zoomed out
+            pan: egui::Vec2::ZERO,
+            zoom: 0.2,
             show_graph: true,
             hovered_node: None,
-            textures: None,
-            db: None,
-            selected_class: "Witch".to_string(),
-            selected_ascendancy: 0,
-            active_bg_textures: HashMap::new(),
-            autoloaded: false,
+            skill_db: None,
+            selected_class: None,
+            selected_ascendancy: None,
+            dim_other_ascendancies: true,
+            layout: None,
         }
     }
 }
 
 impl PsgViewerState {
-    pub fn ensure_initialized(&mut self, ctx: &egui::Context) {
-        if self.db.is_none() {
-            let nodes: HashMap<u32, CompactNode> = serde_json::from_str(NODES_COMPACT_JSON)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to parse nodes_compact.json: {:?}", e);
-                    HashMap::new()
-                });
-            let skills: HashMap<String, [u32; 4]> = serde_json::from_str(SKILLS_COMPACT_JSON)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to parse skills_compact.json: {:?}", e);
-                    HashMap::new()
-                });
-            let frame_meta: FrameMeta = serde_json::from_str(FRAME_JSON)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to parse frame.json: {:?}", e);
-                    FrameMeta { frames: HashMap::new() }
-                });
-            let frames = frame_meta.frames.into_iter().map(|(k, v)| (k, v.frame)).collect();
-
-            self.db = Some(Arc::new(PsgDatabase { nodes, skills, frames }));
-        }
-
-        if self.textures.is_none() {
-            let load_texture = |name: &str, bytes: &[u8]| -> Option<egui::TextureHandle> {
-                match image::load_from_memory(bytes) {
-                    Ok(img) => {
-                        let size = [img.width() as usize, img.height() as usize];
-                        let image_buffer = img.to_rgba8();
-                        let pixels = image_buffer.as_flat_samples();
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-                        Some(ctx.load_texture(name, color_image, Default::default()))
-                    }
-                    Err(e) => {
-                        log::error!("Failed to load texture {}: {:?}", name, e);
-                        None
-                    }
-                }
-            };
-
-            if let (Some(skills), Some(skills_disabled), Some(frame)) = (
-                load_texture("skills", SKILLS_WEBP),
-                load_texture("skills_disabled", SKILLS_DISABLED_WEBP),
-                load_texture("frame", FRAME_WEBP),
-            ) {
-                self.textures = Some(Arc::new(PsgTextures {
-                    skills,
-                    skills_disabled,
-                    frame,
-                }));
+    fn layout_for(&mut self, psg: &PsgFile) -> Arc<TreeLayout> {
+        let key = self.skill_db.as_ref().map(|db| Arc::as_ptr(db) as usize).unwrap_or(0);
+        if let Some((k, l)) = &self.layout {
+            if *k == key {
+                return l.clone();
             }
         }
+        let layout = Arc::new(skill_tree_layout::compute(psg, self.skill_db.as_deref()));
+        self.layout = Some((key, layout.clone()));
+        layout
     }
 
-    pub fn ensure_background_loaded(&mut self, ctx: &egui::Context, class_name: &str) {
-        if self.active_bg_textures.contains_key(class_name) {
-            return;
+    /// Default to the first playable class and its first ascendancy once the
+    /// database is available.
+    fn ensure_selection(&mut self) {
+        let Some(db) = &self.skill_db else { return };
+        if self.selected_class.map(|c| !db.playable_characters().contains(&c)).unwrap_or(true) {
+            self.selected_class = db.playable_characters().first().copied();
+            self.selected_ascendancy = None;
         }
-
-        if let Some(assets) = get_class_bg_assets(class_name) {
-            match image::load_from_memory(assets.webp) {
-                Ok(img) => {
-                    let size = [img.width() as usize, img.height() as usize];
-                    let image_buffer = img.to_rgba8();
-                    let pixels = image_buffer.as_flat_samples();
-                    let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
-                    let tex_name = format!("bg-{}", class_name.to_lowercase());
-                    let texture = ctx.load_texture(tex_name, color_image, Default::default());
-                    
-                    if let Ok(meta) = serde_json::from_str::<FrameMeta>(assets.json) {
-                        let frames = meta.frames.into_iter().map(|(k, v)| (k, v.frame)).collect();
-                        self.active_bg_textures.insert(class_name.to_string(), (texture, frames));
-                    }
-                }
-                Err(e) => {
-                    log::error!("Failed to load background texture for {}: {:?}", class_name, e);
-                }
+        if let Some(c) = self.selected_class {
+            let options = db.ascendancies_of(c);
+            if self.selected_ascendancy.map(|a| !options.contains(&a)).unwrap_or(true) {
+                self.selected_ascendancy = options.first().copied();
             }
         }
     }
@@ -229,76 +151,156 @@ impl PsgViewerState {
 pub struct PsgViewer<'a> {
     pub state: &'a mut PsgViewerState,
     pub psg: &'a PsgFile,
+    pub texture_cache: &'a HashMap<String, egui::TextureHandle>,
+    /// True while the skill graph database and/or its art textures are
+    /// still being fetched/decoded in the background — drives a small
+    /// loading indicator so pop-in doesn't look like nothing is happening.
+    pub is_loading_art: bool,
+    /// Textures still queued (shown next to the spinner).
+    pub art_pending: usize,
+}
+
+struct Canvas {
+    rect: Rect,
+    zoom: f32,
+    pan: Vec2,
+}
+
+impl Canvas {
+    fn to_screen(&self, p: Pos2) -> Pos2 {
+        (p.to_vec2() * self.zoom + self.pan).to_pos2() + self.rect.center().to_vec2()
+    }
+
+    fn world_rect(&self, center: Pos2, size: Vec2) -> Rect {
+        Rect::from_center_size(self.to_screen(center), size * self.zoom)
+    }
+
+    fn visible(&self, r: Rect) -> bool {
+        self.rect.intersects(r)
+    }
+}
+
+const UV_FULL: Rect = Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0));
+
+fn draw_image(painter: &egui::Painter, cv: &Canvas, tex: &egui::TextureHandle, center: Pos2, size: Vec2, tint: Color32) {
+    let rect = cv.world_rect(center, size);
+    if cv.visible(rect) {
+        painter.image(tex.id(), rect, UV_FULL, tint);
+    }
+}
+
+/// Draws `tex` centred on `center` (world) rotated by `angle` (radians,
+/// clockwise, 0 = as authored) — egui's image shape can't rotate, so build the quad.
+fn draw_image_rotated(painter: &egui::Painter, cv: &Canvas, tex: &egui::TextureHandle, center: Pos2, size: Vec2, angle: f32, tint: Color32) {
+    let rect = cv.world_rect(center, size);
+    if !cv.visible(rect) {
+        return;
+    }
+    let c = rect.center();
+    let (s, co) = angle.sin_cos();
+    let half = rect.size() / 2.0;
+    let rot = |v: Vec2| vec2(v.x * co - v.y * s, v.x * s + v.y * co);
+    let corners = [
+        (c + rot(vec2(-half.x, -half.y)), pos2(0.0, 0.0)),
+        (c + rot(vec2(half.x, -half.y)), pos2(1.0, 0.0)),
+        (c + rot(vec2(half.x, half.y)), pos2(1.0, 1.0)),
+        (c + rot(vec2(-half.x, half.y)), pos2(0.0, 1.0)),
+    ];
+    let mut mesh = egui::Mesh::with_texture(tex.id());
+    for (p, uv) in corners {
+        mesh.vertices.push(egui::epaint::Vertex { pos: p, uv, color: tint });
+    }
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 impl<'a> PsgViewer<'a> {
-    pub fn new(state: &'a mut PsgViewerState, psg: &'a PsgFile) -> Self {
-        Self { state, psg }
+    pub fn new(
+        state: &'a mut PsgViewerState,
+        psg: &'a PsgFile,
+        texture_cache: &'a HashMap<String, egui::TextureHandle>,
+        is_loading_art: bool,
+    ) -> Self {
+        Self { state, psg, texture_cache, is_loading_art, art_pending: 0 }
     }
 
-    fn detect_class_and_ascendancy(psg: &PsgFile, db: &PsgDatabase) -> Option<(String, usize)> {
-        let mut counts = std::collections::HashMap::new();
-        for group in &psg.groups {
-            if group.is_proxy {
-                continue;
+    /// Looks up a DDS path in the shared texture cache, trying the literal
+    /// path and a `.dds`-suffixed variant (DAT tables store some texture
+    /// paths with the extension and some without).
+    fn find_texture(&self, path: &str) -> Option<&egui::TextureHandle> {
+        if path.is_empty() {
+            return None;
+        }
+        self.texture_cache
+            .get(path)
+            .or_else(|| self.texture_cache.get(&format!("{}.dds", path)))
+    }
+
+    fn show_toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Switch to JSON View").clicked() {
+                self.state.show_graph = false;
             }
-            for node in &group.nodes {
-                if let Some(compact) = db.nodes.get(&node.skill_id) {
-                    if let Some(ref asc_id) = compact.a {
-                        if !asc_id.is_empty() {
-                            *counts.entry(asc_id.clone()).or_insert(0) += 1;
+            if ui.button("Reset View").clicked() {
+                self.state.pan = egui::Vec2::ZERO;
+                self.state.zoom = 0.2;
+            }
+            ui.label(format!("Zoom: {:.2}", self.state.zoom));
+            if ui.button("-").clicked() {
+                self.state.zoom *= 0.8;
+            }
+            if ui.button("+").clicked() {
+                self.state.zoom *= 1.25;
+            }
+
+            if self.psg.graph_type == 0 {
+                if let Some(db) = self.state.skill_db.clone() {
+                    ui.separator();
+                    let class_name = self.state.selected_class.and_then(|c| db.characters.get(c)).map(|c| c.name.clone()).unwrap_or_else(|| "Class".into());
+                    egui::ComboBox::from_id_salt("psg_class").selected_text(class_name).show_ui(ui, |ui| {
+                        for c in db.playable_characters() {
+                            if ui.selectable_label(self.state.selected_class == Some(c), &db.characters[c].name).clicked() {
+                                self.state.selected_class = Some(c);
+                                self.state.selected_ascendancy = None;
+                            }
+                        }
+                    });
+                    if let Some(c) = self.state.selected_class {
+                        let asc_name = self.state.selected_ascendancy.and_then(|a| db.ascendancies.get(a)).map(|a| a.name.clone()).unwrap_or_else(|| "Ascendancy".into());
+                        egui::ComboBox::from_id_salt("psg_ascendancy").selected_text(asc_name).show_ui(ui, |ui| {
+                            for a in db.ascendancies_of(c) {
+                                if ui.selectable_label(self.state.selected_ascendancy == Some(a), &db.ascendancies[a].name).clicked() {
+                                    self.state.selected_ascendancy = Some(a);
+                                }
+                            }
+                        });
+                    }
+                    ui.checkbox(&mut self.state.dim_other_ascendancies, "Dim other ascendancies");
+                    if let Some(a) = self.state.selected_ascendancy {
+                        if ui.small_button("Go to ascendancy").clicked() {
+                            let layout = self.state.layout_for(self.psg);
+                            if let Some(p) = layout.plates.iter().find(|p| p.ascendancy == a) {
+                                self.state.pan = -p.center.to_vec2() * self.state.zoom;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let mut best_asc = None;
-        let mut max_count = 0;
-        for (asc_id, count) in counts {
-            if count > max_count {
-                max_count = count;
-                best_asc = Some(asc_id);
-            }
-        }
-
-        if let Some(asc_id) = best_asc {
-            let len = asc_id.len();
-            if len > 1 {
-                let (class_part, num_part) = asc_id.split_at(len - 1);
-                if let Ok(num) = num_part.parse::<usize>() {
-                    let class_name = match class_part {
-                        "Witch" => "Witch",
-                        "Sorceress" => "Sorceress",
-                        "Druid" => "Druid",
-                        "Monk" => "Monk",
-                        "Ranger" => "Ranger",
-                        "Huntress" => "Huntress",
-                        "Warrior" => "Warrior",
-                        "Mercenary" => "Mercenary",
-                        _ => class_part,
-                    };
-                    return Some((class_name.to_string(), num));
+            if self.is_loading_art {
+                ui.add_space(8.0);
+                ui.spinner();
+                if self.art_pending > 0 {
+                    ui.label(format!("Loading art… {} left", self.art_pending));
+                } else {
+                    ui.label("Loading node data…");
                 }
             }
-        }
-
-        None
+        });
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        self.state.ensure_initialized(ui.ctx());
-
-        if !self.state.autoloaded {
-            if let Some(db) = &self.state.db {
-                if let Some((detected_class, detected_asc)) = Self::detect_class_and_ascendancy(self.psg, db) {
-                    self.state.selected_class = detected_class;
-                    self.state.selected_ascendancy = detected_asc;
-                }
-                self.state.autoloaded = true;
-            }
-        }
-
         if !self.state.show_graph {
             if ui.button("Switch to Graph View").clicked() {
                 self.state.show_graph = true;
@@ -308,78 +310,18 @@ impl<'a> PsgViewer<'a> {
             return;
         }
 
-        ui.horizontal(|ui| {
-            if ui.button("Switch to JSON View").clicked() {
-                self.state.show_graph = false;
-            }
-            if ui.button("Reset View").clicked() {
-                self.state.pan = egui::Vec2::ZERO;
-                self.state.zoom = 0.2;
-            }
-            ui.label(format!("Zoom: {:.2}", self.state.zoom));
-            
-            // Zoom controls
-            if ui.button("-").clicked() { self.state.zoom *= 0.8; }
-            if ui.button("+").clicked() { self.state.zoom *= 1.25; }
-
-            ui.separator();
-
-            // Class Picker
-            ui.label("Class:");
-            let old_class = self.state.selected_class.clone();
-            egui::ComboBox::from_id_salt("class_picker")
-                .selected_text(&self.state.selected_class)
-                .show_ui(ui, |ui| {
-                    for c in &["Druid", "Huntress", "Mercenary", "Monk", "Ranger", "Sorceress", "Warrior", "Witch"] {
-                        ui.selectable_value(&mut self.state.selected_class, c.to_string(), *c);
-                    }
-                });
-                
-            if old_class != self.state.selected_class {
-                self.state.selected_ascendancy = 0; // Reset ascendancy when class changes
-            }
-            
-            // Ascendancy Picker (dynamic based on selected class)
-            ui.label("Ascendancy:");
-            let ascendancies = match self.state.selected_class.as_str() {
-                "Witch" => vec!["None / Witch", "Infernalist", "Blood Mage", "Lich"],
-                "Sorceress" => vec!["None / Sorceress", "Stormweaver", "Chronomancer", "Disciple of Varashta"],
-                "Druid" => vec!["None / Druid", "Oracle", "Shaman"],
-                "Monk" => vec!["None / Monk", "Martial Artist", "Invoker", "Acolyte of Chayula"],
-                "Ranger" => vec!["None / Ranger", "Deadeye", "Pathfinder"],
-                "Huntress" => vec!["None / Huntress", "Amazon", "Spirit Walker", "Ritualist"],
-                "Warrior" => vec!["None / Warrior", "Titan", "Warbringer", "Smith of Kitava"],
-                "Mercenary" => vec!["None / Mercenary", "Tactician", "Witchhunter", "Gemling Legionnaire"],
-                _ => vec!["None"],
-            };
-            
-            egui::ComboBox::from_id_salt("ascendancy_picker")
-                .selected_text(ascendancies.get(self.state.selected_ascendancy).copied().unwrap_or("None"))
-                .show_ui(ui, |ui| {
-                    for (i, name) in ascendancies.iter().enumerate() {
-                        ui.selectable_value(&mut self.state.selected_ascendancy, i, *name);
-                    }
-                });
-        });
+        self.state.ensure_selection();
+        self.show_toolbar(ui);
 
         egui::Frame::canvas(ui.style()).show(ui, |ui| {
-            let (response, painter) = ui.allocate_painter(
-                ui.available_size(),
-                egui::Sense::drag(),
-            );
-            
-            // Handle input
+            let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::drag());
+
             if response.dragged() {
                 self.state.pan += response.drag_delta();
             }
-            
-            // Handle Zoom
             if response.hovered() {
-                // 1. Pinch or Ctrl+Scroll
                 let zoom_delta = ui.input(|i| i.zoom_delta());
                 self.state.zoom *= zoom_delta;
-                
-                // 2. Mouse Wheel (No Modifier)
                 ui.input(|i| {
                     if i.modifiers.is_none() {
                         let scroll = i.raw_scroll_delta.y;
@@ -390,353 +332,539 @@ impl<'a> PsgViewer<'a> {
                         }
                     }
                 });
-                
-                // Clamp Zoom
-                self.state.zoom = self.state.zoom.clamp(0.05, 5.0);
+                self.state.zoom = self.state.zoom.clamp(0.02, 5.0);
             }
 
-            // Transform helper
-            let zoom = self.state.zoom;
-            let pan = self.state.pan;
-            let center = response.rect.center().to_vec2();
-            let to_screen = move |pos: egui::Pos2| -> egui::Pos2 {
-                (pos.to_vec2() * zoom + pan).to_pos2() + center
-            };
-
-            // Orbit radii depend on graph type (passive tree vs atlas).
+            let cv = Canvas { rect: response.rect, zoom: self.state.zoom, pan: self.state.pan };
+            let layout = self.state.layout_for(self.psg);
+            let db = self.state.skill_db.clone();
             let orbit_radii = self.psg.orbit_radii();
 
-            // Calculate Node Positions
-            let mut node_positions: std::collections::HashMap<u32, egui::Pos2> = std::collections::HashMap::new();
-            struct PsgNodeInfo {
-                pos: egui::Pos2,
-                group_x: f32,
-                group_y: f32,
-                poe_arc: f32,
-                radius: f32,
-            }
-            let mut node_info: std::collections::HashMap<u32, PsgNodeInfo> = std::collections::HashMap::new();
-            
-            for group in &self.psg.groups {
-                if group.is_proxy {
-                    continue;
-                }
-                for node in &group.nodes {
-                    let r_idx = node.radius as usize;
-                    let radius = if r_idx < orbit_radii.len() { orbit_radii[r_idx] } else { node.radius as f32 * 50.0 };
-
-                    // Canonical PoE orbit placement: theta measured clockwise from north.
-                    //   x = group.x + r * sin(theta)
-                    //   y = group.y - r * cos(theta)
-                    // (matches the reference skilltree export exactly; egui y is already down).
-                    let theta = get_node_angle(node.radius, node.position, &self.psg.passives_per_orbit);
-
-                    let pos = egui::Pos2::new(
-                        group.x + theta.sin() * radius,
-                        group.y - theta.cos() * radius,
-                    );
-
-                    node_positions.insert(node.skill_id, pos);
-                    node_info.insert(node.skill_id, PsgNodeInfo {
-                        pos,
-                        group_x: group.x,
-                        group_y: group.y,
-                        poe_arc: theta,
-                        radius,
-                    });
-                }
-            }
-
-            // Determine Hovered Node
-            let db_opt = self.state.db.clone();
-            let mut new_hovered_node = None;
-
+            // ── Hover ─────────────────────────────────────────────
+            let mut hovered = None;
             if response.hovered() {
-                if let Some(cursor_pos) = ui.input(|i| i.pointer.latest_pos()) {
-                    let mut closest_dist = f32::MAX;
-                    for (&skill_id, &pos) in &node_positions {
-                        let screen_pos = to_screen(pos);
-                        let dist = (cursor_pos - screen_pos).length();
-                        
-                        let mut hit_radius = 16.0 * self.state.zoom;
-                        if let Some(db) = &db_opt {
-                            if let Some(compact) = db.nodes.get(&skill_id) {
-                                hit_radius = match compact.t.as_str() {
-                                    "keystone" => 45.0 * self.state.zoom,
-                                    "notable" => 30.0 * self.state.zoom,
-                                    "jewel" => 35.0 * self.state.zoom,
-                                    _ => 20.0 * self.state.zoom,
-                                };
-                            }
+                if let Some(cursor) = ui.input(|i| i.pointer.latest_pos()) {
+                    let mut best = f32::MAX;
+                    for (&id, &pos) in &layout.node_pos {
+                        if layout.is_node_hidden(id) {
+                            continue;
                         }
-                        hit_radius = hit_radius.max(12.0); // Minimum hit size
-                        
-                        if dist < hit_radius && dist < closest_dist {
-                            closest_dist = dist;
-                            new_hovered_node = Some(skill_id);
+                        let dist = (cursor - cv.to_screen(pos)).length();
+                        let info = db.as_ref().and_then(|d| d.nodes.get(&id));
+                        let world_r = info.map(|i| frame_size(i, layout.node_ascendancy(id).is_some()) / 2.0).unwrap_or(20.0);
+                        let hit = (world_r * cv.zoom).max(12.0);
+                        if dist < hit && dist < best {
+                            best = dist;
+                            hovered = Some(id);
                         }
                     }
                 }
             }
-            self.state.hovered_node = new_hovered_node;
+            self.state.hovered_node = hovered;
 
-            // Class backgrounds disabled (as requested, they don't align properly)
-            
-            // Draw Edges (Connections)
-            let mut unique_connections: std::collections::HashMap<(u32, u32), i32> = std::collections::HashMap::new();
+            let selected_asc = self.state.selected_ascendancy;
+            let dim_enabled = self.state.dim_other_ascendancies;
+            let tint_for = |asc: Option<usize>| -> Color32 {
+                match asc {
+                    Some(a) if dim_enabled && selected_asc.is_some() && selected_asc != Some(a) => DIM,
+                    _ => FULL,
+                }
+            };
 
-            for group in &self.psg.groups {
-                if group.is_proxy {
+            // ── Backdrops ─────────────────────────────────────────
+            match self.psg.graph_type {
+                1 => {
+                    if let Some(tex) = self.find_texture(crate::ui::atlas_node_db::ATLAS_MAIN_TREE_BG_PATH) {
+                        if let Some(bbox) = bbox_of(layout.node_pos.values()) {
+                            let size = bbox.size() * 1.15;
+                            draw_image(&painter, &cv, tex, bbox.center(), size, FULL);
+                        }
+                    }
+                }
+                2 => {
+                    if let Some(tex) = self.find_texture(BREACH_BACKDROP) {
+                        if let Some(bbox) = bbox_of(layout.node_pos.values()) {
+                            // 9960×8728 painted backdrop at one px per world unit.
+                            draw_image(&painter, &cv, tex, bbox.center(), vec2(9960.0, 8728.0), FULL);
+                        }
+                    }
+                }
+                _ => {
+                    // Illustration first: the ring carries the six class-start
+                    // roundels and its ornaments have to sit on top of the art.
+                    if let Some(db) = &db {
+                        if let Some(ch) = self.state.selected_class.and_then(|c| db.characters.get(c)) {
+                            if let Some(tex) = ch.illustration.as_deref().and_then(|p| self.find_texture(p)) {
+                                draw_image(&painter, &cv, tex, Pos2::ZERO, Vec2::splat(CLASS_ILLUSTRATION_SIZE), FULL);
+                            }
+                        }
+                    }
+                    if let Some(tex) = self.find_texture(MAIN_CIRCLE) {
+                        draw_image(&painter, &cv, tex, Pos2::ZERO, Vec2::splat(MAIN_CIRCLE_SIZE), FULL);
+                    }
+                    // Lights up the selected class's roundel, drawn over the ring.
+                    if let Some(db) = &db {
+                        let start = self.state.selected_class.and_then(|c| {
+                            self.psg.roots.iter().find(|r| db.nodes.get(r).map(|i| i.characters.contains(&c)).unwrap_or(false))
+                        });
+                        if let (Some(root), Some(tex)) = (start, self.find_texture(MAIN_CIRCLE_ACTIVE)) {
+                            if let Some(&p) = layout.node_pos.get(root) {
+                                let outward = p.to_vec2() / p.to_vec2().length().max(1.0);
+                                let angle = p.x.atan2(-p.y);
+                                let center = p + outward * ACTIVE_MARKER_OFFSET;
+                                draw_image_rotated(&painter, &cv, tex, center, Vec2::splat(ACTIVE_MARKER_SIZE), angle, FULL);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Ascendancy plates ─────────────────────────────────
+            if let Some(db) = &db {
+                if self.psg.graph_type == 0 {
+                    for plate in &layout.plates {
+                        let a = &db.ascendancies[plate.ascendancy];
+                        if let Some(tex) = a.illustration.as_deref().and_then(|p| self.find_texture(p)) {
+                            draw_image(&painter, &cv, tex, plate.center, Vec2::splat(ASCENDANCY_PLATE_SIZE), tint_for(Some(plate.ascendancy)));
+                        }
+                    }
+                } else if self.psg.graph_type == 2 {
+                    if let Some(tex) = self.find_texture(BREACH_START) {
+                        for root in &self.psg.roots {
+                            if let Some(&pos) = layout.node_pos.get(root) {
+                                draw_image(&painter, &cv, tex, pos, Vec2::splat(104.0), FULL);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Atlas subtree backgrounds + decorators ────────────
+            if let Some(db) = &db {
+                if self.psg.graph_type == 1 {
+                    self.draw_atlas_subtrees(&painter, &cv, db, &layout);
+                    for d in &db.decorators {
+                        let Some(&pos) = layout.node_pos.get(&d.node) else { continue };
+                        let center = pos + vec2(d.x, d.y);
+                        let angle = d.rotation_deg.to_radians();
+                        for path in [&d.background, &d.blocked] {
+                            if let Some(tex) = self.find_texture(path) {
+                                let [w, h] = tex.size();
+                                draw_image_rotated(&painter, &cv, tex, center, vec2(w as f32, h as f32) * d.scale * 2.0, angle, FULL);
+                            }
+                        }
+                    }
+                    if let Some(tex) = self.find_texture(ATLAS_START) {
+                        let [w, h] = tex.size();
+                        draw_image(&painter, &cv, tex, Pos2::ZERO, vec2(w as f32, h as f32), FULL);
+                    }
+                }
+            }
+
+            let tree_context = tree_context_for_graph_type(self.psg.graph_type);
+            let art_set = db.as_ref().and_then(|d| d.art_sets.get(tree_context));
+            let art_for_node = |id: u32| -> Option<&SkillTreeArtSet> {
+                let db = db.as_deref()?;
+                match layout.node_ascendancy(id) {
+                    Some(a) => db.ui_art_for_ascendancy(a).or(art_set),
+                    None => art_set,
+                }
+            };
+
+            // ── Group backgrounds (only groups the game flags) ────
+            if let Some(art) = art_set {
+                for (gi, group) in self.psg.groups.iter().enumerate() {
+                    if group.is_proxy || group.nodes.is_empty() || layout.group_hidden[gi] {
+                        continue;
+                    }
+                    if group.background_type == 0 && group.background_flag == 0 {
+                        continue;
+                    }
+                    let set = layout.group_ascendancy[gi].and_then(|a| db.as_ref().and_then(|d| d.ui_art_for_ascendancy(a))).unwrap_or(art);
+                    let (path, half) = match group.background_type {
+                        2 => (&set.group_background.small, false),
+                        4 => (&set.group_background.medium, false),
+                        _ => (&set.group_background.large, set.group_background.large.to_ascii_lowercase().contains("half")),
+                    };
+                    let Some(tex) = self.find_texture(path) else { continue };
+                    let [w, h] = tex.size();
+                    let (w, h) = (w as f32, h as f32);
+                    let origin = pos2(group.x, group.y) + layout.group_offset[gi];
+                    let tint = tint_for(layout.group_ascendancy[gi]);
+                    if half {
+                        // Half images hold the top half; the bottom is the mirror.
+                        let top = cv.world_rect(pos2(origin.x, origin.y - h / 2.0), vec2(w, h));
+                        let bottom = cv.world_rect(pos2(origin.x, origin.y + h / 2.0), vec2(w, h));
+                        if cv.visible(top.union(bottom)) {
+                            painter.image(tex.id(), top, UV_FULL, tint);
+                            painter.image(tex.id(), bottom, Rect::from_min_max(pos2(0.0, 1.0), pos2(1.0, 0.0)), tint);
+                        }
+                    } else {
+                        draw_image(&painter, &cv, tex, origin, vec2(w, h), tint);
+                    }
+                }
+            }
+
+            // ── Connectors ────────────────────────────────────────
+            let mut unique: HashMap<(u32, u32), i32> = HashMap::new();
+            for (gi, group) in self.psg.groups.iter().enumerate() {
+                if group.is_proxy || layout.group_hidden[gi] {
                     continue;
                 }
                 for node in &group.nodes {
                     for conn in &node.connections {
-                        let (a, b) = if node.skill_id < conn.node_id {
-                            (node.skill_id, conn.node_id)
-                        } else {
-                            (conn.node_id, node.skill_id)
-                        };
-                        
-                        let entry = unique_connections.entry((a, b)).or_insert(0);
-                        if conn.orbit != 0 && conn.orbit != 2147483647 {
-                            let sign_multiplier = if node.skill_id < conn.node_id { 1 } else { -1 };
-                            *entry = conn.orbit * sign_multiplier;
+                        if layout.is_node_hidden(conn.node_id) {
+                            continue;
+                        }
+                        let (a, b) = if node.skill_id < conn.node_id { (node.skill_id, conn.node_id) } else { (conn.node_id, node.skill_id) };
+                        let entry = unique.entry((a, b)).or_insert(0);
+                        if conn.orbit != 0 && conn.orbit != i32::MAX {
+                            let sign = if node.skill_id < conn.node_id { 1 } else { -1 };
+                            *entry = conn.orbit * sign;
                         }
                     }
                 }
             }
 
-             for ((start_id, end_id), orbit_idx) in unique_connections {
-                  if let (Some(start_node), Some(end_node)) = (node_info.get(&start_id), node_info.get(&end_id)) {
-                      // Skip connections crossing the ascendancy boundary to keep layout clean
-                      if let Some(db) = &db_opt {
-                          let start_asc = db.nodes.get(&start_id).and_then(|n| n.a.as_deref()).unwrap_or("");
-                          let end_asc = db.nodes.get(&end_id).and_then(|n| n.a.as_deref()).unwrap_or("");
-                          if start_asc != end_asc {
-                              continue;
-                          }
-                      }
-                     let start_screen = to_screen(start_node.pos);
-                     let end_screen = to_screen(end_node.pos);
+            for ((a, b), orbit_idx) in unique {
+                let (Some(&pa), Some(&pb)) = (layout.node_pos.get(&a), layout.node_pos.get(&b)) else { continue };
+                let asc_a = layout.node_ascendancy(a);
+                let asc_b = layout.node_ascendancy(b);
+                // Ascendancy clusters are self-contained; a cross-link is a data artefact.
+                if asc_a != asc_b {
+                    continue;
+                }
+                let margin = 1400.0 * cv.zoom;
+                let sa = cv.to_screen(pa);
+                let sb = cv.to_screen(pb);
+                if !cv.rect.expand(margin).contains(sa) && !cv.rect.expand(margin).contains(sb) {
+                    continue;
+                }
+                let active = self.state.hovered_node == Some(a) || self.state.hovered_node == Some(b);
+                let tint = tint_for(asc_a);
+                let sheet = art_for_node(a).map(|s| if active { &s.connection.active } else { &s.connection.normal }).and_then(|p| self.find_texture(p));
 
-                     // Check visibility (culling)
-                     let margin = 500.0 * self.state.zoom;
-                     if !response.rect.expand(margin).contains(start_screen) && !response.rect.expand(margin).contains(end_screen) {
-                          continue;
-                     }
+                let same_group = layout.node_group.get(&a) == layout.node_group.get(&b);
+                let (ga, gb) = (layout.node_group.get(&a).copied(), layout.node_group.get(&b).copied());
+                let (na, nb) = (self.node_in_group(ga, a), self.node_in_group(gb, b));
 
-                     let is_active = self.state.hovered_node == Some(start_id) || self.state.hovered_node == Some(end_id);
-                     let stroke = if is_active {
-                         egui::Stroke::new(2.5 * self.state.zoom, egui::Color32::from_rgb(0, 220, 255))
-                     } else {
-                         egui::Stroke::new(1.0 * self.state.zoom, egui::Color32::from_rgb(160, 115, 60))
-                     };
+                let mut drawn = false;
+                if let (Some(na), Some(nb)) = (na, nb) {
+                    if same_group && na.radius == nb.radius && na.radius > 0 {
+                        let gi = ga.unwrap();
+                        let center = pos2(self.psg.groups[gi].x, self.psg.groups[gi].y) + layout.group_offset[gi];
+                        let r = orbit_radii[na.radius as usize];
+                        let a1 = skill_tree_layout::orbit_angle(na.radius, na.position, &self.psg.passives_per_orbit);
+                        let a2 = skill_tree_layout::orbit_angle(nb.radius, nb.position, &self.psg.passives_per_orbit);
+                        self.draw_arc_between(&painter, &cv, sheet, center, r, na.radius as usize, a1, a2, tint, active);
+                        drawn = true;
+                    } else if orbit_idx != 0 {
+                        let orbit = orbit_idx.unsigned_abs() as usize;
+                        if let Some(&r) = orbit_radii.get(orbit) {
+                            let d = pb - pa;
+                            let dist = d.length();
+                            if r > 0.0 && dist < r * 2.0 && dist > 0.0 {
+                                let perp = (r * r - dist * dist / 4.0).sqrt() * if orbit_idx > 0 { 1.0 } else { -1.0 };
+                                let center = pos2(pa.x + d.x / 2.0 + perp * (d.y / dist), pa.y + d.y / 2.0 - perp * (d.x / dist));
+                                let a1 = std::f32::consts::FRAC_PI_2 + (pa.y - center.y).atan2(pa.x - center.x);
+                                let a2 = std::f32::consts::FRAC_PI_2 + (pb.y - center.y).atan2(pb.x - center.x);
+                                self.draw_arc_between(&painter, &cv, sheet, center, r, orbit, a1, a2, tint, active);
+                                drawn = true;
+                            }
+                        }
+                    }
+                }
+                if !drawn {
+                    self.draw_line(&painter, &cv, sheet, pa, pb, tint, active);
+                }
+            }
 
-                     if orbit_idx != 0 {
-                          // Draw Arc
-                          // 1. Same group, same radius -> draw using the group center
-                          if (start_node.group_x - end_node.group_x).abs() < 0.1 
-                             && (start_node.group_y - end_node.group_y).abs() < 0.1 
-                             && (start_node.radius - end_node.radius).abs() < 0.1 
-                          {
-                              let group_x = start_node.group_x;
-                              let group_y = start_node.group_y;
-                              let radius = start_node.radius;
+            // ── Nodes ─────────────────────────────────────────────
+            for (gi, group) in self.psg.groups.iter().enumerate() {
+                if group.is_proxy || layout.group_hidden[gi] {
+                    continue;
+                }
+                for node in &group.nodes {
+                    let Some(&pos) = layout.node_pos.get(&node.skill_id) else { continue };
+                    let screen_pos = cv.to_screen(pos);
+                    if !cv.rect.expand(80.0).contains(screen_pos) {
+                        continue;
+                    }
+                    let is_hovered = self.state.hovered_node == Some(node.skill_id);
+                    let info = db.as_ref().and_then(|d| d.nodes.get(&node.skill_id));
+                    let tint = tint_for(layout.group_ascendancy[gi]);
 
-                              let arc1 = start_node.poe_arc;
-                              let arc2 = end_node.poe_arc;
+                    let Some(info) = info else {
+                        painter.circle(screen_pos, 4.5 * cv.zoom, Color32::from_rgb(100, 150, 250), egui::Stroke::NONE);
+                        continue;
+                    };
+                    if !info.characters.is_empty() {
+                        // Class start: the plate is the node.
+                        continue;
+                    }
+                    if self.psg.graph_type == 1 && info.atlas_subtree_icon.is_some() {
+                        if let Some(tex) = info.atlas_subtree_icon.as_deref().and_then(|p| self.find_texture(p)) {
+                            let [w, h] = tex.size();
+                            draw_image(&painter, &cv, tex, pos, vec2(w as f32, h as f32) * 2.0, tint);
+                            continue;
+                        }
+                    }
 
-                              let lo = if arc1 < arc2 { arc1 } else { arc2 };
-                              let hi = if arc1 < arc2 { arc2 } else { arc1 };
+                    let in_asc = layout.group_ascendancy[gi].is_some();
+                    let art = art_for_node(node.skill_id);
+                    let frame: Option<(String, String)> = if info.is_attribute {
+                        Some((PLUS_FRAME_NORMAL.to_string(), PLUS_FRAME_ACTIVE.to_string()))
+                    } else {
+                        let f: Option<&FrameArt> = info
+                            .node_frame_art
+                            .and_then(|i| db.as_ref().and_then(|d| d.node_frames.get(i)))
+                            .or_else(|| art.and_then(|a| a.frames.get(&node_frame_kind(info))));
+                        f.map(|f| (f.normal.clone(), f.active.clone()))
+                    };
+                    let frame_tex = frame.as_ref().and_then(|(n, a)| self.find_texture(if is_hovered { a } else { n }));
+                    // Frames are drawn at their pixel size; the icon fills the frame interior.
+                    let frame_size = frame_tex.map(|t| t.size()[0] as f32).unwrap_or_else(|| frame_size(info, in_asc));
+                    let icon_size = if info.is_ascendancy_start || info.is_jewel_socket { 0.0 } else { frame_size * ICON_TO_FRAME };
+                    let icon_tex = if icon_size > 0.0 { info.icon.as_deref().and_then(|p| self.find_texture(p)) } else { None };
 
-                              let (start_arc, end_arc) = if hi - lo >= std::f32::consts::PI {
-                                  // Sweep the short way around the orbit instead of the long way.
-                                  (hi, lo + std::f32::consts::TAU)
-                              } else {
-                                  (lo, hi)
-                              };
+                    if icon_tex.is_none() && frame_tex.is_none() {
+                        let (r, color) = if info.is_keystone {
+                            (10.0, Color32::from_rgb(255, 90, 120))
+                        } else if info.is_notable {
+                            (7.5, Color32::from_rgb(255, 200, 50))
+                        } else if info.is_jewel_socket {
+                            (7.0, Color32::from_rgb(0, 220, 180))
+                        } else {
+                            (4.5, Color32::from_rgb(100, 150, 250))
+                        };
+                        painter.circle(screen_pos, r * cv.zoom, color, egui::Stroke::new(1.0_f32, Color32::from_gray(20)));
+                        continue;
+                    }
+                    if let Some(tex) = icon_tex {
+                        draw_image(&painter, &cv, tex, pos, Vec2::splat(icon_size), tint);
+                    }
+                    if let Some(tex) = frame_tex {
+                        draw_image(&painter, &cv, tex, pos, Vec2::splat(frame_size), tint);
+                    }
+                    if is_hovered {
+                        painter.circle_stroke(screen_pos, frame_size * 0.6 * cv.zoom, egui::Stroke::new(2.0_f32, Color32::WHITE));
+                    }
+                }
+            }
 
-                              let mut points = Vec::new();
-                              let steps = 15;
-                              for i in 0..=steps {
-                                  let t = i as f32 / steps as f32;
-                                  let th = start_arc + (end_arc - start_arc) * t;
-                                  let px = group_x + radius * th.sin();
-                                  let py = group_y - radius * th.cos();
-                                  points.push(to_screen(egui::Pos2::new(px, py)));
-                              }
-
-                              painter.add(egui::Shape::Path(egui::epaint::PathShape::line(points, stroke)));
-                              continue;
-                          } else {
-                              // 2. Fallback: Perpendicular sphere intersection
-                              let start_pos = start_node.pos;
-                              let end_pos = end_node.pos;
-                              let orbit_abs = orbit_idx.abs() as usize;
-                              let radius = if orbit_abs < orbit_radii.len() { orbit_radii[orbit_abs] } else { 0.0 };
-                              
-                              if radius > 0.0 {
-                                 let dx = end_pos.x - start_pos.x;
-                                 let dy = end_pos.y - start_pos.y;
-                                 let dist = (dx*dx + dy*dy).sqrt();
-                                 
-                                 if dist < radius * 2.0 {
-                                     let h = (radius * radius - (dist * dist) / 4.0).sqrt();
-                                     let sign = if orbit_idx > 0 { 1.0 } else { -1.0 };
-                                     
-                                     let mid_x = start_pos.x + dx / 2.0;
-                                     let mid_y = start_pos.y + dy / 2.0;
-                                     
-                                     let perp_x = (dy / dist) * h * sign;
-                                     let perp_y = (-dx / dist) * h * sign;
-                                     
-                                     let cx = mid_x + perp_x;
-                                     let cy = mid_y + perp_y;
-                                     
-                                     let angle1 = (start_pos.y - cy).atan2(start_pos.x - cx);
-                                     let angle2 = (end_pos.y - cy).atan2(end_pos.x - cx);
-                                     
-                                     let mut diff = angle2 - angle1;
-                                     if diff < -std::f32::consts::PI { diff += std::f32::consts::TAU; }
-                                     if diff > std::f32::consts::PI { diff -= std::f32::consts::TAU; }
-                                     
-                                     let mut points = Vec::new();
-                                     let steps = 15;
-                                     for i in 0..=steps {
-                                         let t = i as f32 / steps as f32;
-                                         let a = angle1 + diff * t;
-                                         let px = cx + radius * a.cos();
-                                         let py = cy + radius * a.sin();
-                                         points.push(to_screen(egui::Pos2::new(px, py)));
-                                     }
-                                     
-                                     painter.add(egui::Shape::Path(egui::epaint::PathShape::line(points, stroke)));
-                                     continue;
-                                 }
-                              }
-                          }
-                      }
-
-                      // Straight Line Fallback
-                      painter.line_segment([start_screen, end_screen], stroke);
-                  }
-             }
-
-             // Draw Nodes (Simple Vector Circles for cleaner presentation and proper alignment)
-             for group in &self.psg.groups {
-                 if group.is_proxy {
-                     continue;
-                 }
-                 for node in &group.nodes {
-                     if let Some(&pos) = node_positions.get(&node.skill_id) {
-                          let screen_pos = to_screen(pos);
-                          
-                          // Culling
-                          if !response.rect.expand(50.0).contains(screen_pos) {
-                              continue;
-                          }
-
-                          let mut radius = 6.0 * self.state.zoom;
-                          let mut color = if self.psg.roots.contains(&node.skill_id) {
-                              egui::Color32::GOLD
-                          } else {
-                              egui::Color32::from_rgb(100, 100, 200)
-                          };
-                          let is_hovered = self.state.hovered_node == Some(node.skill_id);
-
-                          if let Some(db) = &db_opt {
-                              if let Some(compact) = db.nodes.get(&node.skill_id) {
-                                  let (r_val, c_val) = match compact.t.as_str() {
-                                      "keystone" => (10.0, egui::Color32::from_rgb(255, 90, 120)),   // Keystone: larger pink/rose
-                                      "notable" => (7.5, egui::Color32::from_rgb(255, 200, 50)),     // Notable: orange/gold
-                                      "jewel" => (7.0, egui::Color32::from_rgb(0, 220, 180)),        // Jewel: teal
-                                      "mastery" => (6.0, egui::Color32::from_rgb(180, 100, 255)),    // Mastery: purple
-                                      _ => (4.5, egui::Color32::from_rgb(100, 150, 250)),            // Normal: blue-gray
-                                  };
-                                  radius = r_val * self.state.zoom;
-                                  color = c_val;
-                              }
-                          }
-
-                          // Highlight hovered and root nodes
-                          let stroke = if is_hovered {
-                              let stroke_color = if ui.visuals().dark_mode {
-                                  egui::Color32::WHITE
-                              } else {
-                                  egui::Color32::from_rgb(20, 20, 20)
-                              };
-                              egui::Stroke::new(2.0 * self.state.zoom, stroke_color)
-                          } else if self.psg.roots.contains(&node.skill_id) {
-                              egui::Stroke::new(1.5 * self.state.zoom, egui::Color32::from_rgb(255, 215, 0)) // Gold
-                          } else {
-                              let border_color = if ui.visuals().dark_mode {
-                                  egui::Color32::from_rgb(20, 20, 20)
-                              } else {
-                                  egui::Color32::from_rgb(160, 160, 165)
-                              };
-                              egui::Stroke::new(1.0 * self.state.zoom, border_color)  // Subtle border
-                          };
-
-                          painter.circle(screen_pos, radius, color, stroke);
-                     }
-                 }
-             }
-
-             // Hover interaction & Detailed tooltip
-             if let Some(hovered_id) = self.state.hovered_node {
-                 egui::show_tooltip(ui.ctx(), ui.layer_id(), egui::Id::new(hovered_id), |ui| {
-                     if let Some(db) = &db_opt {
-                         if let Some(compact) = db.nodes.get(&hovered_id) {
-                             let name_color = match compact.t.as_str() {
-                                 "keystone" => egui::Color32::from_rgb(255, 90, 120),  // Pink/Rose
-                                 "notable" => egui::Color32::from_rgb(255, 200, 50),   // Orange/Gold
-                                 "jewel" => egui::Color32::from_rgb(0, 220, 180),      // Teal
-                                 _ => if ui.visuals().dark_mode {
-                                     egui::Color32::WHITE
-                                 } else {
-                                     egui::Color32::from_rgb(24, 24, 28)
-                                 },
-                             };
-                             
-                             ui.vertical(|ui| {
-                                 ui.label(egui::RichText::new(&compact.n).color(name_color).strong().size(15.0));
-                                 
-                                 let type_label = match compact.t.as_str() {
-                                     "keystone" => "Keystone Passive Skill",
-                                     "notable" => "Notable Passive Skill",
-                                     "jewel" => "Jewel Socket",
-                                     "mastery" => "Passive Skill Mastery",
-                                     _ => "Passive Skill",
-                                 };
-                                 let type_color = if ui.visuals().dark_mode {
-                                     egui::Color32::from_rgb(150, 150, 150)
-                                 } else {
-                                     egui::Color32::from_rgb(100, 100, 110)
-                                 };
-                                 ui.label(egui::RichText::new(type_label).color(type_color).size(11.0).italics());
-                                 
-                                 if !compact.s.is_empty() {
-                                     ui.add_space(4.0);
-                                     ui.separator();
-                                     ui.add_space(4.0);
-                                     for stat in &compact.s {
-                                         let stat_color = if ui.visuals().dark_mode {
-                                             egui::Color32::from_rgb(180, 210, 255)
-                                         } else {
-                                             egui::Color32::from_rgb(37, 99, 235)
-                                         };
-                                         ui.label(egui::RichText::new(stat).color(stat_color).size(12.0));
-                                     }
-                                 }
-                             });
-                         } else {
-                             ui.label(format!("Skill ID: {}", hovered_id));
-                         }
-                     } else {
-                         ui.label(format!("Skill ID: {}", hovered_id));
-                     }
-                 });
-             }
+            if let Some(hovered_id) = self.state.hovered_node {
+                self.show_tooltip(ui, hovered_id, db.as_deref());
+            }
         });
     }
+
+    fn node_in_group(&self, gi: Option<usize>, id: u32) -> Option<&crate::dat::psg::PsgNode> {
+        self.psg.groups.get(gi?)?.nodes.iter().find(|n| n.skill_id == id)
+    }
+
+    /// Arc on orbit `orbit` (radius `r`) from angle `a1` to `a2` (clockwise
+    /// from north). The sheet holds all nine orbit rings concentric on its
+    /// bottom-right corner, so a single quad would show every smaller ring
+    /// too; instead the arc is tessellated as a thin band whose UVs follow the
+    /// ring at radius `r` inside the sheet.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_arc_between(&self, painter: &egui::Painter, cv: &Canvas, sheet: Option<&egui::TextureHandle>, center: Pos2, r: f32, orbit: usize, a1: f32, a2: f32, tint: Color32, active: bool) {
+        use std::f32::consts::{PI, TAU};
+        let (mut lo, mut hi) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
+        let mut arc = hi - lo;
+        if arc >= PI {
+            std::mem::swap(&mut lo, &mut hi);
+            arc = TAU - arc;
+        }
+        let _ = orbit;
+        let Some(sheet) = sheet else {
+            self.draw_arc_fallback(painter, cv, center, r, lo, arc, tint, active);
+            return;
+        };
+        let bounds = Rect::from_center_size(cv.to_screen(center), Vec2::splat((r + ARC_BAND) * 2.0 * cv.zoom));
+        if !cv.visible(bounds) {
+            return;
+        }
+        let steps = ((arc / 4.0_f32.to_radians()).ceil() as usize).clamp(3, 96);
+        let mut mesh = egui::Mesh::with_texture(sheet.id());
+        for i in 0..=steps {
+            let t = lo + arc * i as f32 / steps as f32;
+            let dir = vec2(t.sin(), -t.cos());
+            // Any point on the ring maps onto the sheet's quarter-arc by its angle within a quadrant.
+            let q = t.rem_euclid(std::f32::consts::FRAC_PI_2);
+            for rho in [r - ARC_BAND, r + ARC_BAND] {
+                let uv = pos2(1.0 - rho * q.cos() / SHEET_SIZE, 1.0 - rho * q.sin() / SHEET_SIZE);
+                mesh.vertices.push(egui::epaint::Vertex { pos: cv.to_screen(center + dir * rho), uv, color: tint });
+            }
+            if i > 0 {
+                let b = (i * 2) as u32;
+                mesh.add_triangle(b - 2, b - 1, b);
+                mesh.add_triangle(b - 1, b + 1, b);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn draw_arc_fallback(&self, painter: &egui::Painter, cv: &Canvas, center: Pos2, r: f32, start: f32, arc: f32, tint: Color32, active: bool) {
+        let steps = 16;
+        let points: Vec<Pos2> = (0..=steps)
+            .map(|i| {
+                let th = start + arc * i as f32 / steps as f32;
+                cv.to_screen(pos2(center.x + r * th.sin(), center.y - r * th.cos()))
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, fallback_stroke(cv, tint, active)));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_line(&self, painter: &egui::Painter, cv: &Canvas, sheet: Option<&egui::TextureHandle>, a: Pos2, b: Pos2, tint: Color32, active: bool) {
+        let Some(sheet) = sheet else {
+            painter.line_segment([cv.to_screen(a), cv.to_screen(b)], fallback_stroke(cv, tint, active));
+            return;
+        };
+        let d = b - a;
+        let len = d.length();
+        if len <= 0.0 {
+            return;
+        }
+        let n = vec2(-d.y, d.x) / len * (LINE_WORLD_HEIGHT / 2.0);
+        let (v0, v1) = (SHEET_LINE_ROWS.0 / SHEET_SIZE, SHEET_LINE_ROWS.1 / SHEET_SIZE);
+        let u_end = len / SHEET_SIZE;
+        let quad = [(a - n, pos2(0.0, v0)), (b - n, pos2(u_end, v0)), (b + n, pos2(u_end, v1)), (a + n, pos2(0.0, v1))];
+        let bounds = Rect::from_points(&[cv.to_screen(a), cv.to_screen(b)]).expand(LINE_WORLD_HEIGHT * cv.zoom);
+        if !cv.visible(bounds) {
+            return;
+        }
+        let mut mesh = egui::Mesh::with_texture(sheet.id());
+        for (pt, uv) in quad {
+            mesh.vertices.push(egui::epaint::Vertex { pos: cv.to_screen(pt), uv, color: tint });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.add_triangle(0, 2, 3);
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Atlas subtree themed backgrounds (Abyss/Breach/…): membership is a
+    /// flood-fill from each root through the psg's own connections, the art
+    /// comes from `PassiveSkills.AtlasSubTree` on the root node.
+    fn draw_atlas_subtrees(&self, painter: &egui::Painter, cv: &Canvas, db: &SkillGraphDatabase, layout: &TreeLayout) {
+        if self.psg.roots.is_empty() {
+            return;
+        }
+        let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
+        for group in &self.psg.groups {
+            for node in &group.nodes {
+                for conn in &node.connections {
+                    adjacency.entry(node.skill_id).or_default().push(conn.node_id);
+                    adjacency.entry(conn.node_id).or_default().push(node.skill_id);
+                }
+            }
+        }
+        let mut root_of: HashMap<u32, u32> = HashMap::new();
+        for &root in &self.psg.roots {
+            if root_of.contains_key(&root) {
+                continue;
+            }
+            let mut stack = vec![root];
+            root_of.insert(root, root);
+            while let Some(cur) = stack.pop() {
+                if let Some(nb) = adjacency.get(&cur) {
+                    for &n in nb {
+                        if let std::collections::hash_map::Entry::Vacant(e) = root_of.entry(n) {
+                            e.insert(root);
+                            stack.push(n);
+                        }
+                    }
+                }
+            }
+        }
+        let mut bbox: HashMap<u32, Rect> = HashMap::new();
+        for (&node, &root) in &root_of {
+            if let Some(&p) = layout.node_pos.get(&node) {
+                bbox.entry(root).and_modify(|r| *r = r.union(Rect::from_min_max(p, p))).or_insert(Rect::from_min_max(p, p));
+            }
+        }
+        for &root in &self.psg.roots {
+            let Some(info) = db.nodes.get(&root) else { continue };
+            let Some((bg, ix, iy)) = &info.atlas_subtree_background else { continue };
+            let (Some(&pos), Some(b)) = (layout.node_pos.get(&root), bbox.get(&root)) else { continue };
+            let Some(tex) = self.find_texture(bg) else { continue };
+            let diameter = (b.width().max(b.height()) * 1.9).max(200.0);
+            draw_image(painter, cv, tex, pos + vec2(*ix, *iy), Vec2::splat(diameter), FULL);
+        }
+    }
+
+    fn show_tooltip(&self, ui: &egui::Ui, hovered_id: u32, db: Option<&SkillGraphDatabase>) {
+        egui::show_tooltip(ui.ctx(), ui.layer_id(), egui::Id::new(hovered_id), |ui| {
+            let Some(info) = db.and_then(|d| d.nodes.get(&hovered_id)) else {
+                ui.label(format!("Skill ID: {}", hovered_id));
+                return;
+            };
+            let dark = ui.visuals().dark_mode;
+            let name_color = if info.is_keystone {
+                Color32::from_rgb(255, 90, 120)
+            } else if info.is_notable {
+                Color32::from_rgb(255, 200, 50)
+            } else if info.is_jewel_socket {
+                Color32::from_rgb(0, 220, 180)
+            } else if dark {
+                Color32::WHITE
+            } else {
+                Color32::from_rgb(24, 24, 28)
+            };
+            let display_name = if info.name.is_empty() { format!("Skill ID: {}", hovered_id) } else { info.name.clone() };
+            ui.label(egui::RichText::new(&display_name).color(name_color).strong().size(15.0));
+            let mut type_label = if info.is_keystone {
+                "Keystone Passive Skill"
+            } else if info.is_notable {
+                "Notable Passive Skill"
+            } else if info.is_jewel_socket {
+                "Jewel Socket"
+            } else if info.is_attribute {
+                "Attribute"
+            } else {
+                "Passive Skill"
+            }
+            .to_string();
+            if let Some(a) = info.ascendancy.and_then(|a| db.and_then(|d| d.ascendancies.get(a))) {
+                type_label = format!("{} · {}", a.name, type_label);
+            }
+            let type_color = if dark { Color32::from_rgb(150, 150, 150) } else { Color32::from_rgb(100, 100, 110) };
+            ui.label(egui::RichText::new(type_label).color(type_color).size(11.0).italics());
+            if !info.stat_lines.is_empty() {
+                ui.add_space(4.0);
+                ui.separator();
+                ui.add_space(4.0);
+                let stat_color = if dark { Color32::from_rgb(180, 210, 255) } else { Color32::from_rgb(37, 99, 235) };
+                for stat in &info.stat_lines {
+                    ui.label(egui::RichText::new(stat).color(stat_color).size(12.0));
+                }
+            }
+            if let Some(flavour) = &info.flavour_text {
+                if !flavour.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(flavour).italics().size(11.0).color(Color32::GRAY));
+                }
+            }
+        });
+    }
+}
+
+fn fallback_stroke(cv: &Canvas, tint: Color32, active: bool) -> egui::Stroke {
+    let base = if active { Color32::from_rgb(0, 220, 255) } else { Color32::from_rgb(160, 115, 60) };
+    let color = if tint == DIM { Color32::from_rgb(base.r() / 2, base.g() / 2, base.b() / 2) } else { base };
+    egui::Stroke::new((if active { 2.5 } else { 1.0 }) * cv.zoom.max(0.5), color)
+}
+
+fn bbox_of<'a>(points: impl Iterator<Item = &'a Pos2>) -> Option<Rect> {
+    let mut rect: Option<Rect> = None;
+    for &p in points {
+        rect = Some(match rect {
+            Some(r) => r.union(Rect::from_min_max(p, p)),
+            None => Rect::from_min_max(p, p),
+        });
+    }
+    rect
 }

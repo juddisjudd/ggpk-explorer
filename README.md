@@ -21,16 +21,18 @@ A high-performance Path of Exile asset explorer for both the standalone (GGPK) a
 - Fast background-threaded search with "Load More" for large result sets.
 
 ### Viewers
-- **DAT / DAT64**: Full schema support for PoE 1 & 2, cross-referencing, foreign key resolution, JSON export.
+- **DAT / DATC64**: Schema-driven table view for PoE 1 & 2 (correct per-game table pick) with sortable columns, row filter, enum names, foreign keys resolved to the target row's `Id` (click to jump), `@file` paths that open the referenced asset, a row-detail panel, column hiding, and JSON/CSV export. Tables missing from the schema get their column types guessed from the data. Warns when the schema row width no longer matches the file.
 - **Textures**: DDS (all BC/DXT variants), PNG, JPG, WebP — with zoom, pan, and fit-to-window controls.
 - **Audio**: Built-in OGG/WAV/MP3 player with volume control.
 - **FMOD Banks**: `.bank` files (`FMOD/` folder) open with a full stream listing — play any stream in-app, save individual streams as WAV, or export the whole bank at once.
 - **Video (BK2)**: Header metadata display (codec, resolution, FPS, duration, audio tracks). Playback via RAD Video Tools `binkplay.exe`, `ffplay`, or your system default.
 - **CSD**: Client String Data viewer with language filtering and JSON export.
-- **PSG**: Particle/graph file viewer with tree visualization.
+- **PSG (skill trees)**: Renders the character, atlas, Chayula and Royale skill graphs the way the game lays them out — every asset comes from the GGPK: centre ring and class illustration, class-start plates, ascendancy plates relocated onto the outer ring (with a class/ascendancy picker that dims the others), textured orbit arcs and connectors from the game's sprite sheets, per-context node frames (character/ascendancy/atlas/Breach, plus per-node overrides), group backgrounds, atlas subtree art and blockers. Hover any node for its name, stats and flavour text.
 - **JSON**: Interactive, collapsible tree viewer.
 - **Shaders**: Syntax-highlighted view for `.hlsl`, `.fx`, `.vshader`, `.pshader`.
 - **Text / Config**: Auto-detected viewer for `.txt`, `.xml`, `.ini`, `.csv`, and dozens of PoE-specific text formats, with UTF-16 BOM support.
+- **Models**: `.ast` skeletons (bone hierarchy, animations, lights), `.fmt` / `.tgm` meshes and `.smd` skinned meshes parsed into a structured tree with geometry stats and full JSON export.
+- **DDS headers**: PoE 2 `.dds.header` streaming stubs render as thumbnails.
 - **Hex Viewer**: Adaptive layout for raw binary inspection of any file.
 
 ### Export
@@ -42,7 +44,7 @@ A high-performance Path of Exile asset explorer for both the standalone (GGPK) a
 - Collapsible sidebar, resizable panels.
 - Dark, VSCode-like theme.
 - Multilingual font fallback for CJK (Chinese, Japanese, Korean) and Thai characters.
-- Settings window: configure data source paths, schema updates, CDN patch version, and cache management.
+- Settings window: configure data source paths, schema updates, CDN patch version, cache management, and whether the ~2.8M `shadercache*/` entries are hidden (default: hidden).
 
 ## Requirements
 

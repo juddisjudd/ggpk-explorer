@@ -1,12 +1,9 @@
 use serde::{Serialize, Serializer};
 use serde::ser::SerializeStruct;
 
-// Orbit radii differ between graph types. The passive skill tree (graph_type 0)
-// and the atlas tree (graph_type 1) place outer orbits at slightly different
-// radii; using the wrong table drifts nodes by a few pixels on the outer rings.
-// Values verified against poe2-skilltree-export (passive) and poe2-atlas
-// constants (atlas).
-pub const PASSIVE_ORBIT_RADII: [i32; 10] = [0, 82, 164, 334, 488, 657, 839, 250, 1076, 1320];
+// Passive radii match the official web-tree export (all 4,483 main-tree nodes
+// line up to <0.01 units); the atlas table differs only on the outermost ring.
+pub const PASSIVE_ORBIT_RADII: [i32; 10] = [0, 82, 162, 335, 493, 662, 846, 251, 1080, 1322];
 pub const ATLAS_ORBIT_RADII: [i32; 10] = [0, 82, 162, 335, 493, 662, 846, 251, 1080, 1332];
 
 #[derive(Debug, Clone)]
@@ -53,6 +50,20 @@ pub struct PsgGroup {
     #[serde(rename = "isProxy")]
     pub is_proxy: bool,
     pub nodes: Vec<PsgNode>,
+    /// Marks a small number of special hub locations (e.g. big keystone/
+    /// notable clusters) that get an ornate decorative background — most
+    /// groups are 0/plain. Only ~30 out of 1600+ groups in the character
+    /// tree have a non-zero value; atlas/chayula currently have none at
+    /// all. Confirmed against real game data: naively drawing a background
+    /// for every multi-node group (by node count) was wrong — the
+    /// GroupBackground* textures are large ornate archway/sunburst designs
+    /// meant only for these specific flagged hubs.
+    #[serde(rename = "backgroundType")]
+    pub background_type: u32,
+    /// Set on exactly one group per character tree (so far observed) —
+    /// likely a distinct "main circle" hub distinct from `background_type`.
+    #[serde(rename = "backgroundFlag")]
+    pub background_flag: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,8 +145,8 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
         // Group Header: x(f32), y(f32), flag(u32), unknown1(I), unknown2(I), passive_length
         let x = read_f32(&mut offset)?;
         let y = read_f32(&mut offset)?;
-        let _flag = read_u32(&mut offset)?;
-        let _unknown1 = read_u32(&mut offset)?;
+        let background_flag = read_u32(&mut offset)?;
+        let background_type = read_u32(&mut offset)?;
         let unknown2 = read_u8(&mut offset)?;
         let passive_length = read_u32(&mut offset)?;
         
@@ -166,6 +177,8 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
             y,
             is_proxy: unknown2 == 1,
             nodes,
+            background_type,
+            background_flag,
         });
     }
 
@@ -230,7 +243,7 @@ mod tests {
         let serialized = serde_json::to_string(&psg).expect("Failed to serialize");
         let val: serde_json::Value = serde_json::from_str(&serialized).expect("Failed to parse JSON");
         assert_eq!(val.get("roots").unwrap().as_array().unwrap()[0].as_u64().unwrap(), 100);
-        assert_eq!(val.get("orbitRadii").unwrap(), &serde_json::json!([0, 82, 164, 334, 488, 657, 839, 250, 1076, 1320]));
+        assert_eq!(val.get("orbitRadii").unwrap(), &serde_json::json!([0, 82, 162, 335, 493, 662, 846, 251, 1080, 1322]));
     }
 
     #[test]
