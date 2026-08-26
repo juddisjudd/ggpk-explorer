@@ -13,6 +13,14 @@ updates:
       # on 1.3.x.
       - dependency-name: "bincode"
         versions: [">=2.0.0"]
+      # egui/eframe/egui_extras must be upgraded together; egui_extras
+      # alone at 0.34 breaks against egui/eframe still pinned at 0.29.
+      - dependency-name: "egui"
+        versions: [">=0.30.0"]
+      - dependency-name: "eframe"
+        versions: [">=0.30.0"]
+      - dependency-name: "egui_extras"
+        versions: [">=0.30.0"]
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

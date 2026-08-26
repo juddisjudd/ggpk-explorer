@@ -141,6 +141,9 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install system dependencies
+        run: brew install libunistring
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -152,6 +155,7 @@ jobs:
 
       - name: Build Release (arm64 + x86_64)
         run: |
+          export CXXFLAGS="-I$(brew --prefix libunistring)/include"
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
 
