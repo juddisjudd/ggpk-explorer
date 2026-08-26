@@ -16,7 +16,7 @@ assets = [
 [dependencies]
 eframe = "0.29"
 egui = "0.29"
-egui_extras = { version = "0.29", features = ["all_loaders"] }
+egui_extras = { version = "0.34", features = ["all_loaders"] }
 image = { version = "0.25", features = ["dds", "webp", "png", "jpeg", "bmp"] }
 image_dds = "0.7"
 ddsfile = "0.5"
