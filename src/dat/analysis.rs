@@ -425,7 +425,10 @@ mod tests {
     }
 
     /// Guesses must tile the whole row; prints them next to the schema when one is cached.
+    /// Needs a local `examples/data/balance/itemvisualidentity.datc64` (not checked in).
+    /// Run with: cargo test guesses_real_example_table -- --ignored --nocapture
     #[test]
+    #[ignore]
     fn guesses_real_example_table() {
         let data = std::fs::read("examples/data/balance/itemvisualidentity.datc64").unwrap();
         let reader = DatReader::new(data, "itemvisualidentity.datc64").unwrap();
