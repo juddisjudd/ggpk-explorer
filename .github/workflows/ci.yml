@@ -40,8 +40,12 @@ jobs:
         with:
           shared-key: "ci-${{ matrix.os }}"
 
+      # RUSTFLAGS is scoped to this step: rustc warnings are errors, but the
+      # clippy step below stays ungated.
       - name: Test
         run: cargo test --locked
+        env:
+          RUSTFLAGS: -Dwarnings
 
       # Not gated on warnings yet: the codebase has a backlog of clippy
       # lints. Surface them in the log so the count trends down over time.

@@ -7,6 +7,7 @@ pub mod bundles;
 mod ui;
 pub mod settings;
 pub mod cli;
+pub mod diff;
 pub mod update;
 pub mod export;
 pub mod parsers;

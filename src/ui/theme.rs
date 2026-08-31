@@ -29,30 +29,30 @@ impl PremiumDarkTheme {
             spread: 0.0,
             color: egui::Color32::from_black_alpha(72),
         };
-        visuals.window_stroke = egui::Stroke::new(1.0, border);
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, border);
 
         visuals.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
         visuals.widgets.noninteractive.bg_fill = bg_secondary;
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_muted);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_muted);
 
         visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
         visuals.widgets.inactive.bg_fill = bg_secondary;
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_primary);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
         visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
         visuals.widgets.hovered.bg_fill = bg_hover;
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, border_strong);
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text_primary);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, border_strong);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
         visuals.widgets.active.rounding = egui::Rounding::same(4.0);
         visuals.widgets.active.bg_fill = selection;
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, border_strong);
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text_primary);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, border_strong);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
         visuals.selection.bg_fill = selection;
-        visuals.selection.stroke = egui::Stroke::new(1.0, border_strong);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, border_strong);
         visuals.hyperlink_color = Color::from_rgb(186, 186, 196);
 
         visuals
@@ -134,30 +134,30 @@ impl PremiumLightTheme {
             spread: 0.0,
             color: egui::Color32::from_black_alpha(20),
         };
-        visuals.window_stroke = egui::Stroke::new(1.0, border);
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, border);
 
         visuals.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
         visuals.widgets.noninteractive.bg_fill = bg_secondary;
-        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border);
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_muted);
+        visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_muted);
 
         visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
         visuals.widgets.inactive.bg_fill = bg_secondary;
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_primary);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
         visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
         visuals.widgets.hovered.bg_fill = bg_hover;
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, border_strong);
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text_primary);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, border_strong);
+        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
         visuals.widgets.active.rounding = egui::Rounding::same(4.0);
         visuals.widgets.active.bg_fill = selection;
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, border_strong);
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text_primary);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, border_strong);
+        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
         visuals.selection.bg_fill = selection;
-        visuals.selection.stroke = egui::Stroke::new(1.0, border_strong);
+        visuals.selection.stroke = egui::Stroke::new(1.0_f32, border_strong);
         visuals.hyperlink_color = Color::from_rgb(50, 70, 150);
 
         visuals

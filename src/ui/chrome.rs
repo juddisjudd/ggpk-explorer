@@ -4,6 +4,7 @@ pub struct ChromeActions {
     pub open_ggpk: bool,
     pub open_steam: bool,
     pub open_settings: bool,
+    pub open_diff: bool,
     pub open_about: bool,
     pub open_command_palette: bool,
     pub toggle_inspector: bool,
@@ -15,6 +16,7 @@ impl ChromeActions {
             open_ggpk: false,
             open_steam: false,
             open_settings: false,
+            open_diff: false,
             open_about: false,
             open_command_palette: false,
             toggle_inspector: false,
@@ -139,7 +141,7 @@ impl AppChrome {
         };
         let c = rect.center();
         let h = 5.0_f32;
-        let stroke = egui::Stroke::new(1.5, color);
+        let stroke = egui::Stroke::new(1.5_f32, color);
         ui.painter().line_segment([egui::pos2(c.x - h, c.y - h), egui::pos2(c.x + h, c.y + h)], stroke);
         ui.painter().line_segment([egui::pos2(c.x + h, c.y - h), egui::pos2(c.x - h, c.y + h)], stroke);
         response
@@ -153,7 +155,7 @@ impl AppChrome {
             egui::Color32::from_rgb(113, 113, 122)
         };
         let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 10.0));
-        ui.painter().rect_stroke(icon_rect, egui::Rounding::ZERO, egui::Stroke::new(1.5, color));
+        ui.painter().rect_stroke(icon_rect, egui::Rounding::ZERO, egui::Stroke::new(1.5_f32, color));
         response
     }
 
@@ -167,7 +169,7 @@ impl AppChrome {
         let c = rect.center();
         ui.painter().line_segment(
             [egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)],
-            egui::Stroke::new(1.5, color),
+            egui::Stroke::new(1.5_f32, color),
         );
         response
     }
@@ -331,6 +333,10 @@ impl AppChrome {
 
                         if Self::nav_button(ui, "Settings").clicked() {
                             actions.open_settings = true;
+                        }
+
+                        if Self::nav_button(ui, "Diff").clicked() {
+                            actions.open_diff = true;
                         }
 
                         if Self::nav_button(ui, "About").clicked() {

@@ -41,11 +41,13 @@ pub struct ExplorerApp {
     pub schema_update_rx: Option<Receiver<Result<String, String>>>,
     pub schema_check_rx: Option<Receiver<Result<i64, String>>>,
     pub export_status_rx: Option<Receiver<crate::export::ExportStatus>>,
+    pub auto_snapshot_rx: Option<Receiver<Result<String, String>>>,
     is_loading: bool,
 
     pub settings: crate::settings::AppSettings,
     pub settings_window: crate::ui::settings_window::SettingsWindow,
     pub export_window: crate::ui::export_window::ExportWindow,
+    pub diff_window: crate::ui::diff_window::DiffWindow,
     pub show_about: bool,
     pub update_state: crate::update::UpdateState,
     pub sidebar_expanded: bool,
@@ -141,10 +143,12 @@ impl ExplorerApp {
             schema_update_rx: None,
             schema_check_rx: None,
             export_status_rx: None,
+            auto_snapshot_rx: None,
             is_loading: false,
             settings: settings.clone(),
             settings_window: crate::ui::settings_window::SettingsWindow::new(),
             export_window: crate::ui::export_window::ExportWindow::new(),
+            diff_window: crate::ui::diff_window::DiffWindow::default(),
             show_about: false,
             update_state: crate::update::UpdateState::new(),
             sidebar_expanded: true,
@@ -893,6 +897,9 @@ impl eframe::App for ExplorerApp {
         if chrome_actions.open_settings {
             self.settings_window.open();
         }
+        if chrome_actions.open_diff {
+            self.diff_window.open_window();
+        }
         if chrome_actions.open_about {
             self.show_about = true;
         }
@@ -985,17 +992,40 @@ impl eframe::App for ExplorerApp {
                         // names/hashes, so the cached index, tree, CDN bundles,
                         // and parsed-content cache from the old patch can no
                         // longer be trusted — wipe them so the next load rebuilds
-                        // from scratch against the new patch.
-                        match crate::settings::AppSettings::clear_cache() {
-                            Ok(()) => {
-                                println!("Cleared disk cache after patch change: {} -> {}", old_version, version);
-                                self.status_msg = format!("Updated PoE 2 patch version to {} (cache cleared)", version);
+                        // from scratch against the new patch. Before the wipe,
+                        // the cached index is the last full record of the old
+                        // patch — save it as a diff snapshot.
+                        self.status_msg = format!("New patch {} — snapshotting previous index...", version);
+                        let (tx, rx) = channel();
+                        self.auto_snapshot_rx = Some(rx);
+                        thread::spawn(move || {
+                            let cache_path = crate::settings::AppSettings::get_app_data_dir()
+                                .join(crate::settings::INDEX_CACHE_FILENAME);
+                            let mut snapshot_note = String::new();
+                            if cache_path.exists() && !crate::diff::has_snapshot_for_version(&old_version) {
+                                match crate::bundles::index::Index::load_from_cache(&cache_path) {
+                                    Ok(mut index) => {
+                                        index.drop_shader_cache();
+                                        match crate::diff::take_snapshot(&index, &old_version, "auto (pre-patch index cache)") {
+                                            Ok(_) => snapshot_note = format!(", snapshot of {} saved", old_version),
+                                            Err(e) => println!("Auto-snapshot failed: {}", e),
+                                        }
+                                    }
+                                    Err(e) => println!("Auto-snapshot: failed to load index cache: {}", e),
+                                }
                             }
-                            Err(e) => {
-                                println!("Failed to clear cache after patch change: {}", e);
-                                self.status_msg = format!("Updated PoE 2 patch version to {}", version);
-                            }
-                        }
+                            let result = match crate::settings::AppSettings::clear_cache() {
+                                Ok(()) => {
+                                    println!("Cleared disk cache after patch change: {} -> {}", old_version, version);
+                                    Ok(format!("Updated PoE 2 patch version to {} (cache cleared{})", version, snapshot_note))
+                                }
+                                Err(e) => {
+                                    println!("Failed to clear cache after patch change: {}", e);
+                                    Err(format!("Updated PoE 2 patch version to {}{}", version, snapshot_note))
+                                }
+                            };
+                            let _ = tx.send(result);
+                        });
                     }
                     self.patch_version_rx = None;
                 },
@@ -1008,6 +1038,25 @@ impl eframe::App for ExplorerApp {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {},
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.patch_version_rx = None;
+                }
+            }
+        }
+
+        if let Some(rx) = &self.auto_snapshot_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.status_msg = match result {
+                        Ok(msg) => msg,
+                        Err(msg) => msg,
+                    };
+                    self.auto_snapshot_rx = None;
+                    if self.diff_window.is_open() {
+                        self.diff_window.refresh();
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.auto_snapshot_rx = None;
                 }
             }
         }
@@ -1120,8 +1169,19 @@ impl eframe::App for ExplorerApp {
         }
 
 
+        let diff_source = self
+            .settings
+            .steam_path
+            .clone()
+            .or_else(|| self.settings.ggpk_path.clone())
+            .unwrap_or_default();
+        self.diff_window.show(ctx, &self.bundle_index, &self.settings.poe2_patch_version, &diff_source);
+        if let Some(hash) = self.diff_window.navigate_to.take() {
+            self.selected_file = Some(FileSelection::BundleFile(hash));
+        }
+
         let old_patch_ver = self.settings.poe2_patch_version.clone();
-        
+
 
         let schema_date = self.content_view.dat_viewer.schema_date.clone();
         self.settings_window.show(ctx, &mut self.settings, Some(&schema_date));

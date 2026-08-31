@@ -63,7 +63,7 @@ impl StatusBar {
                             ui.painter().rect_stroke(
                                 rect,
                                 egui::Rounding::same(3.0),
-                                egui::Stroke::new(1.0, chip_border),
+                                egui::Stroke::new(1.0_f32, chip_border),
                             );
                             // dot
                             let dot_center = egui::pos2(rect.min.x + 10.0, rect.center().y);
