@@ -71,6 +71,20 @@ impl TranslationLookup {
     }
 }
 
+/// Text one entry renders for `values` in `language` (`None` = base/English): the first
+/// sub-entry of that language whose ranges match, falling back to the base language.
+pub fn preview(entry: &CsdEntry, language: Option<&str>, values: &[i32]) -> Option<String> {
+    let n = entry.ids.len().max(1);
+    let pick = |lang: Option<&str>| {
+        entry
+            .descriptions
+            .iter()
+            .find(|s| s.language.as_deref() == lang && ranges_match(&s.operator, n, values))
+            .map(|s| render(s, values))
+    };
+    pick(language).or_else(|| if language.is_some() { pick(None) } else { None })
+}
+
 fn ranges_match(operator: &str, n: usize, values: &[i32]) -> bool {
     let tokens: Vec<&str> = operator.split_whitespace().collect();
     for i in 0..n {

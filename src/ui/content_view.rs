@@ -39,8 +39,31 @@ pub struct ContentView {
     raw_cache_order: Vec<u64>,
     raw_cache_bytes: usize,
     pub csd_cache: HashMap<u64, csd::CsdFile>,
-    pub csd_language_filter: Option<String>,
+    csd_viewer_state: HashMap<u64, crate::ui::csd_viewer::CsdViewerState>,
     pub json_cache: HashMap<u64, serde_json::Value>,
+    /// Decoded text of loaded text files, so viewers don't re-decode every frame.
+    text_cache: HashMap<u64, std::sync::Arc<String>>,
+    text_filters: HashMap<u64, String>,
+    /// Files the user switched to the plain editor view.
+    raw_text_view: std::collections::HashSet<u64>,
+    object_cache: HashMap<u64, std::sync::Arc<crate::parsers::object_dsl::ObjectFile>>,
+    object_viewer_state: HashMap<u64, crate::ui::object_viewer::ObjectViewerState>,
+    curve_cache: HashMap<u64, std::sync::Arc<crate::parsers::curves::CurveFile>>,
+    curve_viewer_state: HashMap<u64, crate::ui::curve_viewer::CurveViewerState>,
+    level_cache: HashMap<u64, Result<std::sync::Arc<crate::parsers::level::DgrGraph>, String>>,
+    level_viewer_state: HashMap<u64, crate::ui::level_viewer::LevelViewerState>,
+    /// JSON body (after any `version` header) of `.mat/.env/.atl/.pet` files; `None` when not JSON.
+    structured_json: HashMap<u64, Option<(String, std::sync::Arc<serde_json::Value>)>>,
+    /// Downscaled texture previews by path (`None` = could not decode), oldest first in `thumb_order`.
+    thumb_cache: HashMap<String, Option<egui::TextureHandle>>,
+    thumb_order: Vec<String>,
+    thumb_pending: std::collections::HashSet<String>,
+    thumb_rx: Option<std::sync::mpsc::Receiver<Vec<(String, Option<egui::ColorImage>)>>>,
+    /// Drawable geometry per model file; `None` when the file has no vertices.
+    mesh_cache: HashMap<u64, Option<std::sync::Arc<crate::ui::mesh_preview::MeshData>>>,
+    mesh_view_state: HashMap<u64, crate::ui::mesh_preview::MeshPreviewState>,
+    /// Models the user switched from the 3D preview to the structure summary.
+    model_summary_view: std::collections::HashSet<u64>,
     pub dat_viewer: DatViewer,
     audio_stream_handle: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
     audio_sink: Option<rodio::Sink>,
@@ -94,6 +117,9 @@ pub struct ContentView {
     // the atlas stat-description CSD files, shared by every open atlas .psg.
     pub skill_graph_db: Option<std::sync::Arc<crate::ui::atlas_node_db::SkillGraphDatabase>>,
     skill_graph_db_rx: Option<std::sync::mpsc::Receiver<Result<crate::ui::atlas_node_db::SkillGraphDatabase, String>>>,
+    table_stats_rx: Option<std::sync::mpsc::Receiver<Vec<crate::dat::analysis::TableStats>>>,
+    /// Identity of the index the DAT viewer's table stats were computed for.
+    table_stats_for: usize,
     skill_graph_db_loading: bool,
 
     // DDS textures referenced by skill graph art (node icons, frames,
@@ -122,8 +148,25 @@ impl Default for ContentView {
             raw_cache_order: Vec::new(),
             raw_cache_bytes: 0,
             csd_cache: HashMap::new(),
-            csd_language_filter: Some("English".to_string()),
+            csd_viewer_state: HashMap::new(),
             json_cache: HashMap::new(),
+            text_cache: HashMap::new(),
+            text_filters: HashMap::new(),
+            raw_text_view: std::collections::HashSet::new(),
+            object_cache: HashMap::new(),
+            object_viewer_state: HashMap::new(),
+            curve_cache: HashMap::new(),
+            curve_viewer_state: HashMap::new(),
+            level_cache: HashMap::new(),
+            level_viewer_state: HashMap::new(),
+            structured_json: HashMap::new(),
+            thumb_cache: HashMap::new(),
+            thumb_order: Vec::new(),
+            thumb_pending: std::collections::HashSet::new(),
+            thumb_rx: None,
+            mesh_cache: HashMap::new(),
+            mesh_view_state: HashMap::new(),
+            model_summary_view: std::collections::HashSet::new(),
             dat_viewer: DatViewer::default(),
             audio_stream_handle: None,
             audio_sink: None,
@@ -160,6 +203,8 @@ impl Default for ContentView {
 
             skill_graph_db: None,
             skill_graph_db_rx: None,
+            table_stats_rx: None,
+            table_stats_for: 0,
             skill_graph_db_loading: false,
 
             psg_texture_cache: HashMap::new(),
@@ -245,6 +290,7 @@ impl ContentView {
             }
         }
 
+        self.poll_thumbnails(ui.ctx());
         if let Some(rx) = &self.psg_texture_rx {
             if let Ok(batch) = rx.try_recv() {
                 self.psg_texture_rx = None;
@@ -402,9 +448,21 @@ impl ContentView {
                                        };
                                        self.dat_viewer.show(ui, is_poe2, Some(&mut loader));
                                        self.handle_dat_nav(index);
+                                       self.service_table_stats(ui.ctx(), reader.clone(), index);
                                    }
                               } else if file_info.path.ends_with(".csd") {
-                                 self.show_csd(ui, hash);
+                                 let mut opened = None;
+                                 if let Some(csd) = self.csd_cache.get(&hash) {
+                                     let state = self.csd_viewer_state.entry(hash).or_default();
+                                     opened = crate::ui::csd_viewer::CsdViewer::show(ui, hash, csd, state);
+                                 } else if self.failed_loads.contains(&hash) {
+                                     ui.colored_label(egui::Color32::RED, self.last_error.as_deref().unwrap_or("Failed to parse CSD."));
+                                 } else {
+                                     ui.spinner();
+                                 }
+                                 if let Some(p) = opened {
+                                     self.open_path(index, &p);
+                                 }
                             } else if file_info.path.ends_with(".psg") {
                                  if self.psg_cache.contains_key(&hash) {
                                      self.ensure_skill_graph_db_loading(reader.clone(), index);
@@ -489,8 +547,23 @@ impl ContentView {
                                     }
                                 }
                             } else if crate::parsers::model::is_model_path(&file_info.path) {
-                                 if let Some((model, summary)) = self.model_cache.get(&hash) {
-                                     crate::ui::model_viewer::ModelViewer::show(ui, &file_info.path, model, summary);
+                                 if let Some((model, summary)) = self.model_cache.get(&hash).cloned() {
+                                     let mesh = self.mesh_cache.entry(hash).or_insert_with(|| crate::ui::mesh_preview::extract(&model).map(std::sync::Arc::new)).clone();
+                                     let mut summary_view = self.model_summary_view.contains(&hash) || mesh.is_none();
+                                     if mesh.is_some() {
+                                         ui.horizontal(|ui| {
+                                             if ui.toggle_value(&mut summary_view, "Summary").on_hover_text("Structure and stats instead of the 3D preview").changed() {
+                                                 if summary_view { self.model_summary_view.insert(hash); } else { self.model_summary_view.remove(&hash); }
+                                             }
+                                         });
+                                     }
+                                     match (&mesh, summary_view) {
+                                         (Some(mesh), false) => {
+                                             let state = self.mesh_view_state.entry(hash).or_default();
+                                             crate::ui::mesh_preview::MeshPreview::show(ui, hash, mesh, state);
+                                         }
+                                         _ => crate::ui::model_viewer::ModelViewer::show(ui, &file_info.path, &model, &summary),
+                                     }
                                  } else if let Some(data) = self.raw_data_cache.get(&hash) {
                                      egui::ScrollArea::vertical().show(ui, |ui| {
                                          if let Some(err) = &self.last_error {
@@ -505,14 +578,18 @@ impl ContentView {
                                      ui.spinner();
                                  }
                             } else if is_json_path(&file_info.path) {
+                                 let mut opened = None;
                                  if let Some(job) = self.json_cache.get(&hash) {
                                      egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-                                         JsonTreeViewer::show(ui, job);
+                                         JsonTreeViewer::show_linked(ui, job, &mut opened);
                                      });
                                  } else if self.failed_loads.contains(&hash) {
                                       ui.label(format!("Failed to load JSON. Error: {}", self.last_error.as_deref().unwrap_or("Unknown")));
                                  } else {
                                       ui.label("Loading JSON...");
+                                 }
+                                 if let Some(p) = opened {
+                                     self.open_path(index, &p);
                                  }
                             } else {
                                  // For other content, use ScrollArea
@@ -692,40 +769,149 @@ impl ContentView {
                                            }
                                       } else if is_non_playable_media(&file_info.path) {
                                            self.show_media_stub(ui, file_info, hash, reader.as_deref(), bundle_index.as_ref().map(|i| i.as_ref()));
-                                      } else if is_text_file(&file_info.path) {
-                                           egui::ScrollArea::vertical().show(ui, |ui| {
-                                                if let Some(data) = self.raw_data_cache.get(&hash) {
-                                                     let text = decode_text_with_detection(data);
-                                                      // Show read-only text edit
-                                                      let language = if is_shader_source(&file_info.path) {
-                                                          "hlsl"
-                                                      } else {
-                                                          "text"
-                                                      };
-
-                                                      let theme = if ui.visuals().dark_mode {
-                                                          crate::ui::syntax::Theme::dark()
-                                                      } else {
-                                                          crate::ui::syntax::Theme::light()
-                                                      };
-                                                      let mut layouter = |ui: &egui::Ui, string: &str, _wrap_width: f32| {
-                                                          let mut layout_job = crate::ui::syntax::highlight(ui.ctx(), &theme, string, language);
-                                                          layout_job.wrap.max_width = f32::INFINITY; 
-                                                          ui.fonts(|f| f.layout_job(layout_job))
-                                                      };
-
-                                                      egui::ScrollArea::both().show(ui, |ui| {
-                                                          ui.add(egui::TextEdit::multiline(&mut text.as_str())
-                                                              .code_editor()
-                                                              .lock_focus(false)
-                                                              .desired_width(f32::INFINITY)
-                                                              .layouter(&mut layouter)
-                                                          );
-                                                      });
-                                                } else {
-                                                     ui.label("Loading text...");
+                                      } else if is_structured_text(&file_info.path) {
+                                           match self.decoded_text(hash) {
+                                                Some(text) => {
+                                                    let ext = file_info.path.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+                                                    let mut raw = self.raw_text_view.contains(&hash);
+                                                    ui.horizontal(|ui| {
+                                                        if ui.toggle_value(&mut raw, "Raw").on_hover_text("Show the file text instead of the dedicated view").changed() {
+                                                            if raw { self.raw_text_view.insert(hash); } else { self.raw_text_view.remove(&hash); }
+                                                        }
+                                                    });
+                                                    let mut wanted_thumbs: Vec<String> = Vec::new();
+                                                    let opened = if raw {
+                                                        self.show_linked_text(ui, hash, &text)
+                                                    } else {
+                                                        match ext.as_str() {
+                                                            "dgr" => {
+                                                                let parsed = self.level_cache.entry(hash).or_insert_with(|| crate::parsers::level::parse_dgr(&text).map(std::sync::Arc::new)).clone();
+                                                                match parsed {
+                                                                    Ok(graph) => {
+                                                                        let state = self.level_viewer_state.entry(hash).or_default();
+                                                                        crate::ui::level_viewer::LevelViewer::show(ui, hash, &graph, state)
+                                                                    }
+                                                                    Err(e) => {
+                                                                        ui.colored_label(egui::Color32::from_rgb(245, 158, 11), format!("⚠ Could not read the graph: {}", e));
+                                                                        self.show_linked_text(ui, hash, &text)
+                                                                    }
+                                                                }
+                                                            }
+                                                            "trl" => self.show_curves(ui, hash, &text),
+                                                            "mat" => match self.structured_json(hash, &text) {
+                                                                Some((_, doc)) => crate::ui::material_viewer::MaterialViewer::show(ui, hash, &doc, &self.thumb_cache, &mut wanted_thumbs),
+                                                                None => self.show_linked_text(ui, hash, &text),
+                                                            },
+                                                            "atl" => match self.structured_json(hash, &text) {
+                                                                Some((_, doc)) => crate::ui::timeline_viewer::TimelineViewer::show(ui, hash, &doc),
+                                                                None => self.show_linked_text(ui, hash, &text),
+                                                            },
+                                                            _ => match self.structured_json(hash, &text) {
+                                                                Some((header, doc)) => {
+                                                                    let mut o = None;
+                                                                    if !header.is_empty() {
+                                                                        ui.label(egui::RichText::new(header).weak().monospace());
+                                                                    }
+                                                                    egui::ScrollArea::both().id_salt(("structured_json", hash)).auto_shrink([false, false]).show(ui, |ui| {
+                                                                        JsonTreeViewer::show_linked(ui, &doc, &mut o);
+                                                                    });
+                                                                    o
+                                                                }
+                                                                None if ext == "pet" => self.show_curves(ui, hash, &text),
+                                                                None => self.show_linked_text(ui, hash, &text),
+                                                            },
+                                                        }
+                                                    };
+                                                    if !wanted_thumbs.is_empty() {
+                                                        self.ensure_thumbnails(reader.clone(), index, wanted_thumbs);
+                                                    }
+                                                    if let Some(p) = opened {
+                                                        self.open_path(index, &p);
+                                                    }
                                                 }
-                                           });
+                                                None => {
+                                                    ui.label("Loading...");
+                                                }
+                                           }
+                                      } else if crate::parsers::object_dsl::is_object_path(&file_info.path) {
+                                           match self.decoded_text(hash) {
+                                                Some(text) => {
+                                                    let mut raw = self.raw_text_view.contains(&hash);
+                                                    ui.horizontal(|ui| {
+                                                        if ui.toggle_value(&mut raw, "Raw").on_hover_text("Show the file text instead of the inspector").changed() {
+                                                            if raw { self.raw_text_view.insert(hash); } else { self.raw_text_view.remove(&hash); }
+                                                        }
+                                                    });
+                                                    let opened = if raw {
+                                                        let mut filter = self.text_filters.remove(&hash).unwrap_or_default();
+                                                        let o = crate::ui::linked_text_viewer::LinkedTextViewer::show(ui, hash, &text, &mut filter);
+                                                        self.text_filters.insert(hash, filter);
+                                                        o
+                                                    } else {
+                                                        let doc = self.object_cache.entry(hash).or_insert_with(|| std::sync::Arc::new(crate::parsers::object_dsl::parse(&text))).clone();
+                                                        let index_arc = index.clone();
+                                                        let reader_arc = reader.clone();
+                                                        let steam = self.steam_loader.clone();
+                                                        let mut loader = |p: &str| -> Option<Vec<u8>> {
+                                                            let fi = find_file_info_by_path(&index_arc, p)?;
+                                                            extract_bundle_file_sync(fi, &index_arc, reader_arc.as_deref(), steam.as_ref())
+                                                        };
+                                                        let state = self.object_viewer_state.entry(hash).or_default();
+                                                        crate::ui::object_viewer::ObjectViewer::show(ui, hash, &file_info.path, &doc, state, Some(&mut loader))
+                                                    };
+                                                    if let Some(p) = opened {
+                                                        self.open_path(index, &p);
+                                                    }
+                                                }
+                                                None => {
+                                                    ui.label("Loading...");
+                                                }
+                                           }
+                                      } else if is_text_file(&file_info.path) {
+                                           match self.decoded_text(hash) {
+                                                Some(text) => {
+                                                    let shader = is_shader_source(&file_info.path);
+                                                    let mut raw = shader || self.raw_text_view.contains(&hash);
+                                                    if !shader {
+                                                        ui.horizontal(|ui| {
+                                                            if ui.toggle_value(&mut raw, "Raw").on_hover_text("Plain editor view with text selection").changed() {
+                                                                if raw { self.raw_text_view.insert(hash); } else { self.raw_text_view.remove(&hash); }
+                                                            }
+                                                        });
+                                                    }
+                                                    if raw {
+                                                        let language = if shader { "hlsl" } else { "text" };
+                                                        let theme = if ui.visuals().dark_mode {
+                                                            crate::ui::syntax::Theme::dark()
+                                                        } else {
+                                                            crate::ui::syntax::Theme::light()
+                                                        };
+                                                        let mut layouter = |ui: &egui::Ui, string: &str, _wrap_width: f32| {
+                                                            let mut layout_job = crate::ui::syntax::highlight(ui.ctx(), &theme, string, language);
+                                                            layout_job.wrap.max_width = f32::INFINITY;
+                                                            ui.fonts(|f| f.layout_job(layout_job))
+                                                        };
+                                                        egui::ScrollArea::both().show(ui, |ui| {
+                                                            ui.add(egui::TextEdit::multiline(&mut text.as_str())
+                                                                .code_editor()
+                                                                .lock_focus(false)
+                                                                .desired_width(f32::INFINITY)
+                                                                .layouter(&mut layouter)
+                                                            );
+                                                        });
+                                                    } else {
+                                                        let mut filter = self.text_filters.remove(&hash).unwrap_or_default();
+                                                        let opened = crate::ui::linked_text_viewer::LinkedTextViewer::show(ui, hash, &text, &mut filter);
+                                                        self.text_filters.insert(hash, filter);
+                                                        if let Some(p) = opened {
+                                                            self.open_path(index, &p);
+                                                        }
+                                                    }
+                                                }
+                                                None => {
+                                                    ui.label("Loading text...");
+                                                }
+                                           }
                                       } else {
                                           egui::ScrollArea::vertical().show(ui, |ui| {
                                               if let Some(data) = self.raw_data_cache.get(&hash) {
@@ -1828,6 +2014,145 @@ impl ContentView {
         }
     }
 
+    /// Runs the background row-count scan the DAT viewer uses to suggest foreign-key
+    /// targets — once per index, and only after the viewer asks for it.
+    fn service_table_stats(&mut self, ctx: &egui::Context, reader: Option<std::sync::Arc<GgpkReader>>, index: &std::sync::Arc<crate::bundles::index::Index>) {
+        let key = std::sync::Arc::as_ptr(index) as usize;
+        if self.table_stats_for != key {
+            self.table_stats_for = key;
+            self.table_stats_rx = None;
+            self.dat_viewer.table_stats = None;
+            self.dat_viewer.table_stats_loading = false;
+        }
+        if let Some(rx) = &self.table_stats_rx {
+            match rx.try_recv() {
+                Ok(stats) => {
+                    self.dat_viewer.set_table_stats(stats);
+                    self.table_stats_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.table_stats_rx = None;
+                    self.dat_viewer.table_stats_loading = false;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if !self.dat_viewer.request_table_stats {
+            return;
+        }
+        self.dat_viewer.request_table_stats = false;
+        if self.table_stats_rx.is_some() || self.dat_viewer.table_stats.is_some() {
+            return;
+        }
+        self.dat_viewer.table_stats_loading = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.table_stats_rx = Some(rx);
+        let index = index.clone();
+        let steam = self.steam_loader.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let stats = scan_table_stats(&index, reader.as_deref(), steam.as_ref());
+            let _ = tx.send(stats);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Decoded text for a loaded text file, cached per hash.
+    fn decoded_text(&mut self, hash: u64) -> Option<std::sync::Arc<String>> {
+        if let Some(t) = self.text_cache.get(&hash) {
+            return Some(t.clone());
+        }
+        let data = self.raw_data_cache.get(&hash)?;
+        let text = std::sync::Arc::new(decode_text_with_detection(data));
+        if self.text_cache.len() > 32 {
+            self.text_cache.clear();
+        }
+        self.text_cache.insert(hash, text.clone());
+        Some(text)
+    }
+
+    fn show_linked_text(&mut self, ui: &mut egui::Ui, hash: u64, text: &str) -> Option<String> {
+        let mut filter = self.text_filters.remove(&hash).unwrap_or_default();
+        let opened = crate::ui::linked_text_viewer::LinkedTextViewer::show(ui, hash, text, &mut filter);
+        self.text_filters.insert(hash, filter);
+        opened
+    }
+
+    fn show_curves(&mut self, ui: &mut egui::Ui, hash: u64, text: &str) -> Option<String> {
+        let file = self.curve_cache.entry(hash).or_insert_with(|| std::sync::Arc::new(crate::parsers::curves::parse(text))).clone();
+        let state = self.curve_viewer_state.entry(hash).or_default();
+        crate::ui::curve_viewer::CurveViewer::show(ui, hash, &file, state)
+    }
+
+    fn structured_json(&mut self, hash: u64, text: &str) -> Option<(String, std::sync::Arc<serde_json::Value>)> {
+        self.structured_json.entry(hash).or_insert_with(|| json_body(text).map(|(h, v)| (h, std::sync::Arc::new(v)))).clone()
+    }
+
+    /// Starts decoding texture previews in the background (one batch at a time).
+    fn ensure_thumbnails(&mut self, reader: Option<std::sync::Arc<GgpkReader>>, index: &std::sync::Arc<crate::bundles::index::Index>, paths: Vec<String>) {
+        if self.thumb_rx.is_some() {
+            return;
+        }
+        let missing: Vec<String> = paths.into_iter().filter(|p| !self.thumb_cache.contains_key(p) && !self.thumb_pending.contains(p)).collect();
+        if missing.is_empty() {
+            return;
+        }
+        for p in &missing {
+            self.thumb_pending.insert(p.clone());
+        }
+        let index = index.clone();
+        let steam = self.steam_loader.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.thumb_rx = Some(rx);
+        std::thread::spawn(move || {
+            let batch = fetch_thumbnails(reader.as_deref(), &index, steam.as_ref(), missing, 192);
+            let _ = tx.send(batch);
+        });
+    }
+
+    fn poll_thumbnails(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.thumb_rx else { return };
+        match rx.try_recv() {
+            Ok(batch) => {
+                self.thumb_rx = None;
+                for (path, img) in batch {
+                    self.thumb_pending.remove(&path);
+                    let handle = img.map(|i| ctx.load_texture(format!("thumb:{}", path), i, egui::TextureOptions::LINEAR));
+                    self.thumb_cache.insert(path.clone(), handle);
+                    self.thumb_order.push(path);
+                }
+                while self.thumb_order.len() > 96 {
+                    let old = self.thumb_order.remove(0);
+                    self.thumb_cache.remove(&old);
+                }
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.thumb_rx = None;
+                self.thumb_pending.clear();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Opens a game file named inside another file (a link click in any viewer).
+    /// `.dds` names get the same fallbacks the texture loader uses.
+    pub(crate) fn open_path(&mut self, index: &crate::bundles::index::Index, path: &str) {
+        let path = crate::ui::links::normalize(path);
+        let mut candidates = vec![path.clone()];
+        if path.to_ascii_lowercase().ends_with(".dds") {
+            candidates.extend(dds_path_candidates(&path));
+        }
+        for c in &candidates {
+            if let Some(fi) = find_file_info_by_path(index, c) {
+                self.selection_requested = Some(crate::ui::app::FileSelection::BundleFile(fi.path_hash));
+                self.last_error = None;
+                return;
+            }
+        }
+        self.last_error = Some(format!("Not found in index: {}", path));
+    }
+
     /// Turns a foreign-key / file-path click in the DAT viewer into a file selection.
     fn handle_dat_nav(&mut self, index: &crate::bundles::index::Index) {
         let Some(req) = self.dat_viewer.nav_request.take() else { return };
@@ -2315,109 +2640,6 @@ impl ContentView {
                       }
     }
 
-    fn show_csd(&mut self, ui: &mut egui::Ui, hash: u64) {
-        if let Some(csd_file) = self.csd_cache.get(&hash) {
-            egui::ScrollArea::both().show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Export JSON").clicked() {
-                           if let Some(path) = rfd::FileDialog::new()
-                               .set_file_name("csd_export.json")
-                               .save_file() 
-                           {
-                               if let Ok(file) = std::fs::File::create(path) {
-                                   let _ = serde_json::to_writer_pretty(file, csd_file);
-                               }
-                           }
-                        }
-                        
-                        ui.separator();
-                        
-                        egui::ComboBox::from_id_salt("csd_lang_filter")
-                            .selected_text(self.csd_language_filter.as_deref().unwrap_or("All"))
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.csd_language_filter, None, "All");
-                                for lang in &csd_file.languages {
-                                    ui.selectable_value(&mut self.csd_language_filter, Some(lang.clone()), lang);
-                                }
-                            });
-                        ui.label("Language:");
-                    });
-                });
-                
-                ui.separator();
-                for (idx, entry) in csd_file.entries.iter().enumerate() {
-                    // Filter check: If ANY sub-entry matches filter, show the group?
-                    // Or show group but only matching sub-entries?
-                    // Usually we want to see the ID and then the translation.
-                    // If filter is set, we only show sub-entries matching.
-                    // If no sub-entries match, maybe hide the whole entry?
-                    
-                    let filtered_subs: Vec<_> = entry.descriptions.iter().filter(|sub| {
-                         match &self.csd_language_filter {
-                             None => true,
-                             Some(filter) => {
-                                 // If sub has no language, show it (defaults/params?)
-                                 // Or if it matches filter.
-                                 // Usually defaults have no language?
-                                 // In sample: `1 ...` then `lang ...` then `1 ...`
-                                 // If filter is English, show None and English.
-                                 // If filter is French, show French.
-                                 sub.language.as_ref().map(|l| l == filter).unwrap_or_else(|| filter == "English")
-                             }
-                         }
-                    }).collect();
-                    
-                    if filtered_subs.is_empty() {
-                        continue;
-                    }
-
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("Entry #{}:", idx + 1));
-                            for id in &entry.ids {
-                                ui.code(id);
-                            }
-                        });
-                        
-                        ui.indent("descriptions", |ui| {
-                            for sub in filtered_subs {
-                                ui.horizontal(|ui| {
-                                    if sub.is_canonical {
-                                        ui.colored_label(egui::Color32::from_rgb(255, 215, 0), "★");
-                                    }
-                                    if let Some(lang) = &sub.language {
-                                        ui.monospace(format!("[{}]", lang));
-                                    }
-                                    ui.label(egui::RichText::new(&sub.operator).strong());
-                                    ui.label(&sub.description);
-                                });
-                                if !sub.parameters.is_empty() {
-                                    ui.horizontal(|ui| {
-                                        ui.label(egui::RichText::new("Params:").italics());
-                                        for param in &sub.parameters {
-                                            ui.monospace(format!("{}={}", param.name, param.value));
-                                        }
-                                    });
-                                }
-                            }
-                        });
-                    });
-                    ui.add_space(4.0);
-                }
-            });
-        } else if self.failed_loads.contains(&hash) {
-             ui.label(format!("Failed to load CSD. Error: {}", self.last_error.as_deref().unwrap_or("Unknown")));
-             // Fallback to hex viewer
-             if let Some(data) = self.raw_data_cache.get(&hash) {
-                  ui.separator();
-                  ui.label("Raw Data Fallback:");
-                  crate::ui::hex_viewer::HexViewer::show(ui, data);
-             }
-        } else {
-             ui.label("Loading CSD...");
-        }
-    }
 
 
 
@@ -2450,6 +2672,57 @@ fn is_text_file(path: &str) -> bool {
     p.ends_with(".tdt") || p.ends_with(".tmd") || p.ends_with(".epk") ||
     p.ends_with(".it") || p.ends_with(".fgp") || p.ends_with(".tgr") ||
     p.ends_with(".atl") || p.ends_with(".geal") || is_shader_source(&p)
+}
+
+/// Text formats with a dedicated view: JSON-bodied materials, environments, timelines
+/// and v5 emitters; keyword trails/emitters; dungeon graphs.
+fn is_structured_text(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.ends_with(".mat") || p.ends_with(".env") || p.ends_with(".atl") || p.ends_with(".pet") || p.ends_with(".trl") || p.ends_with(".dgr")
+}
+
+/// Splits a file into its plain-text header (`version 5`, …) and the JSON document that follows.
+fn json_body(text: &str) -> Option<(String, serde_json::Value)> {
+    let mut header = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with('{') || t.starts_with('[') {
+            break;
+        }
+        header.push(line.trim().to_string());
+        offset += line.len();
+    }
+    if offset >= text.len() {
+        return None;
+    }
+    let value = serde_json::from_str::<serde_json::Value>(&text[offset..]).ok()?;
+    Some((header.into_iter().filter(|h| !h.is_empty()).collect::<Vec<_>>().join(" · "), value))
+}
+
+/// Small RGBA previews for texture paths, decoded without touching the on-disk art cache.
+fn fetch_thumbnails(
+    reader: Option<&GgpkReader>,
+    index: &crate::bundles::index::Index,
+    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+    paths: Vec<String>,
+    max_px: u32,
+) -> Vec<(String, Option<egui::ColorImage>)> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let img = resolve_texture_path(index, &path)
+                .and_then(|info| extract_bundle_file_sync(info, index, reader, steam_loader))
+                .and_then(|bytes| decode_dds_rgba(&bytes))
+                .map(|img| {
+                    let (w, h) = (img.width().max(1), img.height().max(1));
+                    let scale = (max_px as f32 / w as f32).min(max_px as f32 / h as f32).min(1.0);
+                    let small = image::imageops::thumbnail(&img, ((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
+                    rgba_to_color_image(&small)
+                });
+            (path, img)
+        })
+        .collect()
 }
 
 /// Shader sources (and their includes) get HLSL highlighting.
@@ -2599,30 +2872,7 @@ fn is_supported_format(path: &str) -> Option<crate::parsers::FileFormat> {
 }
 
 fn decode_text_with_detection(data: &[u8]) -> String {
-    // Check for UTF-16 LE BOM
-    if data.len() >= 2 && data[0] == 0xFF && data[1] == 0xFE {
-        let u16s: Vec<u16> = data[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        return String::from_utf16_lossy(&u16s);
-    }
-    // Check for UTF-16 BE BOM
-    if data.len() >= 2 && data[0] == 0xFE && data[1] == 0xFF {
-        let u16s: Vec<u16> = data[2..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-            .collect();
-        return String::from_utf16_lossy(&u16s);
-    }
-    
-    // Check for UTF-8 BOM
-    if data.len() >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
-        return String::from_utf8_lossy(&data[3..]).to_string();
-    }
-
-    // Default to UTF-8 lossy
-    String::from_utf8_lossy(data).to_string()
+    crate::parsers::utils::decode_text_lossy(data)
 }
 
 fn parse_with_new_formats(path: &str, data: &[u8]) -> Option<crate::parsers::ParsedContent> {
@@ -2715,8 +2965,23 @@ pub(crate) fn extract_bundle_file_sync(
     }
 
     let bundle_info = index.bundles.get(file_info.bundle_index as usize)?;
+    let raw = fetch_bundle_raw(bundle_info, reader, steam_loader)?;
 
-    let raw = if let Some(reader) = reader {
+    let mut cursor = std::io::Cursor::new(raw);
+    let header = crate::bundles::bundle::Bundle::read_header(&mut cursor).ok()?;
+    let data = header.decompress(&mut cursor).ok()?;
+    let start = file_info.file_offset as usize;
+    let end = start + file_info.file_size as usize;
+    if end <= data.len() { Some(data[start..end].to_vec()) } else { None }
+}
+
+/// Compressed bytes of one bundle, from the GGPK if it has them, else the Steam install.
+fn fetch_bundle_raw(
+    bundle_info: &crate::bundles::index::BundleInfo,
+    reader: Option<&GgpkReader>,
+    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+) -> Option<Vec<u8>> {
+    let from_ggpk = reader.and_then(|reader| {
         let candidates = [
             format!("Bundles2/{}", bundle_info.name),
             format!("Bundles2/{}.bundle.bin", bundle_info.name),
@@ -2726,17 +2991,65 @@ pub(crate) fn extract_bundle_file_sync(
                 reader.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec())
             })
         })
-    } else {
-        None
-    }
-    .or_else(|| steam_loader.and_then(|s| s.fetch_bundle(&bundle_info.name).ok()))?;
+    });
+    from_ggpk.or_else(|| steam_loader.and_then(|s| s.fetch_bundle(&bundle_info.name).ok()))
+}
 
-    let mut cursor = std::io::Cursor::new(raw);
-    let header = crate::bundles::bundle::Bundle::read_header(&mut cursor).ok()?;
-    let data = header.decompress(&mut cursor).ok()?;
-    let start = file_info.file_offset as usize;
-    let end = start + file_info.file_size as usize;
-    if end <= data.len() { Some(data[start..end].to_vec()) } else { None }
+fn is_dat_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".dat") || p.ends_with(".dat64") || p.ends_with(".datc64") || p.ends_with(".datl") || p.ends_with(".datl64")
+}
+
+fn dat_row_count(data: &[u8]) -> Option<u32> {
+    if data.len() < 12 {
+        return None;
+    }
+    let rc = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    (rc as usize <= data.len()).then_some(rc)
+}
+
+/// Row count of every DAT in the index. Each bundle is decompressed once and only the
+/// header of each file is read, so this is far cheaper than extracting the tables.
+pub(crate) fn scan_table_stats(
+    index: &crate::bundles::index::Index,
+    reader: Option<&GgpkReader>,
+    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+) -> Vec<crate::dat::analysis::TableStats> {
+    use crate::dat::analysis::TableStats;
+    let mut by_bundle: HashMap<u32, Vec<&crate::bundles::index::FileInfo>> = HashMap::new();
+    for f in index.files.values().filter(|f| is_dat_path(&f.path)) {
+        by_bundle.entry(f.bundle_index).or_default().push(f);
+    }
+    let mut out = Vec::new();
+    for (bundle_index, files) in by_bundle {
+        if bundle_index == crate::bundles::index::GGPK_LOOSE_FILE_SENTINEL {
+            let Some(r) = reader else { continue };
+            for f in files {
+                let Ok(Some(rec)) = r.read_file_by_path(&f.path) else { continue };
+                let Ok(data) = r.get_data_slice(rec.data_offset, rec.data_length) else { continue };
+                if let Some(row_count) = dat_row_count(data) {
+                    out.push(TableStats { path: f.path.clone(), row_count });
+                }
+            }
+            continue;
+        }
+        let Some(bundle_info) = index.bundles.get(bundle_index as usize) else { continue };
+        let Some(raw) = fetch_bundle_raw(bundle_info, reader, steam_loader) else { continue };
+        let mut cursor = std::io::Cursor::new(raw);
+        let Ok(header) = crate::bundles::bundle::Bundle::read_header(&mut cursor) else { continue };
+        let Ok(data) = header.decompress(&mut cursor) else { continue };
+        for f in files {
+            let start = f.file_offset as usize;
+            let end = start + f.file_size as usize;
+            if end > data.len() {
+                continue;
+            }
+            if let Some(row_count) = dat_row_count(&data[start..end]) {
+                out.push(TableStats { path: f.path.clone(), row_count });
+            }
+        }
+    }
+    out
 }
 
 fn find_file_info_by_path<'a>(
@@ -3139,5 +3452,320 @@ mod skill_graph_pipeline_tests {
     #[ignore]
     fn passive_tree_art_pipeline() {
         check_tree("metadata/passiveskillgraph.psg", 100);
+    }
+}
+
+#[cfg(test)]
+mod schema_discovery_tests {
+    use super::*;
+    use crate::bundles::index::Index as BundleIndex;
+    use crate::dat::analysis::{self, TableStats};
+    use crate::dat::reader::DatReader;
+    use std::sync::Arc;
+
+    /// Runs the discovery heuristics over the real game data: every schema table is
+    /// checked for drift and re-fitted, and every known foreign key is re-derived from
+    /// row counts alone to measure how often tightest-fit ranking finds the true target.
+    /// Run with: cargo test --release schema_discovery_real_data -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn schema_discovery_real_data() {
+        let settings = crate::settings::AppSettings::load();
+        let ggpk_path = settings.ggpk_path.expect("no ggpk_path configured");
+        let reader = Arc::new(GgpkReader::open(&ggpk_path).unwrap());
+        let is_poe2 = reader.is_poe2_heuristic();
+        let cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
+        let index = Arc::new(BundleIndex::load_from_cache(&cache_path).expect("run the app once to build the index cache"));
+        let schema_text = std::fs::read_to_string(crate::settings::AppSettings::get_app_data_dir().join("schema.min.json"))
+            .expect("schema.min.json not found (run the app once first)");
+        let schema: crate::dat::schema::Schema = serde_json::from_str(&schema_text).unwrap();
+
+        // DISCOVERY_EXTS=1 prints a histogram of file extensions in the index.
+        if std::env::var("DISCOVERY_EXTS").is_ok() {
+            let mut counts: HashMap<String, (usize, u64)> = HashMap::new();
+            for f in index.files.values() {
+                let ext = f.path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+                let e = counts.entry(ext).or_default();
+                e.0 += 1;
+                e.1 += f.file_size as u64;
+            }
+            let mut rows: Vec<_> = counts.into_iter().collect();
+            rows.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            for (ext, (n, bytes)) in rows.iter().take(60) {
+                println!("ext {:<12} {:>7} files {:>8.1} MB", ext, n, *bytes as f64 / 1e6);
+            }
+        }
+
+        // DISCOVERY_SAMPLE=ao,mat,pet prints the head of a few files per extension (UTF-16 decoded when BOM'd).
+        if let Ok(exts) = std::env::var("DISCOVERY_SAMPLE") {
+            for ext in exts.split(',') {
+                let suffix = format!(".{}", ext.trim().to_ascii_lowercase());
+                let mut files: Vec<&crate::bundles::index::FileInfo> = index
+                    .files
+                    .values()
+                    .filter(|f| f.path.to_ascii_lowercase().ends_with(&suffix) && f.file_size > 64)
+                    .collect();
+                files.sort_by_key(|f| f.file_size);
+                let picks = [files.get(files.len() / 4), files.get(files.len() / 2), files.get(files.len() * 3 / 4)];
+                for fi in picks.into_iter().flatten() {
+                    let Some(bytes) = extract_bundle_file_sync(fi, &index, Some(&reader), None) else { continue };
+                    let text = if bytes.starts_with(&[0xFF, 0xFE]) {
+                        let u: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+                        Some(String::from_utf16_lossy(&u))
+                    } else if bytes.iter().take(512).all(|b| *b == 9 || *b == 10 || *b == 13 || (32..127).contains(b)) {
+                        Some(String::from_utf8_lossy(&bytes).to_string())
+                    } else {
+                        None
+                    };
+                    println!("----- {} ({} bytes) -----", fi.path, bytes.len());
+                    match text {
+                        Some(t) => println!("{}", t.chars().take(700).collect::<String>()),
+                        None => println!("binary: {:02X?}", &bytes[..bytes.len().min(48)]),
+                    }
+                }
+            }
+        }
+
+        // DISCOVERY_VIEWERS=1 runs every dedicated parser over samples of real files and reports success rates.
+        if std::env::var("DISCOVERY_VIEWERS").is_ok() {
+            let sample = |ext: &str, n: usize| -> Vec<&crate::bundles::index::FileInfo> {
+                let suffix = format!(".{}", ext);
+                let mut files: Vec<&crate::bundles::index::FileInfo> =
+                    index.files.values().filter(|f| f.path.to_ascii_lowercase().ends_with(&suffix) && f.file_size > 32).collect();
+                files.sort_by_key(|f| f.path_hash);
+                let step = (files.len() / n).max(1);
+                files.into_iter().step_by(step).take(n).collect()
+            };
+            let text_of = |fi: &crate::bundles::index::FileInfo| extract_bundle_file_sync(fi, &index, Some(&reader), None).map(|b| crate::parsers::utils::decode_text_lossy(&b));
+            for ext in ["ao", "ot", "it", "act", "epk"] {
+                let files = sample(ext, 60);
+                let (mut ok, mut with_extends, mut fails) = (0, 0, Vec::new());
+                for fi in &files {
+                    let Some(t) = text_of(fi) else { continue };
+                    let d = crate::parsers::object_dsl::parse(&t);
+                    if !d.components.is_empty() || !d.props.is_empty() {
+                        ok += 1;
+                    } else if fails.len() < 3 {
+                        fails.push(fi.path.clone());
+                    }
+                    if d.extends.is_some() {
+                        with_extends += 1;
+                    }
+                }
+                println!("viewer {:<4} object    {:>3}/{:<3} parsed · {} with extends · empty: {:?}", ext, ok, files.len(), with_extends, fails);
+                for path in &fails {
+                    if let Some(t) = find_file_info_by_path(&index, path).and_then(text_of) {
+                        println!("    head of {}: {:?}", path, t.chars().take(160).collect::<String>());
+                    }
+                }
+            }
+            for ext in ["trl", "pet"] {
+                let files = sample(ext, 60);
+                let (mut curves_ok, mut json_ok, mut fails) = (0, 0, Vec::new());
+                for fi in &files {
+                    let Some(t) = text_of(fi) else { continue };
+                    if json_body(&t).is_some() {
+                        json_ok += 1;
+                        continue;
+                    }
+                    let c = crate::parsers::curves::parse(&t);
+                    if c.blocks.iter().any(|b| !b.curves.is_empty()) {
+                        curves_ok += 1;
+                    } else if fails.len() < 3 {
+                        fails.push(fi.path.clone());
+                    }
+                }
+                println!("viewer {:<4} curves    {:>3}/{:<3} with curves · {} json · no curves: {:?}", ext, curves_ok, files.len(), json_ok, fails);
+            }
+            for ext in ["mat", "env", "atl"] {
+                let files = sample(ext, 80);
+                let (mut ok, mut fails) = (0, Vec::new());
+                for fi in &files {
+                    let Some(t) = text_of(fi) else { continue };
+                    if json_body(&t).is_some() {
+                        ok += 1;
+                    } else if fails.len() < 3 {
+                        fails.push(fi.path.clone());
+                    }
+                }
+                println!("viewer {:<4} json      {:>3}/{:<3} parsed · not json: {:?}", ext, ok, files.len(), fails);
+            }
+            {
+                let files = sample("dgr", 60);
+                let (mut ok, mut fails) = (0, Vec::new());
+                for fi in &files {
+                    let Some(t) = text_of(fi) else { continue };
+                    match crate::parsers::level::parse_dgr(&t) {
+                        Ok(g) if !g.nodes.is_empty() => ok += 1,
+                        Ok(_) => fails.push(format!("{} (no nodes)", fi.path)),
+                        Err(e) => {
+                            if fails.len() < 3 {
+                                fails.push(format!("{} ({})", fi.path, e));
+                            }
+                        }
+                    }
+                }
+                println!("viewer dgr  graph     {:>3}/{:<3} parsed · {:?}", ok, files.len(), fails);
+                for f in &fails {
+                    let path = f.split(" (").next().unwrap_or(f);
+                    if let Some(t) = find_file_info_by_path(&index, path).and_then(text_of) {
+                        println!("    head of {}: {:?}", path, t.chars().take(220).collect::<String>());
+                    }
+                }
+            }
+            for ext in ["fmt", "tgm", "smd", "ast"] {
+                let files = sample(ext, 25);
+                let (mut parsed, mut drawable, mut fails) = (0, 0, Vec::new());
+                let t0 = std::time::Instant::now();
+                for fi in &files {
+                    let Some(bytes) = extract_bundle_file_sync(fi, &index, Some(&reader), None) else { continue };
+                    match crate::parsers::model::parse_model(&fi.path, &bytes) {
+                        Ok(m) => {
+                            parsed += 1;
+                            if crate::ui::mesh_preview::extract(&m).is_some() {
+                                drawable += 1;
+                            } else if fails.len() < 3 {
+                                let summary = m.summary().to_string();
+                                fails.push(format!("{} :: {}", fi.path, summary.chars().take(260).collect::<String>()));
+                            }
+                        }
+                        Err(e) => {
+                            if fails.len() < 3 {
+                                fails.push(format!("{} ({})", fi.path, e));
+                            }
+                        }
+                    }
+                }
+                println!("viewer {:<4} mesh      {:>3}/{:<3} parsed · {} drawable · {:.1?} · {:?}", ext, parsed, files.len(), drawable, t0.elapsed(), fails);
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let stats = scan_table_stats(&index, Some(&reader), None);
+        println!("scan_table_stats: {} tables in {:.1?}", stats.len(), t0.elapsed());
+        assert!(stats.len() > 100, "expected the index to hold hundreds of DAT files");
+
+        // DISCOVERY_FIND=mat_table prints every DAT whose path contains the text and whether it parses.
+        if let Ok(needle) = std::env::var("DISCOVERY_FIND") {
+            let needle = needle.to_ascii_lowercase();
+            for ts in stats.iter().filter(|t| t.path.to_ascii_lowercase().contains(&needle)) {
+                let parsed = find_file_info_by_path(&index, &ts.path)
+                    .and_then(|fi| extract_bundle_file_sync(fi, &index, Some(&reader), None))
+                    .map(|bytes| {
+                        let len = bytes.len();
+                        match DatReader::new(bytes, &ts.path) {
+                            Ok(d) => format!("{} bytes · {} rows · row_len {:?} · 64-bit {}", len, d.row_count, d.row_length, d.is_64bit),
+                            Err(e) => format!("{} bytes · not a DAT table: {}", len, e),
+                        }
+                    })
+                    .unwrap_or_else(|| "could not extract".into());
+                let stem = ts.path.rsplit('/').next().unwrap_or("").rsplit_once('.').map(|(s, _)| s).unwrap_or("");
+                let in_schema = schema.tables.iter().any(|t| t.name.eq_ignore_ascii_case(stem));
+                println!("find {:<50} schema:{} · {}", ts.path, in_schema, parsed);
+            }
+        }
+
+        let mut tables: Vec<&TableStats> = stats
+            .iter()
+            .filter(|t| {
+                // PoE 1 keeps tables in data/, PoE 2 in data/balance/; language copies sit one level deeper.
+                let p = t.path.to_ascii_lowercase();
+                let dir = p.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+                p.ends_with(".datc64") && (dir == "data" || dir == "data/balance")
+            })
+            .collect();
+        tables.sort_by(|a, b| a.path.cmp(&b.path));
+        println!("{} base-language tables", tables.len());
+
+        let (mut checked, mut drifted, mut unknown) = (0usize, 0usize, 0usize);
+        let (mut fk_total, mut fk_top1, mut fk_top5) = (0usize, 0usize, 0usize);
+        let mut misses: Vec<String> = Vec::new();
+        let t1 = std::time::Instant::now();
+        for ts in tables {
+            let stem = ts.path.rsplit('/').next().unwrap().trim_end_matches(".datc64");
+            let Some(tdef) = schema.find_table(stem, is_poe2) else {
+                unknown += 1;
+                println!("unknown {:<36} {} rows", stem, ts.row_count);
+                continue;
+            };
+            let Some(fi) = find_file_info_by_path(&index, &ts.path) else { continue };
+            let Some(bytes) = extract_bundle_file_sync(fi, &index, Some(&reader), None) else { continue };
+            let Ok(dat) = DatReader::new(bytes, &ts.path) else { continue };
+            let Some(row_len) = dat.row_length else { continue };
+            if dat.row_count == 0 {
+                continue;
+            }
+            checked += 1;
+            let schema_width = tdef.row_width(dat.is_64bit);
+            if row_len != schema_width {
+                drifted += 1;
+                let cols = analysis::analyze(&dat);
+                let (aligned, report) = analysis::align_schema(tdef, &cols, dat.is_64bit);
+                assert_eq!(aligned.row_width(dat.is_64bit), row_len, "aligned layout must tile the row: {}", ts.path);
+                println!(
+                    "drift {:<36} file {:>4} schema {:>4} → matched {:>3} added {:>2} dropped {:?}",
+                    tdef.name, row_len, schema_width, report.matched, report.added.len(), report.dropped
+                );
+                // DISCOVERY_DUMP=SkillGems prints the newly exposed columns with sample values.
+                if std::env::var("DISCOVERY_DUMP").map(|v| v.eq_ignore_ascii_case(&tdef.name)).unwrap_or(false) {
+                    let rows: Vec<_> = (0..dat.row_count.min(3)).filter_map(|r| dat.read_row(r, &aligned).ok()).collect();
+                    for &ci in &report.added {
+                        let col = &aligned.columns[ci];
+                        let samples: Vec<String> = rows
+                            .iter()
+                            .filter_map(|vals| vals.get(ci))
+                            .map(|v| {
+                                let mut s = dat.value_to_json(v, col).to_string();
+                                if s.len() > 60 {
+                                    s.truncate(60);
+                                    s.push('…');
+                                }
+                                s
+                            })
+                            .collect();
+                        println!("    new {:<22} {}", col.name.clone().unwrap_or_default(), samples.join(" | "));
+                    }
+                }
+                continue;
+            }
+            let base_dir = ts.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+            for (ci, st) in analysis::foreign_key_stats(&dat, tdef).iter().enumerate() {
+                let (Some(st), Some(refr)) = (st, tdef.columns[ci].references.as_ref()) else { continue };
+                if st.non_null == 0 {
+                    continue;
+                }
+                let ranked = analysis::rank_targets(st, &stats, base_dir, "datc64", &ts.path.to_ascii_lowercase(), 5, tdef.columns[ci].name.as_deref());
+                fk_total += 1;
+                match ranked.iter().position(|c| c.stem.eq_ignore_ascii_case(&refr.table)) {
+                    Some(0) => {
+                        fk_top1 += 1;
+                        fk_top5 += 1;
+                    }
+                    Some(_) => fk_top5 += 1,
+                    None => {
+                        if misses.len() < 20 {
+                            let col = tdef.columns[ci].name.clone().unwrap_or_default();
+                            let got: Vec<&str> = ranked.iter().map(|c| c.stem.as_str()).collect();
+                            misses.push(format!("{}.{} → {} (max index {}, got {:?})", tdef.name, col, refr.table, st.max_index, got));
+                        }
+                    }
+                }
+            }
+        }
+        println!("checked {} tables in {:.1?} · drifted {} · not in schema {}", checked, t1.elapsed(), drifted, unknown);
+        println!(
+            "foreign keys {} · true target ranked #1: {} ({:.0}%) · in top 5: {} ({:.0}%)",
+            fk_total,
+            fk_top1,
+            100.0 * fk_top1 as f32 / fk_total.max(1) as f32,
+            fk_top5,
+            100.0 * fk_top5 as f32 / fk_total.max(1) as f32
+        );
+        for m in &misses {
+            println!("  miss {}", m);
+        }
+        assert!(checked > 100);
+        assert!(fk_total > 50);
+        assert!(fk_top5 * 2 >= fk_total, "tightest-fit ranking should put the true target in the top 5 at least half the time");
     }
 }

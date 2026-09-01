@@ -116,6 +116,7 @@ impl ExplorerApp {
         } else {
              println!("Failed to read schema.min.json at {}", schema_path);
         }
+        content_view.dat_viewer.load_overrides();
 
 
         let patch_ver = settings.poe2_patch_version.as_str();

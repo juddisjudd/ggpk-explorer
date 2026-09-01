@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// `SCHEMA_VERSION` from dat-schema's `src/types.ts`. Bumped only on breaking changes.
 pub const SUPPORTED_SCHEMA_VERSION: u32 = 7;
@@ -7,7 +7,7 @@ pub const SUPPORTED_SCHEMA_VERSION: u32 = 7;
 pub const VALID_FOR_POE1: u32 = 0x01;
 pub const VALID_FOR_POE2: u32 = 0x02;
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Schema {
     pub version: u32,
     #[serde(rename = "createdAt")]
@@ -17,16 +17,19 @@ pub struct Schema {
     pub enumerations: Vec<Enumeration>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
     pub tags: Option<Vec<String>>,
     #[serde(rename = "validFor")]
     pub valid_for: Option<u32>,
+    /// Set on tables that come from the user's override file rather than the community schema.
+    #[serde(skip)]
+    pub custom: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Column {
     pub name: Option<String>,
     pub description: Option<String>,
@@ -39,19 +42,19 @@ pub struct Column {
     #[serde(default)]
     pub interval: bool,
     /// Extension hint when the column holds a virtual file path (e.g. ".dds").
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TableReference {
     pub table: String,
     pub column: Option<String>, // If null, row index?
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Enumeration {
     pub name: String,
     #[serde(rename = "validFor")]
@@ -62,7 +65,7 @@ pub struct Enumeration {
     pub enumerators: Vec<Option<String>>,
 }
 
-fn game_mask(is_poe2: bool) -> u32 {
+pub fn game_mask(is_poe2: bool) -> u32 {
     if is_poe2 { VALID_FOR_POE2 } else { VALID_FOR_POE1 }
 }
 
@@ -73,7 +76,25 @@ fn valid_for_game(valid_for: Option<u32>, is_poe2: bool) -> bool {
     }
 }
 
+fn games_overlap(a: Option<u32>, b: Option<u32>) -> bool {
+    let all = VALID_FOR_POE1 | VALID_FOR_POE2;
+    a.unwrap_or(all) & b.unwrap_or(all) != 0
+}
+
 impl Schema {
+    pub fn empty() -> Self {
+        Schema { version: SUPPORTED_SCHEMA_VERSION, created_at: 0, tables: Vec::new(), enumerations: Vec::new() }
+    }
+
+    /// Layers user-defined tables over the community ones: an override replaces every
+    /// same-named definition for the games it is valid for and is marked `custom`.
+    pub fn apply_overrides(&mut self, overrides: &[Table]) {
+        for o in overrides {
+            self.tables.retain(|t| !(t.name.eq_ignore_ascii_case(&o.name) && games_overlap(t.valid_for, o.valid_for)));
+            self.tables.push(Table { custom: true, ..o.clone() });
+        }
+    }
+
     /// Table definition for `name` (case-insensitive) valid for the given game.
     /// Falls back to a definition for the other game if that is all the schema has.
     pub fn find_table(&self, name: &str, is_poe2: bool) -> Option<&Table> {
@@ -143,7 +164,7 @@ mod tests {
 
     #[test]
     fn find_table_prefers_matching_game() {
-        let mk = |valid_for: u32| Table { name: "T".into(), columns: vec![], tags: None, valid_for: Some(valid_for) };
+        let mk = |valid_for: u32| Table { name: "T".into(), columns: vec![], tags: None, valid_for: Some(valid_for), custom: false };
         let schema = Schema { version: 7, created_at: 0, tables: vec![mk(1), mk(2)], enumerations: vec![] };
         assert_eq!(schema.find_table("t", false).unwrap().valid_for, Some(1));
         assert_eq!(schema.find_table("t", true).unwrap().valid_for, Some(2));

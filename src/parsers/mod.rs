@@ -1,6 +1,9 @@
 pub mod fmod_bank;
 pub mod fxgraph;
 pub mod model;
+pub mod object_dsl;
+pub mod curves;
+pub mod level;
 pub mod graphics;
 pub mod skeletal;
 pub mod text_config;

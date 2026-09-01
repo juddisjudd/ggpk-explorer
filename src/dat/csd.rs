@@ -8,6 +8,8 @@ pub struct CsdFile {
     pub path: String,
     pub entries: Vec<CsdEntry>,
     pub languages: Vec<String>,
+    /// Other `.csd` files this one pulls in with `include "…"`.
+    pub includes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,13 +44,21 @@ pub fn parse_csd(data: &[u8], file_path: &str) -> Result<CsdFile, String> {
         .map_err(|e| format!("Failed to decode UTF-16LE: {}", e))?;
 
     let mut entries = Vec::new();
+    let mut includes = Vec::new();
     let mut languages = HashSet::new();
     let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
 
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
-        if line.starts_with('\t') || line.starts_with("include") {
+        if line.starts_with("include") {
+            if let Some(path) = line.split('"').nth(1) {
+                includes.push(path.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if line.starts_with('\t') {
             i += 1;
             continue;
         }
@@ -201,6 +211,7 @@ pub fn parse_csd(data: &[u8], file_path: &str) -> Result<CsdFile, String> {
     Ok(CsdFile {
         path: file_path.to_string(),
         entries,
+        includes,
         languages: {
             let mut l: Vec<_> = languages.into_iter().collect();
             l.sort();

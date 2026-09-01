@@ -1,9 +1,11 @@
 //! Column-type guessing for DAT tables that have no schema entry. Scans the fixed
 //! section byte-by-byte the way poe-dat-viewer's analysis does, then greedily
-//! assigns the widest type that every row satisfies.
+//! assigns the widest type that every row satisfies. Also aligns a stale schema
+//! onto a guessed layout and ranks likely foreign-key targets by row count.
 
-use crate::dat::reader::DatReader;
-use crate::dat::schema::{Column, Table};
+use crate::dat::reader::{get_column_size, DatReader, DatValue};
+use crate::dat::schema::{Column, Table, TableReference};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Guess {
@@ -39,6 +41,10 @@ pub struct GuessedColumn {
     pub offset: usize,
     pub size: usize,
     pub guess: Guess,
+    /// Every row is all zero bytes here, so the guess is a default rather than evidence.
+    pub blank: bool,
+    /// Small non-negative integers with few distinct values — the shape of an `enumrow`.
+    pub enum_like: bool,
 }
 
 const NULL64: u64 = 0xfefe_fefe_fefe_fefe;
@@ -79,6 +85,41 @@ impl<'a> Scan<'a> {
 
     fn max_byte(&self, o: usize) -> u8 {
         (0..self.rows).map(|i| self.row(i)[o]).max().unwrap_or(0)
+    }
+
+    fn is_blank(&self, o: usize, size: usize) -> bool {
+        (0..self.rows).all(|i| self.row(i)[o..o + size].iter().all(|&b| b == 0))
+    }
+
+    /// Every row carries the 0xFE null-reference sentinel at this byte.
+    fn fe_byte(&self, o: usize) -> bool {
+        o < self.row_len && (0..self.rows).all(|i| self.row(i)[o] == 0xFE)
+    }
+
+    /// A sentinel byte within the next three means no 4-byte number can start here.
+    fn sentinel_follows(&self, o: usize) -> bool {
+        (1..4).any(|k| self.fe_byte(o + k))
+    }
+
+    fn enum_like(&self, o: usize) -> bool {
+        if self.rows < 8 || o + 4 > self.row_len {
+            return false;
+        }
+        let mut seen = [false; 256];
+        let mut distinct = 0usize;
+        let mut max = 0usize;
+        for i in 0..self.rows {
+            let v = self.u32_at(i, o) as usize;
+            if v >= seen.len() {
+                return false;
+            }
+            if !seen[v] {
+                seen[v] = true;
+                distinct += 1;
+            }
+            max = max.max(v);
+        }
+        (2..=32).contains(&distinct) && max < distinct * 2
     }
 
     /// `Some(non_empty)` when `p` is a plausible string pointer, `None` otherwise.
@@ -129,12 +170,11 @@ impl<'a> Scan<'a> {
     }
 
     /// Self-references are rare and a small int followed by zeros looks identical,
-    /// so only claim `row` when the null sentinel actually appears.
+    /// so only claim `row` when the null sentinel actually appears (even in every row).
     fn is_row_col(&self, o: usize) -> bool {
         if o + self.ptr > self.row_len || self.rows < 2 {
             return false;
         }
-        let mut non_null = 0;
         let mut nulls = 0;
         for i in 0..self.rows {
             let v = self.ptr_at(i, o);
@@ -145,17 +185,17 @@ impl<'a> Scan<'a> {
             if v as usize >= self.rows {
                 return false;
             }
-            non_null += 1;
         }
-        non_null > 0 && nulls > 0
+        nulls > 0
     }
 
+    /// Accepts columns that are null in every row: PoE 2 tables carry many
+    /// PoE 1-era references that are never set.
     fn is_foreign_col(&self, o: usize) -> bool {
         let size = self.ptr * 2;
-        if o + size > self.row_len {
+        if o + size > self.row_len || self.rows == 0 {
             return false;
         }
-        let mut non_null = 0;
         for i in 0..self.rows {
             let lo = self.ptr_at(i, o);
             let hi = self.ptr_at(i, o + self.ptr);
@@ -165,9 +205,8 @@ impl<'a> Scan<'a> {
             if hi != 0 || lo >= 0x10_0000 {
                 return false;
             }
-            non_null += 1;
         }
-        non_null > 0
+        true
     }
 
     /// Array columns are `(count, pointer)`; returns the element type when every row fits.
@@ -252,8 +291,10 @@ impl<'a> Scan<'a> {
         if self.max_byte(o) > 1 {
             return false;
         }
+        // An all-false bool is indistinguishable from a zero byte unless a null
+        // sentinel starts right after it, which rules out a wider number.
         let any_set = (0..self.rows).any(|i| self.row(i)[o] == 1);
-        if !any_set {
+        if !any_set && !self.sentinel_follows(o) {
             return false;
         }
         // Three trailing zero bytes look more like a small i32 than a bool.
@@ -309,7 +350,11 @@ pub fn analyze(reader: &DatReader) -> Vec<GuessedColumn> {
 
     let mut cols = Vec::new();
     let mut o = 0usize;
-    let mut push = |offset: usize, size: usize, guess: Guess| cols.push(GuessedColumn { offset, size, guess });
+    let mut push = |offset: usize, size: usize, guess: Guess| {
+        let blank = scan.is_blank(offset, size);
+        let enum_like = guess == Guess::I32 && !blank && scan.enum_like(offset);
+        cols.push(GuessedColumn { offset, size, guess, blank, enum_like });
+    };
     while o < row_len {
         let p2 = scan.ptr * 2;
         if o + p2 <= row_len {
@@ -339,6 +384,13 @@ pub fn analyze(reader: &DatReader) -> Vec<GuessedColumn> {
             o += 1;
             continue;
         }
+        // Inside or right before a null sentinel: step one byte so the next
+        // reference is found on its real boundary instead of swallowed by an i32.
+        if scan.fe_byte(o) || scan.sentinel_follows(o) {
+            push(o, 1, Guess::U8);
+            o += 1;
+            continue;
+        }
         if o + 4 <= row_len {
             push(o, 4, scan.numeric_4(o));
             o += 4;
@@ -353,30 +405,393 @@ pub fn analyze(reader: &DatReader) -> Vec<GuessedColumn> {
     cols
 }
 
+/// Schema column for one guess; `note` says where the guess came from.
+pub fn synth_column(c: &GuessedColumn, note: &str) -> Column {
+    let (ty, array) = match &c.guess {
+        Guess::Array(e) => (e.type_name(), true),
+        g => (g.type_name(), false),
+    };
+    let mut name = format!("@{} {}", c.offset, c.guess.type_name());
+    let mut description = format!("{}: {} bytes at offset {}", note, c.size, c.offset);
+    if c.enum_like {
+        name.push_str(" enum?");
+        description.push_str(" · small contiguous values, looks like an enumrow");
+    }
+    if c.blank {
+        description.push_str(" · all rows are zero, type is a default");
+    }
+    Column {
+        name: Some(name),
+        description: Some(description),
+        array,
+        r#type: ty,
+        unique: false,
+        localized: false,
+        references: None,
+        interval: false,
+        file: None,
+        files: None,
+    }
+}
+
 /// Synthetic schema table the regular reader/viewer can consume.
 pub fn to_table(cols: &[GuessedColumn], name: &str) -> Table {
-    let columns = cols
-        .iter()
-        .map(|c| {
-            let (ty, array) = match &c.guess {
-                Guess::Array(e) => (e.type_name(), true),
-                g => (g.type_name(), false),
-            };
-            Column {
-                name: Some(format!("@{} {}", c.offset, c.guess.type_name())),
-                description: Some(format!("Guessed from data: {} bytes at offset {} (table not in schema)", c.size, c.offset)),
-                array,
-                r#type: ty,
-                unique: false,
-                localized: false,
-                references: None,
-                interval: false,
-                file: None,
-                files: None,
+    let columns = cols.iter().map(|c| synth_column(c, "Guessed from data (table not in schema)")).collect();
+    Table { name: name.to_string(), columns, tags: None, valid_for: None, custom: false }
+}
+
+// ── Schema drift alignment ──────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default)]
+pub struct AlignReport {
+    pub matched: usize,
+    /// Indices in the aligned table with no schema counterpart.
+    pub added: Vec<usize>,
+    /// Schema columns that found no place in the file's layout.
+    pub dropped: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Bool,
+    Byte,
+    Short,
+    Int,
+    Float,
+    Long,
+    Str,
+    Row,
+    Foreign,
+    Array,
+    Other,
+}
+
+fn schema_kind(col: &Column) -> Kind {
+    if col.array {
+        return Kind::Array;
+    }
+    match col.r#type.as_str() {
+        "bool" => Kind::Bool,
+        "byte" | "u8" => Kind::Byte,
+        "short" | "i16" | "u16" | "ushort" => Kind::Short,
+        "int" | "i32" | "u32" | "uint" | "enumrow" => Kind::Int,
+        "float" | "f32" => Kind::Float,
+        "long" | "i64" | "u64" | "ulong" => Kind::Long,
+        "string" | "ref|string" => Kind::Str,
+        "foreignrow" | "foreign_row" => Kind::Foreign,
+        t if t == "row" || t.starts_with("ref|") => Kind::Row,
+        _ => Kind::Other,
+    }
+}
+
+/// Numeric guesses carry little evidence; a blank or numeric span could be almost anything.
+fn is_weak(g: &Guess) -> bool {
+    matches!(g, Guess::Bool | Guess::U8 | Guess::I16 | Guess::I32 | Guess::F32)
+}
+
+fn scalar_fits(kind: Kind, g: &Guess) -> bool {
+    match kind {
+        Kind::Bool | Kind::Byte => matches!(g, Guess::Bool | Guess::U8),
+        Kind::Short => matches!(g, Guess::I16),
+        Kind::Int => matches!(g, Guess::I32),
+        Kind::Float => matches!(g, Guess::F32 | Guess::I32),
+        Kind::Str => matches!(g, Guess::String),
+        Kind::Row => matches!(g, Guess::Row),
+        Kind::Foreign => matches!(g, Guess::ForeignRow),
+        Kind::Long | Kind::Other => is_weak(g),
+        Kind::Array => false,
+    }
+}
+
+fn array_fits(col: &Column, g: &Guess) -> bool {
+    let Guess::Array(e) = g else { return false };
+    match col.r#type.as_str() {
+        "string" | "ref|string" => **e == Guess::String,
+        "foreignrow" | "foreign_row" => **e == Guess::ForeignRow,
+        _ => !matches!(**e, Guess::String | Guess::ForeignRow),
+    }
+}
+
+/// Score for placing `col` over `run` (consecutive guesses); `None` when the data rules it out.
+fn match_score(col: &Column, run: &[&GuessedColumn], is_64bit: bool) -> Option<u32> {
+    let size: usize = run.iter().map(|g| g.size).sum();
+    if size != get_column_size(col, is_64bit) {
+        return None;
+    }
+    let kind = schema_kind(col);
+    let exact = match kind {
+        Kind::Array => run.len() == 1 && array_fits(col, &run[0].guess),
+        Kind::Long | Kind::Other => run.iter().all(|g| is_weak(&g.guess)),
+        k if col.interval => run.len() == 2 && run.iter().all(|g| scalar_fits(k, &g.guess)),
+        k => run.len() == 1 && scalar_fits(k, &run[0].guess),
+    };
+    if exact {
+        let strong = matches!(kind, Kind::Str | Kind::Row | Kind::Foreign | Kind::Array);
+        return Some(if strong { 3 } else { 2 });
+    }
+    if run.iter().all(|g| g.blank) {
+        return Some(1);
+    }
+    None
+}
+
+const MAX_RUN: usize = 8;
+
+/// Carries names, types and references from a stale schema onto the layout guessed
+/// from the file. Columns are matched by size and type evidence with a longest-common-
+/// subsequence pass; on ties the earliest positions keep their schema names, so an
+/// inserted column shows up as a new `@offset` column rather than shifting every name.
+pub fn align_schema(schema: &Table, guessed: &[GuessedColumn], is_64bit: bool) -> (Table, AlignReport) {
+    // Reversed inputs make the forward DP's "prefer a match at the end" tie-break
+    // anchor the *start* of the row in original order.
+    let cols: Vec<&Column> = schema.columns.iter().rev().collect();
+    let gs: Vec<&GuessedColumn> = guessed.iter().rev().collect();
+    let (n, m) = (cols.len(), gs.len());
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    let mut how = vec![vec![0u8; m + 1]; n + 1];
+    for i in 0..=n {
+        for j in 0..=m {
+            if i == 0 && j == 0 {
+                continue;
             }
+            let mut best = 0;
+            let mut step = 0u8;
+            if i > 0 {
+                best = dp[i - 1][j];
+                step = 1;
+            }
+            if j > 0 && (step == 0 || dp[i][j - 1] > best) {
+                best = dp[i][j - 1];
+                step = 2;
+            }
+            if i > 0 {
+                for k in 1..=MAX_RUN.min(j) {
+                    if let Some(s) = match_score(cols[i - 1], &gs[j - k..j], is_64bit) {
+                        let v = dp[i - 1][j - k] + s;
+                        if v >= best {
+                            best = v;
+                            step = 2 + k as u8;
+                        }
+                    }
+                }
+            }
+            dp[i][j] = best;
+            how[i][j] = step;
+        }
+    }
+
+    // (schema index, guessed start, guessed end) in original order.
+    let mut matches: Vec<(usize, usize, usize)> = Vec::new();
+    let (mut i, mut j) = (n, m);
+    while i > 0 || j > 0 {
+        match how[i][j] {
+            1 => i -= 1,
+            2 => j -= 1,
+            s => {
+                let k = (s - 2) as usize;
+                matches.push((n - i, m - j, m - (j - k)));
+                i -= 1;
+                j -= k;
+            }
+        }
+    }
+    matches.sort_by_key(|&(_, lo, _)| lo);
+
+    let mut columns = Vec::with_capacity(guessed.len());
+    let mut report = AlignReport::default();
+    let mut placed = vec![false; schema.columns.len()];
+    let mut j = 0;
+    let mut mi = 0;
+    while j < guessed.len() {
+        if mi < matches.len() && matches[mi].1 == j {
+            let (si, _, hi) = matches[mi];
+            columns.push(schema.columns[si].clone());
+            placed[si] = true;
+            report.matched += 1;
+            j = hi;
+            mi += 1;
+        } else {
+            report.added.push(columns.len());
+            columns.push(synth_column(&guessed[j], "New column, not in the schema"));
+            j += 1;
+        }
+    }
+    report.dropped = schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !placed[*i])
+        .map(|(i, c)| c.name.clone().unwrap_or_else(|| format!("_{}", i)))
+        .collect();
+    let table = Table { name: schema.name.clone(), columns, tags: schema.tags.clone(), valid_for: schema.valid_for, custom: false };
+    (table, report)
+}
+
+// ── Foreign-key target inference ────────────────────────────────────────────
+
+/// Row count of one DAT file in the index, gathered once per session.
+#[derive(Debug, Clone)]
+pub struct TableStats {
+    pub path: String,
+    pub row_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FkColumnStats {
+    pub max_index: u64,
+    pub distinct: usize,
+    pub non_null: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct FkCandidate {
+    pub stem: String,
+    pub row_count: u32,
+    /// Share of the candidate's rows the column's indices span; 1.0 is a perfect fit.
+    pub fit: f32,
+    /// The column's name points at this table (`StatsKeys` → `Stats`).
+    pub name_match: bool,
+}
+
+fn normalized_name(name: &str) -> String {
+    let mut n: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    n.make_ascii_lowercase();
+    for suffix in ["keys", "key", "ids", "id"] {
+        if n.ends_with(suffix) && n.len() > suffix.len() + 2 {
+            n.truncate(n.len() - suffix.len());
+            break;
+        }
+    }
+    n
+}
+
+/// How strongly a column name points at a table: 3 exact (± plural), 2 prefix, 1 substring.
+fn name_affinity(column: Option<&str>, stem: &str) -> u8 {
+    let Some(column) = column else { return 0 };
+    let n = normalized_name(column);
+    let s = stem.to_ascii_lowercase();
+    if n.len() < 3 {
+        return 0;
+    }
+    if n == s || format!("{}s", n) == s || n == format!("{}s", s) {
+        return 3;
+    }
+    let singular = s.strip_suffix('s').unwrap_or(&s);
+    if n.len() >= 4 && singular.len() >= 4 && (s.starts_with(&n) || n.starts_with(singular)) {
+        return 2;
+    }
+    if n.len() >= 5 && s.len() >= 5 && (s.contains(&n) || n.contains(&s)) {
+        return 1;
+    }
+    0
+}
+
+pub fn is_foreign(col: &Column) -> bool {
+    matches!(col.r#type.as_str(), "foreignrow" | "foreign_row")
+}
+
+pub fn has_unresolved_foreign(table: &Table) -> bool {
+    table.columns.iter().any(|c| is_foreign(c) && c.references.is_none())
+}
+
+const MAX_LIST_SCAN: usize = 4096;
+
+/// Index statistics for every `foreignrow` column (None for the others).
+pub fn foreign_key_stats(reader: &DatReader, table: &Table) -> Vec<Option<FkColumnStats>> {
+    let mut out = vec![None; table.columns.len()];
+    let fk_cols: Vec<usize> = table.columns.iter().enumerate().filter(|(_, c)| is_foreign(c)).map(|(i, _)| i).collect();
+    if fk_cols.is_empty() {
+        return out;
+    }
+    let mut seen: Vec<HashSet<u64>> = vec![HashSet::new(); table.columns.len()];
+    let mut stats = vec![FkColumnStats::default(); table.columns.len()];
+    let note = |ci: usize, k: usize, seen: &mut Vec<HashSet<u64>>, stats: &mut Vec<FkColumnStats>| {
+        if k == usize::MAX {
+            return;
+        }
+        let s = &mut stats[ci];
+        s.non_null += 1;
+        s.max_index = s.max_index.max(k as u64);
+        if seen[ci].insert(k as u64) {
+            s.distinct += 1;
+        }
+    };
+    for r in 0..reader.row_count {
+        let Ok(vals) = reader.read_row(r, table) else { continue };
+        for &ci in &fk_cols {
+            match vals.get(ci) {
+                Some(DatValue::ForeignRow(k)) => note(ci, *k, &mut seen, &mut stats),
+                Some(DatValue::List(count, off)) if *count > 0 => {
+                    if let Ok(items) = reader.read_list_values(*off, (*count).min(MAX_LIST_SCAN), &table.columns[ci]) {
+                        for item in items {
+                            if let DatValue::ForeignRow(k) = item {
+                                note(ci, k, &mut seen, &mut stats);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for ci in fk_cols {
+        out[ci] = Some(stats[ci]);
+    }
+    out
+}
+
+fn path_stem(path: &str) -> String {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.rsplit_once('.').map(|(s, _)| s).unwrap_or(file).to_string()
+}
+
+/// Tables that could be the target of a column with these statistics: tables the column's
+/// name points at come first, then the tightest fit by row count. Only files in the same
+/// directory and with the same extension as the current file count, which keeps the
+/// per-language copies under `data/balance/<lang>/` out of the running.
+pub fn rank_targets(
+    stats: &FkColumnStats,
+    tables: &[TableStats],
+    base_dir: &str,
+    ext: &str,
+    exclude_path: &str,
+    limit: usize,
+    column_name: Option<&str>,
+) -> Vec<FkCandidate> {
+    if stats.non_null == 0 {
+        return Vec::new();
+    }
+    let prefix = if base_dir.is_empty() { String::new() } else { format!("{}/", base_dir.to_ascii_lowercase()) };
+    let suffix = format!(".{}", ext.to_ascii_lowercase());
+    let mut scored: Vec<(u8, FkCandidate)> = tables
+        .iter()
+        .filter(|t| {
+            let p = t.path.to_ascii_lowercase();
+            p.starts_with(&prefix)
+                && p.ends_with(&suffix)
+                && !p[prefix.len()..].contains('/')
+                && !p.eq_ignore_ascii_case(exclude_path)
+                && (t.row_count as u64) > stats.max_index
+        })
+        .map(|t| {
+            let stem = path_stem(&t.path);
+            let affinity = name_affinity(column_name, &stem);
+            let cand = FkCandidate {
+                stem,
+                row_count: t.row_count,
+                fit: (stats.max_index + 1) as f32 / t.row_count as f32,
+                name_match: affinity > 0,
+            };
+            (affinity, cand)
         })
         .collect();
-    Table { name: name.to_string(), columns, tags: None, valid_for: None }
+    scored.sort_by(|(aa, a), (ab, b)| ab.cmp(aa).then(a.row_count.cmp(&b.row_count)).then_with(|| a.stem.cmp(&b.stem)));
+    scored.truncate(limit);
+    scored.into_iter().map(|(_, c)| c).collect()
+}
+
+pub fn reference_to(table: &str) -> TableReference {
+    TableReference { table: table.to_string(), column: None }
 }
 
 #[cfg(test)]
@@ -422,6 +837,150 @@ mod tests {
         let table = to_table(&cols, "synthetic");
         let row = reader.read_row(1, &table).unwrap();
         assert!(matches!(row[1], crate::dat::reader::DatValue::String(ref s) if s == "beta"));
+    }
+
+    fn col(name: &str, ty: &str) -> Column {
+        Column {
+            name: Some(name.into()),
+            description: None,
+            array: false,
+            r#type: ty.into(),
+            unique: false,
+            localized: false,
+            references: None,
+            interval: false,
+            file: None,
+            files: None,
+        }
+    }
+
+    fn g(offset: usize, size: usize, guess: Guess) -> GuessedColumn {
+        GuessedColumn { offset, size, guess, blank: false, enum_like: false }
+    }
+
+    fn table(cols: Vec<Column>) -> Table {
+        Table { name: "T".into(), columns: cols, tags: None, valid_for: None, custom: false }
+    }
+
+    fn names(t: &Table) -> Vec<String> {
+        t.columns.iter().map(|c| c.name.clone().unwrap_or_default()).collect()
+    }
+
+    #[test]
+    fn align_keeps_names_when_column_inserted() {
+        let schema = table(vec![col("A", "i32"), col("B", "string"), col("C", "bool")]);
+        let guessed = vec![g(0, 4, Guess::I32), g(4, 4, Guess::I32), g(8, 8, Guess::String), g(16, 1, Guess::Bool)];
+        let (t, report) = align_schema(&schema, &guessed, true);
+        assert_eq!(names(&t), vec!["A", "@4 i32", "B", "C"]);
+        assert_eq!(report.matched, 3);
+        assert_eq!(report.added, vec![1]);
+        assert!(report.dropped.is_empty());
+        assert_eq!(t.row_width(true), 17);
+    }
+
+    #[test]
+    fn align_prefers_earliest_position_on_ties() {
+        let schema = table(vec![col("A", "i32"), col("B", "i32")]);
+        let guessed = vec![g(0, 4, Guess::I32), g(4, 4, Guess::I32), g(8, 4, Guess::I32)];
+        let (t, report) = align_schema(&schema, &guessed, true);
+        assert_eq!(names(&t), vec!["A", "B", "@8 i32"]);
+        assert_eq!(report.added, vec![2]);
+    }
+
+    #[test]
+    fn align_drops_removed_columns_and_spans_intervals() {
+        let mut range = col("Range", "i32");
+        range.interval = true;
+        let schema = table(vec![col("Id", "string"), col("Gone", "foreignrow"), range, col("Flag", "bool")]);
+        let guessed = vec![g(0, 8, Guess::String), g(8, 4, Guess::I32), g(12, 4, Guess::I32), g(16, 1, Guess::Bool)];
+        let (t, report) = align_schema(&schema, &guessed, true);
+        assert_eq!(names(&t), vec!["Id", "Range", "Flag"]);
+        assert_eq!(report.dropped, vec!["Gone"]);
+        assert!(t.columns[1].interval);
+    }
+
+    #[test]
+    fn align_rejects_type_conflicts_unless_blank() {
+        let schema = table(vec![col("Id", "string")]);
+        let (t, _) = align_schema(&schema, &[g(0, 8, Guess::Row), g(8, 1, Guess::Bool)], true);
+        assert_eq!(names(&t)[0], "@0 row");
+        let mut blank = g(0, 8, Guess::I32);
+        blank.size = 8;
+        blank.blank = true;
+        let (t, _) = align_schema(&schema, &[blank], true);
+        assert_eq!(names(&t), vec!["Id"]);
+    }
+
+    #[test]
+    fn ranks_tightest_fitting_table_first() {
+        let stats = FkColumnStats { max_index: 7, distinct: 3, non_null: 3 };
+        let tables = vec![
+            TableStats { path: "Data/Small.datc64".into(), row_count: 5 },
+            TableStats { path: "Data/Right.datc64".into(), row_count: 8 },
+            TableStats { path: "Data/Big.datc64".into(), row_count: 100 },
+            TableStats { path: "Data/Self.datc64".into(), row_count: 50 },
+            TableStats { path: "Other/Elsewhere.datc64".into(), row_count: 9 },
+            TableStats { path: "Data/Legacy.dat".into(), row_count: 9 },
+            TableStats { path: "Data/French/Right.datc64".into(), row_count: 8 },
+        ];
+        let ranked = rank_targets(&stats, &tables, "Data", "datc64", "data/self.datc64", 10, None);
+        let stems: Vec<_> = ranked.iter().map(|c| c.stem.as_str()).collect();
+        assert_eq!(stems, vec!["Right", "Big"]);
+        assert!((ranked[0].fit - 1.0).abs() < 1e-6);
+        assert!(ranked.iter().all(|c| !c.name_match));
+        assert!(rank_targets(&FkColumnStats::default(), &tables, "Data", "datc64", "", 10, None).is_empty());
+
+        let named = rank_targets(&stats, &tables, "Data", "datc64", "data/self.datc64", 10, Some("BigKeys"));
+        assert_eq!(named[0].stem, "Big");
+        assert!(named[0].name_match);
+        assert!(!named[1].name_match);
+    }
+
+    #[test]
+    fn name_affinity_handles_plurals_and_suffixes() {
+        assert_eq!(name_affinity(Some("StatsKeys"), "Stats"), 3);
+        assert_eq!(name_affinity(Some("Mod"), "Mods"), 3);
+        assert_eq!(name_affinity(Some("BaseItemType"), "BaseItemTypes"), 3);
+        assert_eq!(name_affinity(Some("LeagueInfoPanel"), "LeagueInfoPanelVersions"), 2);
+        assert_eq!(name_affinity(Some("QuestFlagHeard"), "QuestFlags"), 2);
+        assert_eq!(name_affinity(Some("T17SpawnChanceStatsKey"), "Stats"), 1);
+        assert_eq!(name_affinity(Some("Mod"), "ModFamily"), 0);
+        assert_eq!(name_affinity(Some("@16 foreignrow"), "Mods"), 0);
+        assert_eq!(name_affinity(None, "Mods"), 0);
+    }
+
+    #[test]
+    fn sentinel_spans_are_null_references_not_ints() {
+        // Rows: bool(false in every row) · foreignrow(null) · row(null) · i32
+        let mut data = 4u32.to_le_bytes().to_vec();
+        for i in 0..4u32 {
+            data.push(0);
+            data.extend_from_slice(&[0xFE; 16]);
+            data.extend_from_slice(&[0xFE; 8]);
+            data.extend_from_slice(&(i * 10).to_le_bytes());
+        }
+        data.extend_from_slice(&[0xBB; 8]);
+        let reader = DatReader::new(data, "s.datc64").unwrap();
+        let kinds: Vec<_> = analyze(&reader).iter().map(|c| c.guess.clone()).collect();
+        assert_eq!(kinds, vec![Guess::Bool, Guess::ForeignRow, Guess::Row, Guess::I32]);
+    }
+
+    #[test]
+    fn enum_hint_needs_small_contiguous_values() {
+        let build = |values: &[u32]| {
+            let mut data = (values.len() as u32).to_le_bytes().to_vec();
+            for v in values {
+                data.extend_from_slice(&v.to_le_bytes());
+                data.extend_from_slice(&[0u8; 4]);
+            }
+            data.extend_from_slice(&[0xBB; 8]);
+            DatReader::new(data, "e.datc64").unwrap()
+        };
+        let enumish = build(&[0, 1, 2, 3, 0, 1, 2, 3, 1, 2]);
+        assert!(analyze(&enumish)[0].enum_like);
+        let sparse = build(&[0, 100, 0, 100, 0, 100, 0, 100, 0, 100]);
+        assert!(!analyze(&sparse)[0].enum_like);
+        assert!(analyze(&sparse)[1].blank);
     }
 
     /// Guesses must tile the whole row; prints them next to the schema when one is cached.

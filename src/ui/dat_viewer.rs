@@ -1,11 +1,14 @@
-use crate::dat::reader::{DatReader, DatValue};
-use crate::dat::schema::{Column, Schema, Table, SUPPORTED_SCHEMA_VERSION};
+use crate::dat::analysis::{self, AlignReport, FkCandidate, TableStats};
+use crate::dat::overrides::Overrides;
+use crate::dat::reader::{get_column_size, DatReader, DatValue};
+use crate::dat::schema::{game_mask, Column, Schema, Table, SUPPORTED_SCHEMA_VERSION};
 use crate::ggpk::reader::GgpkReader;
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column as TCol, TableBuilder};
 use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Loads the bytes of another virtual file by path; used to resolve foreign keys.
@@ -53,6 +56,20 @@ pub struct DatViewer {
     /// Column layout guessed from the data when the schema has no entry for this table.
     guessed: Option<Arc<Table>>,
     byte_view: bool,
+    /// Community schema before user overrides are layered on.
+    base_schema: Option<Schema>,
+    overrides: Overrides,
+    overrides_path: PathBuf,
+    /// Schema layout re-fitted onto the file after its row width drifted (keyed by schema_gen).
+    aligned: Option<(u64, Arc<Table>, AlignReport)>,
+    use_aligned: bool,
+    /// Row count of every DAT in the index, supplied by the content view for FK inference.
+    pub table_stats: Option<Arc<Vec<TableStats>>>,
+    pub request_table_stats: bool,
+    pub table_stats_loading: bool,
+    fk_suggestions: Option<(usize, HashMap<usize, Vec<FkCandidate>>)>,
+    editor: Option<SchemaEditor>,
+    notice: Option<String>,
 }
 
 impl Default for DatViewer {
@@ -80,7 +97,89 @@ impl Default for DatViewer {
             related: HashMap::new(),
             guessed: None,
             byte_view: false,
+            base_schema: None,
+            overrides: Overrides::default(),
+            overrides_path: Overrides::default_path(),
+            aligned: None,
+            use_aligned: true,
+            table_stats: None,
+            request_table_stats: false,
+            table_stats_loading: false,
+            fk_suggestions: None,
+            editor: None,
+            notice: None,
         }
+    }
+}
+
+/// Where the column layout being shown came from.
+#[derive(Clone, Copy, PartialEq)]
+enum Layout {
+    Schema,
+    Custom,
+    Aligned,
+    Guessed,
+}
+
+/// Mutations collected while the table is drawn and applied once its borrows end.
+enum Deferred {
+    Save { name: String, columns: Vec<Column> },
+    Revert(String),
+}
+
+struct SchemaEditor {
+    name: String,
+    columns: Vec<Column>,
+    dirty: bool,
+}
+
+#[derive(PartialEq)]
+enum EditorAction {
+    None,
+    Save,
+    Revert,
+    Close,
+}
+
+const EDITOR_TYPES: &[&str] = &["bool", "u8", "i16", "u16", "i32", "u32", "f32", "i64", "u64", "string", "row", "foreignrow", "enumrow"];
+
+fn blank_column(ty: &str) -> Column {
+    Column {
+        name: None,
+        description: None,
+        array: false,
+        r#type: ty.to_string(),
+        unique: false,
+        localized: false,
+        references: None,
+        interval: false,
+        file: None,
+        files: None,
+    }
+}
+
+/// Appends numeric columns until the layout covers `missing` more bytes.
+fn pad_columns(columns: &mut Vec<Column>, mut missing: usize) {
+    while missing >= 4 {
+        columns.push(blank_column("i32"));
+        missing -= 4;
+    }
+    if missing >= 2 {
+        columns.push(blank_column("i16"));
+        missing -= 2;
+    }
+    for _ in 0..missing {
+        columns.push(blank_column("u8"));
+    }
+}
+
+impl SchemaEditor {
+    fn from_table(table: &Table) -> Self {
+        Self { name: table.name.clone(), columns: table.columns.clone(), dirty: false }
+    }
+
+    fn as_table(&self, is_poe2: bool) -> Table {
+        Table { name: self.name.clone(), columns: self.columns.clone(), tags: None, valid_for: Some(game_mask(is_poe2)), custom: true }
     }
 }
 
@@ -171,6 +270,21 @@ fn file_stem(path: &str) -> String {
 
 fn col_name(col: &Column, idx: usize) -> String {
     col.name.clone().unwrap_or_else(|| format!("_{}", idx))
+}
+
+fn candidate_label(c: &FkCandidate) -> String {
+    format!("{}{} ({:.0}%)", if c.name_match { "★ " } else { "" }, c.stem, c.fit * 100.0)
+}
+
+fn candidate_menu_label(c: &FkCandidate) -> String {
+    format!(
+        "{}{} · {} rows · {:.0}% fit{}",
+        if c.name_match { "★ " } else { "" },
+        c.stem,
+        c.row_count,
+        c.fit * 100.0,
+        if c.name_match { " · name match" } else { "" }
+    )
 }
 
 fn col_width(col: &Column) -> f32 {
@@ -449,13 +563,56 @@ impl DatViewer {
     }
 
     pub fn set_schema(&mut self, schema: Schema, date: String) {
-        self.schema = Some(schema);
+        self.base_schema = Some(schema);
         self.schema_date = date;
+        self.rebuild_schema();
+    }
+
+    /// Reads `schema_overrides.json` from the app data dir and layers it over the schema.
+    pub fn load_overrides(&mut self) {
+        self.overrides = Overrides::load(&self.overrides_path);
+        if self.base_schema.is_some() || !self.overrides.is_empty() {
+            self.rebuild_schema();
+        }
+    }
+
+    fn rebuild_schema(&mut self) {
+        let mut merged = self.base_schema.clone().unwrap_or_else(Schema::empty);
+        merged.apply_overrides(&self.overrides.tables);
+        self.schema = Some(merged);
         self.schema_gen += 1;
         self.table = None;
+        self.aligned = None;
+        self.fk_suggestions = None;
         self.related.clear();
         self.row_cache.clear();
         self.invalidate_view();
+    }
+
+    fn persist_overrides(&mut self) {
+        self.notice = Some(match self.overrides.save(&self.overrides_path) {
+            Ok(()) => format!("Saved {}", self.overrides_path.display()),
+            Err(e) => format!("Could not write {}: {}", self.overrides_path.display(), e),
+        });
+    }
+
+    fn save_override(&mut self, name: &str, columns: Vec<Column>, is_poe2: bool) {
+        self.overrides.upsert(Table { name: name.to_string(), columns, tags: None, valid_for: Some(game_mask(is_poe2)), custom: true });
+        self.persist_overrides();
+        self.rebuild_schema();
+    }
+
+    fn revert_override(&mut self, name: &str, is_poe2: bool) {
+        if self.overrides.remove(name, is_poe2) {
+            self.persist_overrides();
+            self.rebuild_schema();
+        }
+    }
+
+    pub fn set_table_stats(&mut self, stats: Vec<TableStats>) {
+        self.table_stats = Some(Arc::new(stats));
+        self.table_stats_loading = false;
+        self.fk_suggestions = None;
     }
 
     pub fn schema_version_warning(&self) -> Option<String> {
@@ -488,6 +645,10 @@ impl DatViewer {
         self.hidden_cols.clear();
         self.related.clear();
         self.guessed = None;
+        self.aligned = None;
+        self.fk_suggestions = None;
+        self.editor = None;
+        self.notice = None;
         self.scroll_to_row = self.pending_scroll_row.take();
         self.selected_row = self.scroll_to_row;
         match DatReader::new(data, filename) {
@@ -567,12 +728,27 @@ impl DatViewer {
         self.ensure_table(is_poe2);
         let table = self.table.as_ref().and_then(|t| t.2.clone());
         match table {
-            Some(table) => self.show_table(ui, is_poe2, table, loader, false),
+            Some(table) => {
+                let (row_len, is_64bit) = {
+                    let r = self.reader.as_ref().unwrap();
+                    (r.row_length, r.is_64bit)
+                };
+                let drifted = row_len.map(|l| l != table.row_width(is_64bit)).unwrap_or(false);
+                let layout = if table.custom { Layout::Custom } else { Layout::Schema };
+                if drifted && !table.custom && self.use_aligned {
+                    match self.ensure_aligned(&table) {
+                        Some(aligned) => self.show_table(ui, is_poe2, aligned, loader, Layout::Aligned),
+                        None => self.show_table(ui, is_poe2, table, loader, layout),
+                    }
+                } else {
+                    self.show_table(ui, is_poe2, table, loader, layout);
+                }
+            }
             None => {
                 self.show_unknown_banner(ui, is_poe2);
                 let guessed = if self.byte_view { None } else { self.ensure_guessed() };
                 match guessed {
-                    Some(t) => self.show_table(ui, is_poe2, t, loader, true),
+                    Some(t) => self.show_table(ui, is_poe2, t, loader, Layout::Guessed),
                     None => {
                         let reader = self.reader.take().unwrap();
                         self.show_generic_view(ui, &reader);
@@ -586,36 +762,121 @@ impl DatViewer {
     fn ensure_guessed(&mut self) -> Option<Arc<Table>> {
         if self.guessed.is_none() {
             let reader = self.reader.as_ref()?;
-            let cols = crate::dat::analysis::analyze(reader);
+            let cols = analysis::analyze(reader);
             if cols.is_empty() {
                 return None;
             }
             let name = file_stem(&reader.filename);
-            self.guessed = Some(Arc::new(crate::dat::analysis::to_table(&cols, &name)));
+            self.guessed = Some(Arc::new(analysis::to_table(&cols, &name)));
         }
         self.guessed.clone()
     }
 
-    fn show_table(&mut self, ui: &mut egui::Ui, is_poe2: bool, table: Arc<Table>, loader: Option<&mut TableLoader<'_>>, guessed: bool) {
+    fn ensure_aligned(&mut self, schema_table: &Arc<Table>) -> Option<Arc<Table>> {
+        if let Some((gen, t, _)) = &self.aligned {
+            if *gen == self.schema_gen {
+                return Some(t.clone());
+            }
+        }
+        let reader = self.reader.as_ref()?;
+        let cols = analysis::analyze(reader);
+        if cols.is_empty() {
+            return None;
+        }
+        let (table, report) = analysis::align_schema(schema_table, &cols, reader.is_64bit);
+        let table = Arc::new(table);
+        self.aligned = Some((self.schema_gen, table.clone(), report));
+        Some(table)
+    }
+
+    /// Likely `references` targets for foreignrow columns that have none, keyed by column
+    /// index. Asks the content view for a table scan the first time it is needed.
+    fn ensure_fk_suggestions(&mut self, table: &Arc<Table>, base_dir: &str, ext: &str, is_poe2: bool) -> HashMap<usize, Vec<FkCandidate>> {
+        let key = Arc::as_ptr(table) as usize;
+        if let Some((k, s)) = &self.fk_suggestions {
+            if *k == key {
+                return s.clone();
+            }
+        }
+        if !analysis::has_unresolved_foreign(table) {
+            return HashMap::new();
+        }
+        let Some(stats) = self.table_stats.clone() else {
+            self.request_table_stats = true;
+            return HashMap::new();
+        };
+        let Some(reader) = self.reader.as_ref() else { return HashMap::new() };
+        let current = reader.filename.to_ascii_lowercase();
+        let mut out = HashMap::new();
+        for (ci, st) in analysis::foreign_key_stats(reader, table).into_iter().enumerate() {
+            let Some(st) = st else { continue };
+            if table.columns[ci].references.is_some() {
+                continue;
+            }
+            let name = table.columns[ci].name.as_deref().filter(|n| !n.starts_with('@'));
+            let mut ranked = analysis::rank_targets(&st, &stats, base_dir, ext, &current, 5, name);
+            if let Some(schema) = &self.schema {
+                for c in &mut ranked {
+                    if let Some(t) = schema.find_table(&c.stem, is_poe2) {
+                        c.stem = t.name.clone();
+                    }
+                }
+            }
+            if !ranked.is_empty() {
+                out.insert(ci, ranked);
+            }
+        }
+        self.fk_suggestions = Some((key, out.clone()));
+        out
+    }
+
+    fn show_table(&mut self, ui: &mut egui::Ui, is_poe2: bool, table: Arc<Table>, loader: Option<&mut TableLoader<'_>>, layout: Layout) {
         let (row_count, row_len, is_64bit, filename) = {
             let r = self.reader.as_ref().unwrap();
             (r.row_count, r.row_length, r.is_64bit, r.filename.clone())
         };
         let schema_width = table.row_width(is_64bit);
-        let width_ok = guessed || row_len.map(|l| l == schema_width).unwrap_or(true);
+        let width_ok = matches!(layout, Layout::Aligned | Layout::Guessed) || row_len.map(|l| l == schema_width).unwrap_or(true);
+        let base_dir = filename.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
+        let ext = filename.rsplit('.').next().unwrap_or("datc64").to_string();
+        let suggestions = self.ensure_fk_suggestions(&table, &base_dir, &ext, is_poe2);
+        let amber = Color32::from_rgb(245, 158, 11);
+        let mut pending: Vec<Deferred> = Vec::new();
 
         // ── Toolbar ─────────────────────────────────────────────────
         ui.horizontal(|ui| {
             ui.label(RichText::new(&table.name).strong().size(15.0));
             ui.label(RichText::new(format!("{} rows · {} columns", row_count, table.columns.len())).weak());
-            if guessed {
-                ui.label(RichText::new("column types guessed from data").color(Color32::from_rgb(245, 158, 11)).size(11.0));
-            } else {
-                ui.label(RichText::new(format!("{} · schema {}", if is_poe2 { "PoE 2" } else { "PoE 1" }, self.schema_date)).weak().size(11.0));
+            match layout {
+                Layout::Schema => {
+                    ui.label(RichText::new(format!("{} · schema {}", if is_poe2 { "PoE 2" } else { "PoE 1" }, self.schema_date)).weak().size(11.0));
+                }
+                Layout::Custom => {
+                    ui.label(RichText::new("custom layout").color(Color32::from_rgb(96, 165, 250)).size(11.0))
+                        .on_hover_text(format!("From {}", self.overrides_path.display()));
+                }
+                Layout::Aligned => {
+                    ui.label(RichText::new("schema re-fitted to this file").color(amber).size(11.0));
+                }
+                Layout::Guessed => {
+                    ui.label(RichText::new("column types guessed from data").color(amber).size(11.0));
+                }
+            }
+            if self.table_stats_loading {
+                ui.spinner();
+                ui.label(RichText::new("scanning tables for reference targets…").weak().size(11.0));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.small_button("Update schema").on_hover_text("Download the latest community schema").clicked() {
                     self.request_update_schema = true;
+                }
+                let mut editing = self.editor.is_some();
+                if ui
+                    .toggle_value(&mut editing, "Edit columns")
+                    .on_hover_text("Rename, retype or re-reference columns and save the result as a custom layout")
+                    .changed()
+                {
+                    self.editor = if editing { Some(SchemaEditor::from_table(&table)) } else { None };
                 }
                 ui.toggle_value(&mut self.show_detail, "Details").on_hover_text("Show the selected row in a side panel");
                 ui.menu_button("Columns", |ui| {
@@ -643,17 +904,73 @@ impl DatViewer {
         });
 
         if let Some(w) = self.schema_version_warning() {
-            ui.colored_label(Color32::from_rgb(245, 158, 11), format!("⚠ {}", w));
+            ui.colored_label(amber, format!("⚠ {}", w));
         }
-        if !width_ok {
-            ui.colored_label(
-                Color32::from_rgb(245, 158, 11),
-                format!(
-                    "⚠ Schema describes {}-byte rows but this file has {}-byte rows. Columns after the first mismatch are misaligned — update the schema.",
-                    schema_width,
-                    row_len.unwrap_or(0)
-                ),
-            );
+        if let Some(n) = self.notice.clone() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(n).weak().size(11.0));
+                if ui.small_button("✕").clicked() {
+                    self.notice = None;
+                }
+            });
+        }
+        let file_width = row_len.unwrap_or(0);
+        match layout {
+            Layout::Aligned => {
+                let report = self.aligned.as_ref().map(|a| a.2.clone()).unwrap_or_default();
+                let community_width = self.table.as_ref().and_then(|t| t.2.as_ref()).map(|t| t.row_width(is_64bit)).unwrap_or(0);
+                ui.horizontal_wrapped(|ui| {
+                    let mut msg = format!(
+                        "⚠ Schema drift: this file has {}-byte rows, the schema describes {}. {} column(s) re-fitted by type, {} new column(s) named by offset.",
+                        file_width,
+                        community_width,
+                        report.matched,
+                        report.added.len()
+                    );
+                    if !report.dropped.is_empty() {
+                        msg.push_str(&format!(" Not placed: {}.", report.dropped.join(", ")));
+                    }
+                    ui.colored_label(amber, msg);
+                    if ui.small_button("Show schema layout").clicked() {
+                        self.use_aligned = false;
+                    }
+                    if ui.small_button("Save as custom layout").on_hover_text("Keep this layout in schema_overrides.json").clicked() {
+                        pending.push(Deferred::Save { name: table.name.clone(), columns: table.columns.clone() });
+                    }
+                });
+            }
+            Layout::Schema if !width_ok => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        amber,
+                        format!("⚠ Schema describes {}-byte rows but this file has {}-byte rows. Columns after the first mismatch are misaligned.", schema_width, file_width),
+                    );
+                    if ui.small_button("Re-fit to data").clicked() {
+                        self.use_aligned = true;
+                    }
+                });
+            }
+            Layout::Custom if !width_ok => {
+                ui.colored_label(amber, format!("⚠ Custom layout describes {}-byte rows but this file has {}-byte rows — fix it under Edit columns.", schema_width, file_width));
+            }
+            _ => {}
+        }
+
+        if self.editor.is_some() {
+            match self.show_editor(ui, &table, row_len, is_64bit, is_poe2, &suggestions, layout) {
+                EditorAction::Save => {
+                    if let Some(e) = &mut self.editor {
+                        e.dirty = false;
+                        pending.push(Deferred::Save { name: e.name.clone(), columns: e.columns.clone() });
+                    }
+                }
+                EditorAction::Revert => {
+                    pending.push(Deferred::Revert(table.name.clone()));
+                    self.editor = None;
+                }
+                EditorAction::Close => self.editor = None,
+                EditorAction::None => {}
+            }
         }
 
         ui.horizontal(|ui| {
@@ -694,7 +1011,8 @@ impl DatViewer {
 
         // Pull state out of `self` so the table closures borrow only locals.
         let reader = self.reader.take().unwrap();
-        let schema = self.schema.take().unwrap();
+        let had_schema = self.schema.is_some();
+        let schema = self.schema.take().unwrap_or_else(Schema::empty);
         let mut related = std::mem::take(&mut self.related);
         let mut row_cache = std::mem::replace(&mut self.row_cache, LruCache::new(NonZeroUsize::new(1).unwrap()));
         let all_rows = self.all_rows.take();
@@ -705,11 +1023,10 @@ impl DatViewer {
         let hidden = self.hidden_cols.clone();
         let mut sort = self.sort;
         let mut hide_request: Option<usize> = None;
+        let mut set_ref: Option<(usize, String)> = None;
         let mut out = CellOut { nav: None, scroll_to: None, select: None };
 
-        let base_dir = filename.rsplit_once('/').map(|(d, _)| d.to_string()).unwrap_or_default();
-        let ext = filename.rsplit('.').next().unwrap_or("datc64").to_string();
-        let mut rel = RelCtx { schema: &schema, related: &mut related, loader, base_dir, ext, is_poe2 };
+        let mut rel = RelCtx { schema: &schema, related: &mut related, loader, base_dir: base_dir.clone(), ext: ext.clone(), is_poe2 };
         let current_table = table.name.clone();
 
         let get_row = |i: u32, row_cache: &mut LruCache<u32, Vec<DatValue>>| -> Vec<DatValue> {
@@ -817,6 +1134,10 @@ impl DatViewer {
                             tip.push('\n');
                             tip.push_str(d);
                         }
+                        if let Some(c) = suggestions.get(&ci) {
+                            let list: Vec<String> = c.iter().take(3).map(candidate_label).collect();
+                            tip.push_str(&format!("\nLikely target: {} — right-click to set", list.join(", ")));
+                        }
                         tip.push_str("\nClick to sort · right-click for options");
                         let resp = resp.on_hover_text(tip);
                         if resp.clicked() {
@@ -831,6 +1152,17 @@ impl DatViewer {
                             if ui.button("Sort descending").clicked() { sort = Some((ci, false)); ui.close_menu(); }
                             if ui.button("Hide column").clicked() { hide_request = Some(ci); ui.close_menu(); }
                             if ui.button("Copy column name").clicked() { ui.ctx().copy_text(name.clone()); ui.close_menu(); }
+                            if let Some(c) = suggestions.get(&ci) {
+                                ui.separator();
+                                ui.menu_button("Set reference target", |ui| {
+                                    for cand in c {
+                                        if ui.button(candidate_menu_label(cand)).on_hover_text("Saves a custom layout with this reference").clicked() {
+                                            set_ref = Some((ci, cand.stem.clone()));
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
+                            }
                         });
                     });
                 }
@@ -866,7 +1198,7 @@ impl DatViewer {
         // Restore state and apply interactions.
         drop(rel);
         self.reader = Some(reader);
-        self.schema = Some(schema);
+        self.schema = had_schema.then_some(schema);
         self.related = related;
         self.row_cache = row_cache;
         self.all_rows = all_rows;
@@ -888,6 +1220,197 @@ impl DatViewer {
         if out.nav.is_some() {
             self.nav_request = out.nav;
         }
+        if let Some((ci, target)) = set_ref {
+            let mut columns = table.columns.clone();
+            if let Some(c) = columns.get_mut(ci) {
+                c.references = Some(analysis::reference_to(&target));
+            }
+            pending.push(Deferred::Save { name: table.name.clone(), columns });
+        }
+        for d in pending {
+            match d {
+                Deferred::Save { name, columns } => self.save_override(&name, columns, is_poe2),
+                Deferred::Revert(name) => self.revert_override(&name, is_poe2),
+            }
+        }
+    }
+
+    /// Side panel for editing the column layout; returns what the user asked for.
+    #[allow(clippy::too_many_arguments)]
+    fn show_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        table: &Arc<Table>,
+        row_len: Option<usize>,
+        is_64bit: bool,
+        is_poe2: bool,
+        suggestions: &HashMap<usize, Vec<FkCandidate>>,
+        layout: Layout,
+    ) -> EditorAction {
+        let Some(mut ed) = self.editor.take() else { return EditorAction::None };
+        let mut action = EditorAction::None;
+        let green = Color32::from_rgb(74, 222, 128);
+        let red = Color32::from_rgb(239, 68, 68);
+
+        egui::SidePanel::right("dat_schema_editor")
+            .resizable(true)
+            .default_width(520.0)
+            .show_inside(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Column layout").strong());
+                    if ed.dirty {
+                        ui.label(RichText::new("unsaved").color(Color32::from_rgb(245, 158, 11)).size(11.0));
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").clicked() {
+                            action = EditorAction::Close;
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Table");
+                    if ui.add(egui::TextEdit::singleline(&mut ed.name).desired_width(180.0)).changed() {
+                        ed.dirty = true;
+                    }
+                });
+                let width: usize = ed.columns.iter().map(|c| get_column_size(c, is_64bit)).sum();
+                let file_width = row_len.unwrap_or(0);
+                let fits = file_width == 0 || width == file_width;
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Row width {} · file {}", width, file_width)).color(if fits { green } else { red }));
+                    if width < file_width && ui.small_button("Pad to file width").on_hover_text("Append numeric columns for the missing bytes").clicked() {
+                        pad_columns(&mut ed.columns, file_width - width);
+                        ed.dirty = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(fits, egui::Button::new("Save")).on_hover_text("Write to schema_overrides.json").clicked() {
+                        action = EditorAction::Save;
+                    }
+                    if layout == Layout::Custom && ui.button("Revert to schema").on_hover_text("Delete the override for this table").clicked() {
+                        action = EditorAction::Revert;
+                    }
+                    if ui.button("Copy JSON").on_hover_text("dat-schema table definition for a poe-tool-dev PR").clicked() {
+                        ui.ctx().copy_text(Overrides::table_json(&ed.as_table(is_poe2)));
+                    }
+                    ui.menu_button("Reset from…", |ui| {
+                        if ui.button("Current view").clicked() {
+                            ed.columns = table.columns.clone();
+                            ed.dirty = true;
+                            ui.close_menu();
+                        }
+                        if let Some(t) = self.table.as_ref().and_then(|t| t.2.clone()) {
+                            if !t.custom && ui.button("Community schema").clicked() {
+                                ed.columns = t.columns.clone();
+                                ed.dirty = true;
+                                ui.close_menu();
+                            }
+                        }
+                        if ui.button("Guessed from data").clicked() {
+                            if let Some(g) = self.ensure_guessed() {
+                                ed.columns = g.columns.clone();
+                                ed.dirty = true;
+                            }
+                            ui.close_menu();
+                        }
+                    });
+                });
+                ui.separator();
+
+                let mut dirty = false;
+                let mut insert_at: Option<usize> = None;
+                let mut delete_at: Option<usize> = None;
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    egui::Grid::new("dat_editor_grid").num_columns(6).spacing([6.0, 4.0]).striped(true).show(ui, |ui| {
+                        ui.strong("#");
+                        ui.strong("Offset");
+                        ui.strong("Name");
+                        ui.strong("Type");
+                        ui.strong("Reference");
+                        ui.label("");
+                        ui.end_row();
+                        let mut offset = 0usize;
+                        for (i, col) in ed.columns.iter_mut().enumerate() {
+                            ui.label(RichText::new(i.to_string()).weak().monospace());
+                            ui.label(RichText::new(format!("@{}", offset)).weak().monospace());
+                            let mut name = col.name.clone().unwrap_or_default();
+                            if ui.add(egui::TextEdit::singleline(&mut name).desired_width(150.0)).changed() {
+                                col.name = if name.is_empty() { None } else { Some(name) };
+                                dirty = true;
+                            }
+                            let label = format!("{}{}{}", col.r#type, if col.array { "[]" } else { "" }, if col.interval { " ×2" } else { "" });
+                            egui::ComboBox::from_id_salt(("dat_editor_type", i)).selected_text(label).width(110.0).show_ui(ui, |ui| {
+                                for t in EDITOR_TYPES {
+                                    if ui.selectable_label(!col.array && col.r#type == *t, *t).clicked() {
+                                        col.r#type = t.to_string();
+                                        col.array = false;
+                                        col.interval = false;
+                                        dirty = true;
+                                    }
+                                }
+                                ui.separator();
+                                for t in EDITOR_TYPES {
+                                    if ui.selectable_label(col.array && col.r#type == *t, format!("{}[]", t)).clicked() {
+                                        col.r#type = t.to_string();
+                                        col.array = true;
+                                        col.interval = false;
+                                        dirty = true;
+                                    }
+                                }
+                            });
+                            if analysis::is_foreign(col) || col.r#type == "enumrow" {
+                                ui.horizontal(|ui| {
+                                    let mut target = col.references.as_ref().map(|r| r.table.clone()).unwrap_or_default();
+                                    if ui.add(egui::TextEdit::singleline(&mut target).desired_width(130.0).hint_text("target table")).changed() {
+                                        col.references = if target.is_empty() { None } else { Some(analysis::reference_to(&target)) };
+                                        dirty = true;
+                                    }
+                                    if let Some(c) = suggestions.get(&i) {
+                                        ui.menu_button("▾", |ui| {
+                                            for cand in c {
+                                                if ui.button(candidate_menu_label(cand)).clicked() {
+                                                    col.references = Some(analysis::reference_to(&cand.stem));
+                                                    dirty = true;
+                                                    ui.close_menu();
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
+                            } else {
+                                ui.label(RichText::new("—").weak());
+                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("+").on_hover_text("Insert an i32 after this column").clicked() {
+                                    insert_at = Some(i + 1);
+                                }
+                                if ui.small_button("✕").on_hover_text("Delete this column").clicked() {
+                                    delete_at = Some(i);
+                                }
+                            });
+                            ui.end_row();
+                            offset += get_column_size(col, is_64bit);
+                        }
+                    });
+                    if ed.columns.is_empty() && ui.button("Add column").clicked() {
+                        insert_at = Some(0);
+                    }
+                });
+                if let Some(i) = delete_at {
+                    ed.columns.remove(i);
+                    dirty = true;
+                }
+                if let Some(i) = insert_at {
+                    ed.columns.insert(i.min(ed.columns.len()), blank_column("i32"));
+                    dirty = true;
+                }
+                if dirty {
+                    ed.dirty = true;
+                }
+            });
+
+        self.editor = Some(ed);
+        action
     }
 
     fn show_unknown_banner(&mut self, ui: &mut egui::Ui, is_poe2: bool) {

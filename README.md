@@ -21,17 +21,25 @@ A high-performance Path of Exile asset explorer for both the standalone (GGPK) a
 - Fast background-threaded search with "Load More" for large result sets.
 
 ### Viewers
-- **DAT / DATC64**: Schema-driven table view for PoE 1 & 2 (correct per-game table pick) with sortable columns, row filter, enum names, foreign keys resolved to the target row's `Id` (click to jump), `@file` paths that open the referenced asset, a row-detail panel, column hiding, and JSON/CSV export. Tables missing from the schema get their column types guessed from the data. Warns when the schema row width no longer matches the file.
+Every file reference inside any viewer — a `.dds` in a material, an `.ao` in an object definition, an `.et` in a dungeon graph — is a link that opens that file.
+
+- **DAT / DATC64**: Schema-driven table view for PoE 1 & 2 (correct per-game table pick) with sortable columns, row filter, enum names, foreign keys resolved to the target row's `Id` (click to jump), `@file` paths that open the referenced asset, a row-detail panel, column hiding, and JSON/CSV export.
+- **Schema discovery**: Tables missing from the community schema get their column types guessed from the data. When a table *is* in the schema but the game changed its layout, the schema is re-fitted onto the file automatically — names and references carry over, new columns show by offset. Foreign-key columns without a target get likely targets suggested from row counts and column names (right-click the header to set one). **Edit columns** lets you rename, retype, reference, insert or delete columns and save the result as a custom layout (`schema_overrides.json`, in dat-schema format so it can go straight into a poe-tool-dev pull request).
 - **Textures**: DDS (all BC/DXT variants), PNG, JPG, WebP — with zoom, pan, and fit-to-window controls.
 - **Audio**: Built-in OGG/WAV/MP3 player with volume control.
 - **FMOD Banks**: `.bank` files (`FMOD/` folder) open with a full stream listing — play any stream in-app, save individual streams as WAV, or export the whole bank at once.
 - **Video (BK2)**: Header metadata display (codec, resolution, FPS, duration, audio tracks). Playback via RAD Video Tools `binkplay.exe`, `ffplay`, or your system default.
-- **CSD**: Client String Data viewer with language filtering and JSON export.
+- **CSD (stat descriptions)**: Searchable table of every description line (stat ids, value condition, text with placeholders highlighted, value functions), language switch, `include` links, and a detail panel that renders the line for values you type in.
+- **Object definitions** (`.ao`, `.ot`, `.it`, `.act`, `.epk`): Components as collapsible sections with key/value grids, the `extends` chain resolved as links, and an **Inherited** toggle that merges every ancestor's components into the view.
+- **Materials** (`.mat`): The textures a material samples as thumbnails, its fxgraph instances with their parameters (curves plotted, colours as swatches), and the full document.
+- **Timelines** (`.atl`): Each animation's events on a time strip and in a table, with the effect packs and sounds they trigger as links.
+- **Particles & trails** (`.pet`, `.trl`): Every keyframe and sampled curve plotted per emitter or trail block.
+- **Dungeon graphs** (`.dgr`): The room grid drawn with its nodes and connections; click a node for its details and room sets.
 - **PSG (skill trees)**: Renders the character, atlas, Chayula and Royale skill graphs the way the game lays them out — every asset comes from the GGPK: centre ring and class illustration, class-start plates, ascendancy plates relocated onto the outer ring (with a class/ascendancy picker that dims the others), textured orbit arcs and connectors from the game's sprite sheets, per-context node frames (character/ascendancy/atlas/Breach, plus per-node overrides), group backgrounds, atlas subtree art and blockers. Hover any node for its name, stats and flavour text.
-- **JSON**: Interactive, collapsible tree viewer.
+- **JSON**: Interactive, collapsible tree viewer (`.json`, `.hideout`, `.env`, JSON-bodied `.pet`) with file links, colour swatches and inline plots for `points` curves.
 - **Shaders**: Syntax-highlighted view for `.hlsl`, `.fx`, `.vshader`, `.pshader`.
-- **Text / Config**: Auto-detected viewer for `.txt`, `.xml`, `.ini`, `.csv`, and dozens of PoE-specific text formats, with UTF-16 BOM support.
-- **Models**: `.ast` skeletons (bone hierarchy, animations, lights), `.fmt` / `.tgm` meshes and `.smd` skinned meshes parsed into a structured tree with geometry stats and full JSON export.
+- **Text / Config**: Every other PoE text format (`.tst`, `.rs`, `.mtd`, `.tsi`, `.arm`, `.sm`, `.amd`, `.ui`, …) in a filterable view with file references as links and a Raw toggle for the plain editor; UTF-16 with or without a BOM.
+- **Models**: `.fmt` / `.tgm` meshes and `.smd` skinned meshes in a 3D preview (orbit, zoom, pan, wireframe, per-shape selection), `.ast` skeletons as bone lines, plus the structured summary with geometry stats and full JSON export.
 - **DDS headers**: PoE 2 `.dds.header` streaming stubs render as thumbnails.
 - **Hex Viewer**: Adaptive layout for raw binary inspection of any file.
 
