@@ -98,6 +98,8 @@ pub struct PsgViewerState {
     pub selected_class: Option<usize>,
     /// `Ascendancy` row drawn at full colour; the others are dimmed.
     pub selected_ascendancy: Option<usize>,
+    /// The user chose "None": show the base class with no ascendancy layer.
+    pub ascendancy_none: bool,
     pub dim_other_ascendancies: bool,
     /// Set by the toolbar's export button; `content_view` picks it up,
     /// asks for a folder and runs the export.
@@ -117,6 +119,7 @@ impl Default for PsgViewerState {
             skill_db: None,
             selected_class: None,
             selected_ascendancy: None,
+            ascendancy_none: false,
             dim_other_ascendancies: true,
             export_requested: false,
             export_status: None,
@@ -145,10 +148,11 @@ impl PsgViewerState {
         if self.selected_class.map(|c| !db.playable_characters().contains(&c)).unwrap_or(true) {
             self.selected_class = db.playable_characters().first().copied();
             self.selected_ascendancy = None;
+            self.ascendancy_none = false;
         }
         if let Some(c) = self.selected_class {
             let options = db.ascendancies_of(c);
-            if self.selected_ascendancy.map(|a| !options.contains(&a)).unwrap_or(true) {
+            if self.selected_ascendancy.map(|a| !options.contains(&a)).unwrap_or(!self.ascendancy_none) {
                 self.selected_ascendancy = options.first().copied();
             }
         }
@@ -270,15 +274,26 @@ impl<'a> PsgViewer<'a> {
                             if ui.selectable_label(self.state.selected_class == Some(c), &db.characters[c].name).clicked() {
                                 self.state.selected_class = Some(c);
                                 self.state.selected_ascendancy = None;
+                                self.state.ascendancy_none = false;
                             }
                         }
                     });
                     if let Some(c) = self.state.selected_class {
-                        let asc_name = self.state.selected_ascendancy.and_then(|a| db.ascendancies.get(a)).map(|a| a.name.clone()).unwrap_or_else(|| "Ascendancy".into());
+                        let asc_name = self
+                            .state
+                            .selected_ascendancy
+                            .and_then(|a| db.ascendancies.get(a))
+                            .map(|a| a.name.clone())
+                            .unwrap_or_else(|| if self.state.ascendancy_none { "None".into() } else { "Ascendancy".into() });
                         egui::ComboBox::from_id_salt("psg_ascendancy").selected_text(asc_name).show_ui(ui, |ui| {
+                            if ui.selectable_label(self.state.ascendancy_none, "None (base class)").clicked() {
+                                self.state.selected_ascendancy = None;
+                                self.state.ascendancy_none = true;
+                            }
                             for a in db.ascendancies_of(c) {
                                 if ui.selectable_label(self.state.selected_ascendancy == Some(a), &db.ascendancies[a].name).clicked() {
                                     self.state.selected_ascendancy = Some(a);
+                                    self.state.ascendancy_none = false;
                                 }
                             }
                         });
@@ -361,13 +376,17 @@ impl<'a> PsgViewer<'a> {
             let db = self.state.skill_db.clone();
             let orbit_radii = self.psg.orbit_radii();
 
+            // "None" shows the base class alone: no plates, ascendancy nodes or links.
+            let hide_ascendancies = self.state.ascendancy_none && self.psg.graph_type == 0;
+            let asc_hidden = move |asc: Option<usize>| hide_ascendancies && asc.is_some();
+
             // ── Hover ─────────────────────────────────────────────
             let mut hovered = None;
             if response.hovered() {
                 if let Some(cursor) = ui.input(|i| i.pointer.latest_pos()) {
                     let mut best = f32::MAX;
                     for (&id, &pos) in &layout.node_pos {
-                        if layout.is_node_hidden(id) {
+                        if layout.is_node_hidden(id) || asc_hidden(layout.node_ascendancy(id)) {
                             continue;
                         }
                         let dist = (cursor - cv.to_screen(pos)).length();
@@ -442,7 +461,7 @@ impl<'a> PsgViewer<'a> {
 
             // ── Ascendancy plates ─────────────────────────────────
             if let Some(db) = &db {
-                if self.psg.graph_type == 0 {
+                if self.psg.graph_type == 0 && !hide_ascendancies {
                     for plate in &layout.plates {
                         let a = &db.ascendancies[plate.ascendancy];
                         if let Some(tex) = a.illustration.as_deref().and_then(|p| self.find_texture(p)) {
@@ -495,7 +514,7 @@ impl<'a> PsgViewer<'a> {
             // ── Group backgrounds (only groups the game flags) ────
             if let Some(art) = art_set {
                 for (gi, group) in self.psg.groups.iter().enumerate() {
-                    if group.is_proxy || group.nodes.is_empty() || layout.group_hidden[gi] {
+                    if group.is_proxy || group.nodes.is_empty() || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
                         continue;
                     }
                     if group.background_type == 0 && group.background_flag == 0 {
@@ -552,7 +571,7 @@ impl<'a> PsgViewer<'a> {
                 let asc_a = layout.node_ascendancy(a);
                 let asc_b = layout.node_ascendancy(b);
                 // Ascendancy clusters are self-contained; a cross-link is a data artefact.
-                if asc_a != asc_b {
+                if asc_a != asc_b || asc_hidden(asc_a) {
                     continue;
                 }
                 let margin = 1400.0 * cv.zoom;
@@ -602,7 +621,7 @@ impl<'a> PsgViewer<'a> {
 
             // ── Nodes ─────────────────────────────────────────────
             for (gi, group) in self.psg.groups.iter().enumerate() {
-                if group.is_proxy || layout.group_hidden[gi] {
+                if group.is_proxy || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
                     continue;
                 }
                 for node in &group.nodes {

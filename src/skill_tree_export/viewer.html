@@ -91,7 +91,7 @@
 
   // ── state ─────────────────────────────────────────────────────────
   const view = { zoom: 0.08, x: 0, y: 0 };
-  let selClass = classes[0] || null, selAsc = null, showAll = false;
+  let selClass = classes[0] || null, selAsc = null, ascNone = false, showAll = false;
   const allocated = new Set();
   let hovered = null, search = '';
   let dragging = false, dragMoved = false, last = null;
@@ -101,12 +101,15 @@
   function fillAsc() {
     ascSel.innerHTML = '';
     if (!selClass) return;
+    const none = document.createElement('option'); none.value = ''; none.textContent = 'None (base class)'; ascSel.appendChild(none);
     for (const a of selClass.ascendancies) { if (!a.name) continue; const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; ascSel.appendChild(o); }
     selAsc = selClass.ascendancies.find(a => a.name) || null;
+    ascNone = !selAsc;
+    ascSel.value = selAsc ? selAsc.id : '';
   }
   fillAsc();
   classSel.onchange = () => { selClass = classes.find(c => String(c.index) === classSel.value); fillAsc(); requestDraw(); };
-  ascSel.onchange = () => { selAsc = selClass.ascendancies.find(a => a.id === ascSel.value) || null; requestDraw(); };
+  ascSel.onchange = () => { selAsc = selClass.ascendancies.find(a => a.id === ascSel.value) || null; ascNone = !selAsc; requestDraw(); };
   document.getElementById('showAll').onchange = e => { showAll = e.target.checked; requestDraw(); };
   document.getElementById('search').oninput = e => { search = e.target.value.trim().toLowerCase(); requestDraw(); };
   document.getElementById('fit').onclick = fit;
@@ -115,7 +118,7 @@
   function visibleAscendancy(id) {
     if (!id) return true;
     if (showAll) return true;
-    if (!selClass) return false;
+    if (!selClass || ascNone) return false;
     return selClass.ascendancies.some(a => a.id === id && a.name);
   }
   function nodeVisible(n) {
@@ -151,7 +154,10 @@
     view.y = canvas.height / 2 - cy * view.zoom;
     const cls = classes.find(c => c.name === p.get('class'));
     if (cls) { selClass = cls; classSel.value = cls.index; fillAsc(); }
-    if (selClass && p.get('asc')) { const a = selClass.ascendancies.find(a => a.id === p.get('asc')); if (a) { selAsc = a; ascSel.value = a.id; } }
+    if (selClass && p.get('asc')) {
+      const a = selClass.ascendancies.find(a => a.id === p.get('asc'));
+      selAsc = a || null; ascNone = !a; ascSel.value = a ? a.id : '';
+    }
     requestDraw();
     return true;
   }
@@ -217,7 +223,7 @@
     // ascendancy plates
     const plates = X.ascendancyPlates || {};
     for (const c of classes) {
-      if (!showAll && c !== selClass) continue;
+      if (!showAll && (c !== selClass || ascNone)) continue;
       const sheet = 'background-' + c.name.toLowerCase();
       let slot = 0;
       for (const a of c.ascendancies) {
@@ -329,8 +335,15 @@
       ctx.strokeStyle = active ? '#6ec0ff' : '#8b7047'; ctx.lineWidth = 14;
       ctx.beginPath(); ctx.arc(cx, cy, r, a1, a2, anticlockwise); ctx.stroke(); return;
     }
+    // The sprite holds every smaller ring too (they share the corner), so
+    // clip to an annular sector around this ring.
+    const band = 24;
     ctx.save();
-    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, r + 60, a1, a2, anticlockwise); ctx.closePath(); ctx.clip();
+    ctx.beginPath();
+    ctx.arc(cx, cy, r + band, a1, a2, anticlockwise);
+    ctx.arc(cx, cy, Math.max(r - band, 1), a2, a1, !anticlockwise);
+    ctx.closePath();
+    ctx.clip();
     const S = sp.w / SHEET_SCALE;
     ctx.translate(cx, cy);
     for (let k = 0; k < 4; k++) {
