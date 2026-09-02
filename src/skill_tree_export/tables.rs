@@ -160,18 +160,7 @@ pub fn load(source: &TreeExportSource, db: &SkillGraphDatabase, psg_path: &str) 
         out.jewel_slots = t.rows().filter_map(|row| t.row_ref(&row, "Slot").and_then(gid)).collect();
     }
 
-    if let (Some(groups), Some(art)) = (open(source, "PassiveSkillMasteryGroups"), open(source, "PassiveSkillTreeMasteryArt")) {
-        for (i, row) in groups.rows().enumerate() {
-            if let Some(image) = groups
-                .row_ref(&row, "Art")
-                .and_then(|a| art.row(a))
-                .map(|r| art.string(&r, "ActiveEffectImage"))
-                .filter(|s| !s.is_empty())
-            {
-                out.mastery_effect_images.insert(i, image);
-            }
-        }
-    }
+    out.mastery_effect_images = db.mastery_effect_images.clone();
 
     if let (Some(recipes), Some(results), Some(items), Some(bases)) = (
         open(source, "BlightCraftingRecipes"),

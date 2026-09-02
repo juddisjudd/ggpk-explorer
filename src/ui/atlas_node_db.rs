@@ -153,6 +153,9 @@ pub struct SkillGraphDatabase {
     /// `PassiveSkillGraphId` of every `PassiveSkills` row (0 when unset), so
     /// tables that reference passives by row can be resolved to graph ids.
     pub row_graph_ids: Vec<u32>,
+    /// `PassiveSkillMasteryGroups` row -> `PassiveSkillTreeMasteryArt.ActiveEffectImage`,
+    /// the big faded glyph the client draws for a cluster's "mastery" row.
+    pub mastery_effect_images: HashMap<usize, String>,
 }
 
 impl SkillGraphDatabase {
@@ -401,6 +404,28 @@ pub struct ExtraTables {
     pub atlas_subtrees: Option<Vec<u8>>,
     pub characters: Option<Vec<u8>>,
     pub decorators: Option<Vec<u8>>,
+    pub mastery_groups: Option<Vec<u8>>,
+    pub mastery_art: Option<Vec<u8>>,
+}
+
+fn parse_mastery_effect_images(groups: Vec<u8>, art: Vec<u8>, schema: &Schema) -> Result<HashMap<usize, String>, String> {
+    let art_table = find_table(schema, "PassiveSkillTreeMasteryArt")?;
+    let art_reader = DatReader::new(art, "passiveskilltreemasteryart.datc64").map_err(|e| e.to_string())?;
+    let image_col = col_index(art_table, "ActiveEffectImage").ok_or("PassiveSkillTreeMasteryArt missing ActiveEffectImage")?;
+    let images: Vec<Option<String>> = (0..art_reader.row_count)
+        .map(|i| art_reader.read_row(i, art_table).ok().and_then(|r| r.get(image_col).and_then(as_string)))
+        .collect();
+    let groups_table = find_table(schema, "PassiveSkillMasteryGroups")?;
+    let groups_reader = DatReader::new(groups, "passiveskillmasterygroups.datc64").map_err(|e| e.to_string())?;
+    let art_col = col_index(groups_table, "Art").ok_or("PassiveSkillMasteryGroups missing Art")?;
+    let mut out = HashMap::new();
+    for i in 0..groups_reader.row_count {
+        let row = groups_reader.read_row(i, groups_table).map_err(|e| e.to_string())?;
+        if let Some(img) = row.get(art_col).and_then(as_foreign_row).and_then(|a| images.get(a).cloned().flatten()) {
+            out.insert(i as usize, img);
+        }
+    }
+    Ok(out)
 }
 
 pub fn build(
@@ -410,7 +435,11 @@ pub fn build(
     extra: ExtraTables,
     schema: &Schema,
 ) -> Result<SkillGraphDatabase, String> {
-    let ExtraTables { ascendancy: ascendancy_bytes, atlas_subtrees: atlas_subtrees_bytes, characters: characters_bytes, decorators: decorators_bytes } = extra;
+    let ExtraTables { ascendancy: ascendancy_bytes, atlas_subtrees: atlas_subtrees_bytes, characters: characters_bytes, decorators: decorators_bytes, mastery_groups, mastery_art } = extra;
+    let mastery_effect_images = match (mastery_groups, mastery_art) {
+        (Some(groups), Some(art)) => parse_mastery_effect_images(groups, art, schema).unwrap_or_default(),
+        _ => HashMap::new(),
+    };
     let stats_table = find_table(schema, "Stats")?;
     let stats_reader = DatReader::new(stats_bytes, "stats.datc64").map_err(|e| e.to_string())?;
     let stats_id_col = col_index(stats_table, "Id").ok_or("Stats table missing Id column")?;
@@ -646,5 +675,6 @@ pub fn build(
         characters,
         decorators,
         row_graph_ids,
+        mastery_effect_images,
     })
 }

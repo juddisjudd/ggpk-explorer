@@ -22,7 +22,7 @@ use crate::ggpk::reader::GgpkReader;
 use crate::ui::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo};
 use crate::ui::content_view::{build_skill_graph_db, dds_path_candidates, decompress_bundle, extract_bundle_file_sync};
 use crate::ui::skill_tree_art::{FrameArt, NodeFrameKind};
-use crate::ui::skill_tree_layout::{self, ASCENDANCY_PLATE_SIZE, CLASS_ILLUSTRATION_SIZE, MAIN_CIRCLE_SIZE};
+use crate::ui::skill_tree_layout::{self, ASCENDANCY_PLATE_SIZE, CLASS_ILLUSTRATION_SIZE, CLASS_START_MOUNT_RADIUS, CLASS_START_RING_RADIUS, MAIN_CIRCLE_SIZE};
 use image::RgbaImage;
 use json::J;
 use sheets::TextureStore;
@@ -36,7 +36,8 @@ pub const KEYSTONE_RADIUS: f64 = 1380.0;
 
 const VIEWER_HTML: &str = include_str!("viewer.html");
 
-/// Icon sizes (sheet pixels) the official `skills` sheet uses per node type.
+/// Icon sizes (sheet pixels) the official `skills` sheet uses per node type;
+/// `mastery` (cluster theme glyphs) is an extension.
 const ICON_SIZES: [(&str, u32, u32); 4] = [("normal", 34, 34), ("notable", 49, 49), ("keystone", 68, 69), ("mastery", 49, 49)];
 /// Official mastery pattern width in the `mastery-effect-*` sheets.
 const MASTERY_PATTERN_WIDTH: u32 = 244;
@@ -1007,6 +1008,8 @@ fn viewer_extras(psg: &PsgFile, db: &SkillGraphDatabase, radii: &[f32; 10], grou
     sizes.set("classIllustration", J::num(CLASS_ILLUSTRATION_SIZE as f64));
     sizes.set("mainCircle", J::num(MAIN_CIRCLE_SIZE as f64));
     sizes.set("ascendancyPlate", J::num(ASCENDANCY_PLATE_SIZE as f64));
+    sizes.set("classStartRadius", J::num(CLASS_START_RING_RADIUS as f64));
+    sizes.set("classStartMount", J::num(CLASS_START_MOUNT_RADIUS as f64));
     extras.set("sizes", sizes);
     extras
 }

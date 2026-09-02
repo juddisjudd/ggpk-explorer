@@ -51,6 +51,11 @@ const ACTIVE_MARKER_OFFSET: f32 = 47.0 * skill_tree_layout::RING_PX;
 
 const DIM: Color32 = Color32::from_rgb(120, 120, 120);
 const FULL: Color32 = Color32::WHITE;
+/// Cluster "mastery" rows (`IsJustIcon`) are not nodes in PoE 2: the client
+/// draws the group's `MasteryBackgroundGraphic` pattern behind the cluster,
+/// faded until the cluster is highlighted.
+const MASTERY_PATTERN_SIZE: f32 = 400.0;
+const MASTERY_ALPHA: u8 = 120;
 
 /// Fallback frame size (world units) by node type.
 fn frame_size(info: &SkillGraphNodeInfo, in_ascendancy: bool) -> f32 {
@@ -391,6 +396,9 @@ impl<'a> PsgViewer<'a> {
                         }
                         let dist = (cursor - cv.to_screen(pos)).length();
                         let info = db.as_ref().and_then(|d| d.nodes.get(&id));
+                        if info.map(|i| i.is_mastery || !i.characters.is_empty()).unwrap_or(false) {
+                            continue;
+                        }
                         let world_r = info.map(|i| frame_size(i, layout.node_ascendancy(id).is_some()) / 2.0).unwrap_or(20.0);
                         let hit = (world_r * cv.zoom).max(12.0);
                         if dist < hit && dist < best {
@@ -436,23 +444,6 @@ impl<'a> PsgViewer<'a> {
                         if let Some(ch) = self.state.selected_class.and_then(|c| db.characters.get(c)) {
                             if let Some(tex) = ch.illustration.as_deref().and_then(|p| self.find_texture(p)) {
                                 draw_image(&painter, &cv, tex, Pos2::ZERO, Vec2::splat(CLASS_ILLUSTRATION_SIZE), FULL);
-                            }
-                        }
-                    }
-                    if let Some(tex) = self.find_texture(MAIN_CIRCLE) {
-                        draw_image(&painter, &cv, tex, Pos2::ZERO, Vec2::splat(MAIN_CIRCLE_SIZE), FULL);
-                    }
-                    // Lights up the selected class's roundel, drawn over the ring.
-                    if let Some(db) = &db {
-                        let start = self.state.selected_class.and_then(|c| {
-                            self.psg.roots.iter().find(|r| db.nodes.get(r).map(|i| i.characters.contains(&c)).unwrap_or(false))
-                        });
-                        if let (Some(root), Some(tex)) = (start, self.find_texture(MAIN_CIRCLE_ACTIVE)) {
-                            if let Some(&p) = layout.node_pos.get(root) {
-                                let outward = p.to_vec2() / p.to_vec2().length().max(1.0);
-                                let angle = p.x.atan2(-p.y);
-                                let center = p + outward * ACTIVE_MARKER_OFFSET;
-                                draw_image_rotated(&painter, &cv, tex, center, Vec2::splat(ACTIVE_MARKER_SIZE), angle, FULL);
                             }
                         }
                     }
@@ -545,6 +536,26 @@ impl<'a> PsgViewer<'a> {
                 }
             }
 
+            // ── Cluster patterns ──────────────────────────────────
+            // The faded glyph behind a cluster sits under its lines and nodes.
+            if let Some(db) = &db {
+                for (gi, group) in self.psg.groups.iter().enumerate() {
+                    if group.is_proxy || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
+                        continue;
+                    }
+                    for node in &group.nodes {
+                        let Some(info) = db.nodes.get(&node.skill_id).filter(|i| i.is_mastery) else { continue };
+                        let Some(&pos) = layout.node_pos.get(&node.skill_id) else { continue };
+                        let pattern = info.mastery_group.and_then(|g| db.mastery_effect_images.get(&g));
+                        if let Some(tex) = pattern.and_then(|p| self.find_texture(p)) {
+                            let tint = tint_for(layout.group_ascendancy[gi]);
+                            let faded = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), MASTERY_ALPHA);
+                            draw_image(&painter, &cv, tex, pos, Vec2::splat(MASTERY_PATTERN_SIZE), faded);
+                        }
+                    }
+                }
+            }
+
             // ── Connectors ────────────────────────────────────────
             let mut unique: HashMap<(u32, u32), i32> = HashMap::new();
             for (gi, group) in self.psg.groups.iter().enumerate() {
@@ -568,6 +579,15 @@ impl<'a> PsgViewer<'a> {
 
             for ((a, b), orbit_idx) in unique {
                 let (Some(&pa), Some(&pb)) = (layout.node_pos.get(&a), layout.node_pos.get(&b)) else { continue };
+                // Cluster "mastery" markers have no connectors; class starts
+                // connect from their roundel on the ring.
+                let (info_a, info_b) = (db.as_ref().and_then(|d| d.nodes.get(&a)), db.as_ref().and_then(|d| d.nodes.get(&b)));
+                if info_a.map(|i| i.is_mastery).unwrap_or(false) || info_b.map(|i| i.is_mastery).unwrap_or(false) {
+                    continue;
+                }
+                let (start_a, start_b) = (info_a.map(|i| !i.characters.is_empty()).unwrap_or(false), info_b.map(|i| !i.characters.is_empty()).unwrap_or(false));
+                let pa = if start_a { skill_tree_layout::class_start_line_end(pa, pb) } else { pa };
+                let pb = if start_b { skill_tree_layout::class_start_line_end(pb, pa) } else { pb };
                 let asc_a = layout.node_ascendancy(a);
                 let asc_b = layout.node_ascendancy(b);
                 // Ascendancy clusters are self-contained; a cross-link is a data artefact.
@@ -619,6 +639,29 @@ impl<'a> PsgViewer<'a> {
                 }
             }
 
+            // ── Centre ring ───────────────────────────────────────
+            // Painted after the connectors so the class-start lines end
+            // under the roundel mounts, as in game.
+            if self.psg.graph_type == 0 {
+                if let Some(tex) = self.find_texture(MAIN_CIRCLE) {
+                    draw_image(&painter, &cv, tex, Pos2::ZERO, Vec2::splat(MAIN_CIRCLE_SIZE), FULL);
+                }
+                // Lights up the selected class's roundel, drawn over the ring.
+                if let Some(db) = &db {
+                    let start = self.state.selected_class.and_then(|c| {
+                        self.psg.roots.iter().find(|r| db.nodes.get(r).map(|i| i.characters.contains(&c)).unwrap_or(false))
+                    });
+                    if let (Some(root), Some(tex)) = (start, self.find_texture(MAIN_CIRCLE_ACTIVE)) {
+                        if let Some(&p) = layout.node_pos.get(root) {
+                            let outward = p.to_vec2() / p.to_vec2().length().max(1.0);
+                            let angle = p.x.atan2(-p.y);
+                            let center = skill_tree_layout::class_start_anchor(p) + outward * ACTIVE_MARKER_OFFSET;
+                            draw_image_rotated(&painter, &cv, tex, center, Vec2::splat(ACTIVE_MARKER_SIZE), angle, FULL);
+                        }
+                    }
+                }
+            }
+
             // ── Nodes ─────────────────────────────────────────────
             for (gi, group) in self.psg.groups.iter().enumerate() {
                 if group.is_proxy || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
@@ -641,6 +684,9 @@ impl<'a> PsgViewer<'a> {
                     if !info.characters.is_empty() {
                         // Class start: the plate is the node.
                         continue;
+                    }
+                    if info.is_mastery {
+                        continue; // drawn as a cluster pattern before the connectors
                     }
                     if self.psg.graph_type == 1 && info.atlas_subtree_icon.is_some() {
                         if let Some(tex) = info.atlas_subtree_icon.as_deref().and_then(|p| self.find_texture(p)) {
@@ -686,9 +732,6 @@ impl<'a> PsgViewer<'a> {
                     if let Some(tex) = frame_tex {
                         draw_image(&painter, &cv, tex, pos, Vec2::splat(frame_size), tint);
                     }
-                    if is_hovered {
-                        painter.circle_stroke(screen_pos, frame_size * 0.6 * cv.zoom, egui::Stroke::new(2.0_f32, Color32::WHITE));
-                    }
                 }
             }
 
@@ -706,10 +749,12 @@ impl<'a> PsgViewer<'a> {
     /// from north). The sheet holds all nine orbit rings concentric on its
     /// bottom-right corner, so a single quad would show every smaller ring
     /// too; instead the arc is tessellated as a thin band whose UVs follow the
-    /// ring at radius `r` inside the sheet.
+    /// ring at radius `r` inside the sheet. The sheet only holds a quarter
+    /// ring, so the band restarts at every 90° boundary — a triangle spanning
+    /// one would interpolate its UVs straight across the sheet.
     #[allow(clippy::too_many_arguments)]
     fn draw_arc_between(&self, painter: &egui::Painter, cv: &Canvas, sheet: Option<&egui::TextureHandle>, center: Pos2, r: f32, orbit: usize, a1: f32, a2: f32, tint: Color32, active: bool) {
-        use std::f32::consts::{PI, TAU};
+        use std::f32::consts::{FRAC_PI_2, PI, TAU};
         let (mut lo, mut hi) = if a1 <= a2 { (a1, a2) } else { (a2, a1) };
         let mut arc = hi - lo;
         if arc >= PI {
@@ -725,22 +770,31 @@ impl<'a> PsgViewer<'a> {
         if !cv.visible(bounds) {
             return;
         }
-        let steps = ((arc / 4.0_f32.to_radians()).ceil() as usize).clamp(3, 96);
         let mut mesh = egui::Mesh::with_texture(sheet.id());
-        for i in 0..=steps {
-            let t = lo + arc * i as f32 / steps as f32;
-            let dir = vec2(t.sin(), -t.cos());
-            // Any point on the ring maps onto the sheet's quarter-arc by its angle within a quadrant.
-            let q = t.rem_euclid(std::f32::consts::FRAC_PI_2);
-            for rho in [r - ARC_BAND, r + ARC_BAND] {
-                let uv = pos2(1.0 - rho * q.cos() / SHEET_SIZE, 1.0 - rho * q.sin() / SHEET_SIZE);
-                mesh.vertices.push(egui::epaint::Vertex { pos: cv.to_screen(center + dir * rho), uv, color: tint });
+        let end = lo + arc;
+        let mut start = lo;
+        while end - start > 1e-4 {
+            let quadrant = ((start + 1e-4) / FRAC_PI_2).floor();
+            let stop = end.min((quadrant + 1.0) * FRAC_PI_2);
+            let span = stop - start;
+            let steps = ((span / 4.0_f32.to_radians()).ceil() as usize).clamp(1, 96);
+            let base = mesh.vertices.len() as u32;
+            for i in 0..=steps {
+                let t = start + span * i as f32 / steps as f32;
+                let dir = vec2(t.sin(), -t.cos());
+                // Position within this quarter of the ring, mapped onto the sheet's quarter-arc.
+                let q = (t - quadrant * FRAC_PI_2).clamp(0.0, FRAC_PI_2);
+                for rho in [r - ARC_BAND, r + ARC_BAND] {
+                    let uv = pos2(1.0 - rho * q.cos() / SHEET_SIZE, 1.0 - rho * q.sin() / SHEET_SIZE);
+                    mesh.vertices.push(egui::epaint::Vertex { pos: cv.to_screen(center + dir * rho), uv, color: tint });
+                }
+                if i > 0 {
+                    let b = base + (i * 2) as u32;
+                    mesh.add_triangle(b - 2, b - 1, b);
+                    mesh.add_triangle(b - 1, b + 1, b);
+                }
             }
-            if i > 0 {
-                let b = (i * 2) as u32;
-                mesh.add_triangle(b - 2, b - 1, b);
-                mesh.add_triangle(b - 1, b + 1, b);
-            }
+            start = stop;
         }
         painter.add(egui::Shape::mesh(mesh));
     }

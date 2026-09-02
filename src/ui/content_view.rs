@@ -3203,6 +3203,9 @@ pub(crate) fn collect_needed_texture_paths(
                 if let Some(icon) = &info.icon {
                     paths.push(icon.clone());
                 }
+                if let Some(pattern) = info.mastery_group.and_then(|g| db.mastery_effect_images.get(&g)) {
+                    paths.push(pattern.clone());
+                }
                 if let Some((bg, _, _)) = &info.atlas_subtree_background {
                     paths.push(bg.clone());
                 }
@@ -3265,6 +3268,8 @@ pub(crate) fn build_skill_graph_db(
         atlas_subtrees: fetch_optional("data/balance/atlaspassiveskillsubtrees.datc64"),
         characters: fetch_optional("data/balance/characters.datc64"),
         decorators: fetch_optional("data/balance/passivetreedecorators.datc64"),
+        mastery_groups: fetch_optional("data/balance/passiveskillmasterygroups.datc64"),
+        mastery_art: fetch_optional("data/balance/passiveskilltreemasteryart.datc64"),
     };
 
     let mut db = crate::ui::atlas_node_db::build(

@@ -108,8 +108,12 @@
     ascSel.value = selAsc ? selAsc.id : '';
   }
   fillAsc();
-  classSel.onchange = () => { selClass = classes.find(c => String(c.index) === classSel.value); fillAsc(); requestDraw(); };
-  ascSel.onchange = () => { selAsc = selClass.ascendancies.find(a => a.id === ascSel.value) || null; ascNone = !selAsc; requestDraw(); };
+  classSel.onchange = () => { selClass = classes.find(c => String(c.index) === classSel.value); fillAsc(); allocated.clear(); requestDraw(); };
+  ascSel.onchange = () => {
+    selAsc = selClass.ascendancies.find(a => a.id === ascSel.value) || null; ascNone = !selAsc;
+    for (const id of [...allocated]) if (byId(id).ascendancyId) allocated.delete(id);
+    requestDraw();
+  };
   document.getElementById('showAll').onchange = e => { showAll = e.target.checked; requestDraw(); };
   document.getElementById('search').oninput = e => { search = e.target.value.trim().toLowerCase(); requestDraw(); };
   document.getElementById('fit').onclick = fit;
@@ -124,6 +128,18 @@
   function nodeVisible(n) {
     if (n.x === undefined || n.isMultipleChoiceOption) return false;
     return visibleAscendancy(ascOfNode(n));
+  }
+  // Cluster theme glyphs ("mastery" rows) are decoration, not nodes.
+  const selectable = n => nodeVisible(n) && !n.classStartIndex && !n.isMastery;
+  // Class starts connect from their roundel on the centre ring; the line
+  // stops under the roundel's mount so it never crosses the quatrefoil.
+  function anchor(n, other) {
+    if (!n.classStartIndex) return [n.x, n.y];
+    const r = Math.hypot(n.x, n.y) || 1, R = (X.sizes && X.sizes.classStartRadius) || 1564;
+    const ax = n.x / r * R, ay = n.y / r * R;
+    const dx = other.x - ax, dy = other.y - ay, len = Math.hypot(dx, dy) || 1;
+    const m = Math.min(len, (X.sizes && X.sizes.classStartMount) || 130);
+    return [ax + dx / len * m, ay + dy / len * m];
   }
   function dimmed(n) {
     const a = ascOfNode(n);
@@ -143,6 +159,19 @@
     view.x = canvas.width / 2 - ((D.min_x + D.max_x) / 2) * view.zoom;
     view.y = canvas.height / 2 - ((D.min_y + D.max_y) / 2) * view.zoom;
     requestDraw();
+  }
+  // `#alloc=1,2,3` pre-allocates nodes (each along its shortest path).
+  function updateHash() {
+    const p = new URLSearchParams(location.hash.replace(/^#/, ''));
+    if (allocated.size) p.set('alloc', [...allocated].join(',')); else p.delete('alloc');
+    if (selClass) p.set('class', selClass.name);
+    p.set('asc', selAsc ? selAsc.id : 'none');
+    history.replaceState(null, '', '#' + p.toString());
+  }
+  function allocFromHash() {
+    const p = new URLSearchParams(location.hash.replace(/^#/, ''));
+    if (!p.get('alloc')) return;
+    for (const id of p.get('alloc').split(',')) { const n = byId(id.trim()); if (n) toggleNode(n); }
   }
   // `#z=0.3&x=0&y=-1500` opens centred on a world point at a given zoom.
   function viewFromHash() {
@@ -186,10 +215,69 @@
     return ['frame:PSSkillFrame' + { '': '', CanAllocate: 'Highlighted', Allocated: 'Active' }[state]];
   }
   function iconCategory(n) { return n.isKeystone ? 'keystone' : n.isNotable ? 'notable' : n.isMastery ? 'mastery' : 'normal'; }
+  // ── allocation (game rules) ───────────────────────────────────────
+  // Paths start at the class start (and the chosen ascendancy's start);
+  // a node can only be taken when it links back to one of those through
+  // allocated nodes, so clicking farther away fills the shortest path.
+  let R = new Set();
+  function roots() {
+    const r = new Set();
+    const start = selClass && X.classStart && X.classStart[selClass.index];
+    if (start) r.add(Number(start));
+    if (selAsc) { const a = ids.find(id => nodes[id].isAscendancyStart && nodes[id].ascendancyId === selAsc.id); if (a) r.add(Number(a)); }
+    return r;
+  }
+  const taken = id => allocated.has(id) || R.has(id);
+  function pathable(n) {
+    if (!n || !nodeVisible(n) || n.isMastery || n.classStartIndex || n.isAscendancyStart || n.isMultipleChoiceOption) return false;
+    if (n.ascendancyId && !(selAsc && n.ascendancyId === selAsc.id)) return false;
+    return true;
+  }
   function allocState(n) {
     if (allocated.has(n.skill)) return 'Allocated';
-    const nb = neighbours[n.skill] || [];
-    return nb.some(o => allocated.has(o)) ? 'CanAllocate' : '';
+    return (neighbours[n.skill] || []).some(o => taken(o)) ? 'CanAllocate' : '';
+  }
+  // Shortest path from `n` to anything already taken, as the list of new nodes.
+  function pathTo(n) {
+    if (!pathable(n)) return null;
+    const prev = new Map([[n.skill, null]]);
+    const queue = [n.skill];
+    while (queue.length) {
+      const cur = queue.shift();
+      for (const nb of neighbours[cur] || []) {
+        if (taken(nb)) { const path = []; for (let c = cur; c !== null; c = prev.get(c)) path.push(c); return path; }
+        if (prev.has(nb) || !pathable(byId(nb))) continue;
+        prev.set(nb, cur);
+        queue.push(nb);
+      }
+    }
+    return null;
+  }
+  // Drops every allocated node that no longer links back to a root.
+  function pruneDisconnected() {
+    const keep = new Set();
+    const queue = [...R];
+    const seen = new Set(queue);
+    while (queue.length) {
+      const cur = queue.shift();
+      for (const nb of neighbours[cur] || []) {
+        if (seen.has(nb) || !allocated.has(nb)) continue;
+        seen.add(nb); keep.add(nb); queue.push(nb);
+      }
+    }
+    for (const id of [...allocated]) if (!keep.has(id)) allocated.delete(id);
+  }
+  function toggleNode(n) {
+    R = roots();
+    if (allocated.has(n.skill)) {
+      allocated.delete(n.skill);
+      pruneDisconnected();
+      return true;
+    }
+    const path = pathTo(n);
+    if (!path) return false;
+    for (const id of path) allocated.add(id);
+    return true;
   }
   function matches(n) {
     if (!search) return false;
@@ -198,6 +286,7 @@
   }
 
   function draw() {
+    R = roots();
     const W = canvas.width, H = canvas.height;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.fillStyle = '#0a0a0d';
@@ -218,8 +307,6 @@
       const sheet = 'background-' + selClass.name.toLowerCase();
       drawSprite(sprite(sheet, 'class' + selClass.name + ':Class0'), 0, 0, sizes.classIllustration || 2518);
     }
-    drawSprite(sprite('group-background', 'startNode:MainCircle'), 0, 0, sizes.mainCircle || 3644);
-
     // ascendancy plates
     const plates = X.ascendancyPlates || {};
     for (const c of classes) {
@@ -254,16 +341,24 @@
       }
     }
 
+    // cluster patterns: the faded glyph behind a cluster sits under its lines and nodes
+    for (const id of ids) {
+      const n = nodes[id];
+      if (!n.isMastery || !n.activeEffectImage || !nodeVisible(n) || !inView(n.x, n.y, 400)) continue;
+      const lit = (neighbours[n.skill] || []).some(o => allocated.has(o));
+      drawSprite(sprite('mastery-effect-active', 'masteryEffectActive:' + n.activeEffectImage), n.x, n.y, 400, (dimmed(n) ? 0.4 : 1) * (lit ? 1 : 0.45));
+    }
+
     // connectors
     const radii = X.orbitRadii || [0, 82, 164, 334, 488, 657, 839, 250, 1076, 1320];
     for (const e of edges) {
       if (e.from === 'root') continue;
       const a = byId(e.from), b = byId(e.to);
       if (!a || !b || !nodeVisible(a) || !nodeVisible(b)) continue;
-      if (a.hideConnection || b.hideConnection) continue;
+      if (a.hideConnection || b.hideConnection || a.isMastery || b.isMastery) continue;
       if (ascOfNode(a) !== ascOfNode(b)) continue;
       if (!inView((a.x + b.x) / 2, (a.y + b.y) / 2, 1400)) continue;
-      const active = allocated.has(a.skill) && allocated.has(b.skill);
+      const active = taken(a.skill) && taken(b.skill);
       const kind = active ? 'Active' : 'Normal';
       const alpha = (dimmed(a) || dimmed(b)) ? 0.4 : 1;
       ctx.globalAlpha = alpha;
@@ -277,24 +372,25 @@
         const sp = sprite('line', 'line:Orbit' + a.orbit + kind);
         drawArc(sp, g.x, g.y, r, Math.atan2(a.y - g.y, a.x - g.x), Math.atan2(b.y - g.y, b.x - g.x), active);
       } else {
-        drawLine(sprite('line', 'line:LineConnector' + kind), a.x, a.y, b.x, b.y, active);
+        const pa = anchor(a, b), pb = anchor(b, a);
+        drawLine(sprite('line', 'line:LineConnector' + kind), pa[0], pa[1], pb[0], pb[1], active);
       }
       ctx.globalAlpha = 1;
     }
 
+    // centre ring, over the connectors so class-start lines end under the roundel mounts
+    drawSprite(sprite('group-background', 'startNode:MainCircle'), 0, 0, sizes.mainCircle || 4000);
+
     // nodes
-    const hoverId = hovered ? hovered.skill : null;
     for (const id of ids) {
       const n = nodes[id];
       if (!nodeVisible(n) || n.classStartIndex) continue;
       if (!inView(n.x, n.y, 300)) continue;
       const alpha = dimmed(n) ? 0.4 : 1;
+      if (n.isMastery) continue; // drawn as a cluster pattern before the connectors
       const state = allocState(n);
       const allocatedHere = state === 'Allocated';
       ctx.globalAlpha = alpha;
-      if (n.isMastery && n.activeEffectImage) {
-        drawSprite(sprite(allocatedHere ? 'mastery-effect-active' : 'mastery-effect-disabled', (allocatedHere ? 'masteryEffectActive:' : 'masteryEffectInactive:') + n.activeEffectImage), n.x, n.y, 300);
-      }
       const frame = firstSprite('frame', frameKeys(n, state));
       if (n.icon && !n.isAscendancyStart && !n.isJewelSocket) {
         const cat = iconCategory(n);
@@ -303,14 +399,16 @@
       }
       if (frame) drawSprite(frame, n.x, n.y);
       else { ctx.fillStyle = n.isKeystone ? '#c96b3c' : n.isNotable ? '#d6b25a' : '#7a8ab0'; ctx.beginPath(); ctx.arc(n.x, n.y, n.isKeystone ? 60 : n.isNotable ? 45 : 30, 0, Math.PI * 2); ctx.fill(); }
-      if (n.skill === hoverId || matches(n)) {
-        ctx.strokeStyle = n.skill === hoverId ? '#ffffff' : '#ffd25a';
+      if (matches(n)) {
+        ctx.strokeStyle = '#ffd25a';
         ctx.lineWidth = 6 / Math.max(view.zoom, 0.05) * 0.5 + 4;
         ctx.beginPath(); ctx.arc(n.x, n.y, (frame ? frame.w / SHEET_SCALE : 100) * 0.62, 0, Math.PI * 2); ctx.stroke();
       }
       ctx.globalAlpha = 1;
     }
-    status.textContent = `${allocated.size} allocated · zoom ${view.zoom.toFixed(3)} · ${selClass ? selClass.name : ''}${selAsc ? ' / ' + selAsc.name : ''} · drag to pan, wheel to zoom, click to allocate`;
+    let passive = 0, ascend = 0;
+    for (const id of allocated) { if (byId(id).ascendancyId) ascend++; else passive++; }
+    status.textContent = `${passive} passive + ${ascend} ascendancy points · zoom ${view.zoom.toFixed(3)} · ${selClass ? selClass.name : ''}${selAsc ? ' / ' + selAsc.name : ''} · drag to pan, wheel to zoom, click to allocate along a path`;
   }
 
   function drawLine(sp, x1, y1, x2, y2, active) {
@@ -359,7 +457,7 @@
     let best = null, bestD = Infinity;
     for (const id of ids) {
       const n = nodes[id];
-      if (!nodeVisible(n) || n.classStartIndex) continue;
+      if (!selectable(n)) continue;
       const radius = n.isKeystone ? 110 : (n.isNotable || ascOfNode(n)) ? 80 : 55;
       const d = Math.hypot(n.x - wx, n.y - wy);
       if (d < radius && d < bestD) { best = n; bestD = d; }
@@ -409,8 +507,7 @@
     if (dragMoved) return;
     const n = nodeAt(e.clientX, e.clientY);
     if (!n || n.isAscendancyStart) return;
-    if (allocated.has(n.skill)) allocated.delete(n.skill); else allocated.add(n.skill);
-    requestDraw();
+    if (toggleNode(n)) { requestDraw(); updateHash(); }
   });
   canvas.addEventListener('wheel', e => {
     e.preventDefault();
@@ -425,7 +522,10 @@
   }, { passive: false });
   window.addEventListener('resize', resize);
   resize();
-  if (!viewFromHash()) fit();
+  const hadView = viewFromHash();
+  allocFromHash();
+  if (!hadView) fit();
+  requestDraw();
 })();
 </script>
 </body>

@@ -17,19 +17,55 @@ use std::collections::HashMap;
 pub const ASCENDANCY_RING_RADIUS: f32 = 15537.0;
 pub const ASCENDANCY_SLOT_STEP_DEG: f32 = 12.0;
 
-/// World units per pixel of `PassiveTreeMainCircle`. That texture is 4000 px
-/// and already contains the six class-start roundels; measuring their centres
-/// (all at texture radius 1611 px, angles matching the class starts to ~1°)
-/// against the class-start nodes' own radius (~1468) gives this ratio, so the
-/// ring is drawn at 4000 × 0.911 rather than 4000.
-pub const RING_PX: f32 = 0.9109;
+/// World units per pixel of `PassiveTreeMainCircle`: the client draws the
+/// 4000 px texture one pixel per unit (the official web export tags every
+/// sheet at half scale for the same reason).
+pub const RING_PX: f32 = 1.0;
 pub const MAIN_CIRCLE_SIZE: f32 = 4000.0 * RING_PX;
 
+/// The ring texture carries the six class-start roundels, each a mount
+/// around a transparent hole centred at this texture radius (alpha profile
+/// along a class direction: mount 1396–1492, hole 1504–1624, mount
+/// 1636–1780). The class-start nodes themselves sit ~1440–1490 units from the
+/// centre, so the client starts their connectors at the roundel, not at the
+/// node's stored position (in game the first nodes are ~180 units from the
+/// quatrefoil, which only the roundel radius reproduces).
+pub const CLASS_START_RING_RADIUS: f32 = 1564.0 * RING_PX;
+
 /// `Characters`/`Ascendancy.PassiveTreeImage` are 1500 px textures holding a
-/// circle inscribed to the edges (corners are transparent). The class one
-/// fills the ring's inner circle, whose edge measures 1382 px ≈ 1259 units.
-pub const CLASS_ILLUSTRATION_SIZE: f32 = 2518.0;
+/// circle inscribed to the edges (corners are transparent), drawn at two
+/// units per pixel like the ring; the art reaches the ring's outer rim and
+/// shows dimly through the ring's soft inner vignette, as in game.
+pub const CLASS_ILLUSTRATION_SIZE: f32 = 3000.0 * RING_PX;
 pub const ASCENDANCY_PLATE_SIZE: f32 = CLASS_ILLUSTRATION_SIZE;
+
+/// Where a class start's connectors begin: the roundel on the ring along
+/// the node's own direction.
+pub fn class_start_anchor(node_pos: Pos2) -> Pos2 {
+    let v = node_pos.to_vec2();
+    let len = v.length();
+    if len <= 0.0 {
+        return node_pos;
+    }
+    (v / len * CLASS_START_RING_RADIUS).to_pos2()
+}
+
+/// The roundel's ornate mount is opaque from about 72 px out to 170 px from
+/// the hole centre; connectors to the first nodes stop under it, so they
+/// never cross the quatrefoil.
+pub const CLASS_START_MOUNT_RADIUS: f32 = 130.0 * RING_PX;
+
+/// End point of the connector between a class start and `other`: on the
+/// line from the roundel to `other`, just inside the mount.
+pub fn class_start_line_end(node_pos: Pos2, other: Pos2) -> Pos2 {
+    let anchor = class_start_anchor(node_pos);
+    let d = other - anchor;
+    let len = d.length();
+    if len <= CLASS_START_MOUNT_RADIUS {
+        return anchor;
+    }
+    anchor + d / len * CLASS_START_MOUNT_RADIUS
+}
 
 /// Ascendancies whose start group is not at the plate centre in the official
 /// export (multi-group layouts placed by hand). Everything else is within
