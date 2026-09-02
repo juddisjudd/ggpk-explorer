@@ -1327,7 +1327,19 @@ checksum = "479dfe1e6737aa9e96c6ac7b69689dc4c32da8383f2c12744739d76afa8b66c4"
 dependencies = [
  "bitflags 2.13.1",
  "byteorder",
- "enum-primitive-derive",
+ "enum-primitive-derive 0.2.2",
+ "num-traits",
+]
+
+[[package]]
+name = "ddsfile"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be425797f9962624aba78dee473dad28c15999e6ee6feb28ad3ee7928a3bc5b"
+dependencies = [
+ "bitflags 2.13.1",
+ "byteorder",
+ "enum-primitive-derive 0.3.0",
  "num-traits",
 ]
 
@@ -1656,6 +1668,17 @@ dependencies = [
  "num-traits",
  "quote",
  "syn 1.0.109",
+]
+
+[[package]]
+name = "enum-primitive-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba7795da175654fe16979af73f81f26a8ea27638d8d9823d317016888a63dc4c"
+dependencies = [
+ "num-traits",
+ "quote",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -2079,7 +2102,7 @@ dependencies = [
  "byteorder",
  "cc",
  "chrono",
- "ddsfile",
+ "ddsfile 0.6.0",
  "eframe",
  "egui",
  "egui_extras",
@@ -2678,7 +2701,7 @@ checksum = "c3388630ed66c07107145ac5b13c804261f18d5daf0dd2699481888aba16cd38"
 dependencies = [
  "bcdec_rs",
  "bytemuck",
- "ddsfile",
+ "ddsfile 0.5.2",
  "half",
  "image",
  "intel_tex_2",
