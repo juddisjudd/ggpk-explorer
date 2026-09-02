@@ -936,7 +936,7 @@ fn export_file_data(
                     std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
                 }
             }
-            PsgFormat::Original => {
+            PsgFormat::Original | PsgFormat::Tree => {
                 std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
             }
         }

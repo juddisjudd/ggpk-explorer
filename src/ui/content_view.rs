@@ -127,6 +127,8 @@ pub struct ContentView {
     // .psg viewer. Fetched/decoded lazily in small batches as `psg_viewer`
     // discovers which paths the currently-open tree actually needs.
     pub psg_texture_cache: HashMap<String, egui::TextureHandle>,
+    /// In-flight skill tree export: file hash it was started from + status channel.
+    tree_export_rx: Option<(u64, std::sync::mpsc::Receiver<crate::export::ExportStatus>)>,
     psg_texture_pending: std::collections::HashSet<String>,
     /// Paths that could not be resolved/decoded — never re-requested.
     psg_texture_failed: std::collections::HashSet<String>,
@@ -208,6 +210,7 @@ impl Default for ContentView {
             skill_graph_db_loading: false,
 
             psg_texture_cache: HashMap::new(),
+            tree_export_rx: None,
             psg_texture_pending: std::collections::HashSet::new(),
             psg_texture_failed: std::collections::HashSet::new(),
             psg_texture_rx: None,
@@ -291,6 +294,7 @@ impl ContentView {
         }
 
         self.poll_thumbnails(ui.ctx());
+        self.poll_tree_export();
         if let Some(rx) = &self.psg_texture_rx {
             if let Ok(batch) = rx.try_recv() {
                 self.psg_texture_rx = None;
@@ -492,6 +496,12 @@ impl ContentView {
                                          } else {
                                              ui.label("JSON representation not available.");
                                          }
+                                     }
+                                     if state.export_requested {
+                                         state.export_requested = false;
+                                         let psg_file = psg_file.clone();
+                                         let path = file_info.path.clone();
+                                         self.start_tree_export(hash, path, psg_file, reader.clone(), index);
                                      }
                                 } else if let Some(json) = self.json_cache.get(&hash) {
                                     // Fallback if PSG struct missing but JSON exists
@@ -2367,6 +2377,64 @@ impl ContentView {
         });
     }
 
+    /// Asks for a destination folder and runs the official-format skill tree
+    /// export for `psg` on a background thread.
+    fn start_tree_export(
+        &mut self,
+        hash: u64,
+        psg_path: String,
+        psg: crate::dat::psg::PsgFile,
+        reader: Option<std::sync::Arc<GgpkReader>>,
+        index: &std::sync::Arc<crate::bundles::index::Index>,
+    ) {
+        if self.tree_export_rx.is_some() {
+            return;
+        }
+        let Some(schema) = self.dat_viewer.schema.clone() else {
+            if let Some(state) = self.psg_viewer_state.get_mut(&hash) {
+                state.export_status = Some("Schema not loaded yet".to_string());
+            }
+            return;
+        };
+        let Some(out_dir) = rfd::FileDialog::new().set_title("Export skill tree to folder").pick_folder() else { return };
+        let source = crate::skill_tree_export::TreeExportSource { reader, index: index.clone(), steam: self.steam_loader.clone(), schema };
+        let db = self.skill_graph_db.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.tree_export_rx = Some((hash, rx));
+        if let Some(state) = self.psg_viewer_state.get_mut(&hash) {
+            state.export_status = Some("Exporting…".to_string());
+        }
+        std::thread::spawn(move || {
+            crate::skill_tree_export::run_tree_export(source, psg_path, psg, db, crate::skill_tree_export::TreeExportOptions::default(), out_dir, tx);
+        });
+    }
+
+    fn poll_tree_export(&mut self) {
+        let Some((hash, rx)) = &self.tree_export_rx else { return };
+        let hash = *hash;
+        let mut finished = false;
+        let mut status = None;
+        while let Ok(msg) = rx.try_recv() {
+            status = Some(match msg {
+                crate::export::ExportStatus::Progress { current, total, filename } => format!("Exporting [{}/{}] {}", current, total, filename),
+                crate::export::ExportStatus::Complete { message, .. } => {
+                    finished = true;
+                    message
+                }
+                crate::export::ExportStatus::Error(e) => {
+                    finished = true;
+                    format!("Export failed: {}", e)
+                }
+            });
+        }
+        if let (Some(status), Some(state)) = (status, self.psg_viewer_state.get_mut(&hash)) {
+            state.export_status = Some(status);
+        }
+        if finished {
+            self.tree_export_rx = None;
+        }
+    }
+
     /// True while the shared skill graph database and/or any of its art
     /// textures are still being fetched/decoded in the background.
     pub fn is_psg_art_loading(&self) -> bool {
@@ -3052,7 +3120,7 @@ pub(crate) fn scan_table_stats(
     out
 }
 
-fn find_file_info_by_path<'a>(
+pub(crate) fn find_file_info_by_path<'a>(
     index: &'a crate::bundles::index::Index,
     path: &str,
 ) -> Option<&'a crate::bundles::index::FileInfo> {
@@ -3173,14 +3241,15 @@ pub(crate) fn build_skill_graph_db(
     let stats_bytes = fetch("data/balance/stats.datc64")?;
 
     // Covers all three known graph types: character/ascendancy, atlas, and
-    // Brequel (Chayula league tree). `stat_descriptions.csd` is the generic
-    // fallback every tree can fall back to for shared/uncommon stat ids.
+    // Brequel (Chayula league tree). Later files redefine earlier entries,
+    // so the generic `stat_descriptions.csd` goes before the passive-tree
+    // files; the atlas files come first so they never shadow passive text.
     let csd_paths = [
-        "data/statdescriptions/passive_skill_stat_descriptions.csd",
-        "data/statdescriptions/passive_skill_variant_stat_descriptions.csd",
         "data/statdescriptions/atlas_stat_descriptions.csd",
         "data/statdescriptions/atlas_variant_stat_descriptions.csd",
         "data/statdescriptions/stat_descriptions.csd",
+        "data/statdescriptions/passive_skill_stat_descriptions.csd",
+        "data/statdescriptions/passive_skill_variant_stat_descriptions.csd",
     ];
     let mut stat_csd_sources = Vec::new();
     for path in csd_paths {
@@ -3259,7 +3328,7 @@ fn tree_art_cache_path(path: &str, info: &crate::bundles::index::FileInfo) -> st
 }
 
 /// Decompresses a whole bundle (the raw payload for `bundle_index`).
-fn decompress_bundle(
+pub(crate) fn decompress_bundle(
     bundle_index: u32,
     index: &crate::bundles::index::Index,
     reader: Option<&GgpkReader>,
@@ -3290,7 +3359,7 @@ fn decompress_bundle(
 /// `Art/Textures/Interface/2D/2DArt/UIImages/InGame/PassiveSkillScreenGroupBackgroundSmall.dds`
 /// on disk. Icon (`SkillIcons`) and connector (`PassiveTree`) paths don't
 /// need this — only try it for the `UIImages` case.
-fn dds_path_candidates(path: &str) -> Vec<String> {
+pub(crate) fn dds_path_candidates(path: &str) -> Vec<String> {
     let mut candidates = vec![path.to_string(), format!("{}.dds", path)];
     let lower = path.to_ascii_lowercase();
     if let Some(rest) = lower.strip_prefix("art/2dart/uiimages") {

@@ -1,9 +1,10 @@
 use serde::{Serialize, Serializer};
 use serde::ser::SerializeStruct;
 
-// Passive radii match the official web-tree export (all 4,483 main-tree nodes
-// line up to <0.01 units); the atlas table differs only on the outermost ring.
-pub const PASSIVE_ORBIT_RADII: [i32; 10] = [0, 82, 162, 335, 493, 662, 846, 251, 1080, 1322];
+// Passive radii are fitted to the official web-tree export (every orbit's
+// node-to-group distance is within 0.1 units of these); the atlas table is the
+// older set, which differs on most rings.
+pub const PASSIVE_ORBIT_RADII: [i32; 10] = [0, 82, 164, 334, 488, 657, 839, 250, 1076, 1320];
 pub const ATLAS_ORBIT_RADII: [i32; 10] = [0, 82, 162, 335, 493, 662, 846, 251, 1080, 1332];
 
 #[derive(Debug, Clone)]
@@ -243,7 +244,7 @@ mod tests {
         let serialized = serde_json::to_string(&psg).expect("Failed to serialize");
         let val: serde_json::Value = serde_json::from_str(&serialized).expect("Failed to parse JSON");
         assert_eq!(val.get("roots").unwrap().as_array().unwrap()[0].as_u64().unwrap(), 100);
-        assert_eq!(val.get("orbitRadii").unwrap(), &serde_json::json!([0, 82, 162, 335, 493, 662, 846, 251, 1080, 1322]));
+        assert_eq!(val.get("orbitRadii").unwrap(), &serde_json::json!([0, 82, 164, 334, 488, 657, 839, 250, 1076, 1320]));
     }
 
     #[test]

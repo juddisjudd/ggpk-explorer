@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passive Skill Tree</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #08080b; color: #d8d2c4; font: 13px/1.4 "Segoe UI", system-ui, sans-serif; overflow: hidden; }
+  #c { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
+  #c.dragging { cursor: grabbing; }
+  #ui { position: absolute; top: 10px; left: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; background: rgba(12,12,16,.85); border: 1px solid #3a3325; padding: 8px 10px; border-radius: 4px; z-index: 2; max-width: calc(100% - 40px); }
+  #ui select, #ui input, #ui button { background: #17161a; color: #e6dcc3; border: 1px solid #4a4030; padding: 4px 6px; font: inherit; border-radius: 3px; }
+  #ui button:hover { border-color: #b59a5a; }
+  #ui label { display: inline-flex; gap: 4px; align-items: center; color: #b8b0a0; }
+  #status { position: absolute; left: 10px; bottom: 10px; color: #8d8574; font-size: 12px; background: rgba(12,12,16,.7); padding: 4px 8px; border-radius: 3px; z-index: 2; }
+  #tip { position: absolute; display: none; pointer-events: none; max-width: 380px; background: rgba(8,8,10,.94); border: 1px solid #5a4a2a; border-radius: 4px; padding: 8px 10px; z-index: 3; box-shadow: 0 4px 18px rgba(0,0,0,.6); }
+  #tip .name { font-size: 15px; font-weight: 600; margin-bottom: 2px; }
+  #tip .type { color: #8d8574; font-size: 11px; font-style: italic; margin-bottom: 6px; }
+  #tip .stat { color: #8888ff; }
+  #tip .stat.kw { color: #7c9cff; }
+  #tip .flav { color: #af6025; font-style: italic; margin-top: 6px; white-space: pre-wrap; }
+  #tip .extra { color: #a09880; margin-top: 6px; font-size: 12px; }
+  #tip .opt { color: #c8c0a8; margin-top: 4px; }
+  #tip .opt b { color: #e6dcc3; }
+  .keystone { color: #c96b3c; } .notable { color: #d6b25a; } .mastery { color: #9fd0a0; } .jewel { color: #6fd6c5; } .normal { color: #e6dcc3; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label>Class <select id="classSel"></select></label>
+  <label>Ascendancy <select id="ascSel"></select></label>
+  <label><input type="checkbox" id="showAll"> show every ascendancy</label>
+  <label>Find <input id="search" placeholder="node name or stat" size="22"></label>
+  <button id="fit">Fit</button>
+  <button id="reset">Clear allocation</button>
+</div>
+<canvas id="c"></canvas>
+<div id="status"></div>
+<div id="tip"></div>
+<script src="data.js"></script>
+<script src="assets.js"></script>
+<script>
+(function () {
+  const D = window.TREE_DATA, A = window.TREE_ASSETS || { sheets: {}, extras: {} };
+  const S = A.sheets, X = A.extras;
+  const SHEET_SCALE = 0.5;
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  const tip = document.getElementById('tip');
+  const status = document.getElementById('status');
+
+  // ── sheets ────────────────────────────────────────────────────────
+  const imgs = {};
+  for (const name in S) {
+    const im = new Image();
+    im.onload = () => requestDraw();
+    im.src = 'assets/' + S[name].meta.image;
+    imgs[name] = im;
+  }
+  function sprite(sheet, key) {
+    const s = S[sheet]; if (!s) return null;
+    const f = s.frames[key]; if (!f) return null;
+    const im = imgs[sheet]; if (!im || !im.complete || !im.naturalWidth) return null;
+    return { img: im, x: f.frame.x, y: f.frame.y, w: f.frame.w, h: f.frame.h };
+  }
+  function drawSprite(sp, cx, cy, size, alpha) {
+    if (!sp) return false;
+    const w = size ? size : sp.w / SHEET_SCALE;
+    const h = size ? size * sp.h / sp.w : sp.h / SHEET_SCALE;
+    if (alpha !== undefined) ctx.globalAlpha = alpha;
+    ctx.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, cx - w / 2, cy - h / 2, w, h);
+    if (alpha !== undefined) ctx.globalAlpha = 1;
+    return true;
+  }
+  function firstSprite(sheet, keys) { for (const k of keys) { const s = sprite(sheet, k); if (s) return s; } return null; }
+
+  // ── data ──────────────────────────────────────────────────────────
+  const nodes = D.nodes, groups = D.groups, edges = D.edges;
+  const ids = Object.keys(nodes).filter(k => k !== 'root' && nodes[k].x !== undefined);
+  const byId = id => nodes[String(id)];
+  const classes = D.classes.map((c, i) => ({ ...c, index: i })).filter(c => c.ascendancies && c.ascendancies.length);
+  const ascOfNode = n => n.ascendancyId || null;
+  const neighbours = {};
+  for (const e of edges) {
+    if (e.from === 'root') continue;
+    (neighbours[e.from] = neighbours[e.from] || []).push(e.to);
+    (neighbours[e.to] = neighbours[e.to] || []).push(e.from);
+  }
+  const optionsOf = {};
+  for (const id of ids) { const n = nodes[id]; if (n.multipleChoiceParent) (optionsOf[n.multipleChoiceParent] = optionsOf[n.multipleChoiceParent] || []).push(n); }
+
+  // ── state ─────────────────────────────────────────────────────────
+  const view = { zoom: 0.08, x: 0, y: 0 };
+  let selClass = classes[0] || null, selAsc = null, showAll = false;
+  const allocated = new Set();
+  let hovered = null, search = '';
+  let dragging = false, dragMoved = false, last = null;
+
+  const classSel = document.getElementById('classSel'), ascSel = document.getElementById('ascSel');
+  for (const c of classes) { const o = document.createElement('option'); o.value = c.index; o.textContent = c.name; classSel.appendChild(o); }
+  function fillAsc() {
+    ascSel.innerHTML = '';
+    if (!selClass) return;
+    for (const a of selClass.ascendancies) { if (!a.name) continue; const o = document.createElement('option'); o.value = a.id; o.textContent = a.name; ascSel.appendChild(o); }
+    selAsc = selClass.ascendancies.find(a => a.name) || null;
+  }
+  fillAsc();
+  classSel.onchange = () => { selClass = classes.find(c => String(c.index) === classSel.value); fillAsc(); requestDraw(); };
+  ascSel.onchange = () => { selAsc = selClass.ascendancies.find(a => a.id === ascSel.value) || null; requestDraw(); };
+  document.getElementById('showAll').onchange = e => { showAll = e.target.checked; requestDraw(); };
+  document.getElementById('search').oninput = e => { search = e.target.value.trim().toLowerCase(); requestDraw(); };
+  document.getElementById('fit').onclick = fit;
+  document.getElementById('reset').onclick = () => { allocated.clear(); requestDraw(); };
+
+  function visibleAscendancy(id) {
+    if (!id) return true;
+    if (showAll) return true;
+    if (!selClass) return false;
+    return selClass.ascendancies.some(a => a.id === id && a.name);
+  }
+  function nodeVisible(n) {
+    if (n.x === undefined || n.isMultipleChoiceOption) return false;
+    return visibleAscendancy(ascOfNode(n));
+  }
+  function dimmed(n) {
+    const a = ascOfNode(n);
+    return a && selAsc && a !== selAsc.id;
+  }
+
+  // ── transform ─────────────────────────────────────────────────────
+  function resize() {
+    canvas.width = Math.floor(window.innerWidth * devicePixelRatio);
+    canvas.height = Math.floor(window.innerHeight * devicePixelRatio);
+    requestDraw();
+  }
+  function fit() {
+    const pad = 1500;
+    const w = D.max_x - D.min_x + pad * 2, h = D.max_y - D.min_y + pad * 2;
+    view.zoom = Math.min(canvas.width / w, canvas.height / h);
+    view.x = canvas.width / 2 - ((D.min_x + D.max_x) / 2) * view.zoom;
+    view.y = canvas.height / 2 - ((D.min_y + D.max_y) / 2) * view.zoom;
+    requestDraw();
+  }
+  // `#z=0.3&x=0&y=-1500` opens centred on a world point at a given zoom.
+  function viewFromHash() {
+    const p = new URLSearchParams(location.hash.replace(/^#/, ''));
+    if (!p.has('z')) return false;
+    view.zoom = Math.min(2, Math.max(0.01, parseFloat(p.get('z')) || 0.3));
+    const cx = parseFloat(p.get('x')) || 0, cy = parseFloat(p.get('y')) || 0;
+    view.x = canvas.width / 2 - cx * view.zoom;
+    view.y = canvas.height / 2 - cy * view.zoom;
+    const cls = classes.find(c => c.name === p.get('class'));
+    if (cls) { selClass = cls; classSel.value = cls.index; fillAsc(); }
+    if (selClass && p.get('asc')) { const a = selClass.ascendancies.find(a => a.id === p.get('asc')); if (a) { selAsc = a; ascSel.value = a.id; } }
+    requestDraw();
+    return true;
+  }
+  const toScreen = (x, y) => [x * view.zoom + view.x, y * view.zoom + view.y];
+  const toWorld = (sx, sy) => [(sx - view.x) / view.zoom, (sy - view.y) / view.zoom];
+
+  // ── drawing ───────────────────────────────────────────────────────
+  let pending = false;
+  function requestDraw() { if (!pending) { pending = true; requestAnimationFrame(() => { pending = false; draw(); }); } }
+
+  function frameKeys(n, state) {
+    // state: '' | 'CanAllocate' | 'Allocated'
+    const asc = ascOfNode(n);
+    const std = { '': 'Unallocated', CanAllocate: 'CanAllocate', Allocated: 'Allocated' }[state];
+    if (n.isAscendancyStart) return ['frame:AscendancyStartNode'];
+    if (asc) {
+      const oracle = asc === 'Druid1';
+      if (n.isNotable) return oracle ? ['frame:OracleFrameNotable' + std, 'frame:AscendancyFrameNotable' + std] : ['frame:AscendancyFrameNotable' + std];
+      return oracle ? ['frame:OracleFrame' + std, 'frame:AscendancyFrameNormal' + std] : ['frame:AscendancyFrameNormal' + std];
+    }
+    if (n.isKeystone) return ['frame:KeystoneFrame' + std];
+    if (n.isBlighted) return ['frame:AnointNotableFrame' + std, 'frame:BlightedNotableFrame' + std];
+    if (n.isNotable) return ['frame:NotableFrame' + std];
+    if (n.isJewelSocket) return ['frame:JewelFrame' + std];
+    if (n.isGenericAttribute) return ['frame:AttributeFrame' + std, 'frame:PSSkillFrame' + { '': '', CanAllocate: 'Highlighted', Allocated: 'Active' }[state]];
+    return ['frame:PSSkillFrame' + { '': '', CanAllocate: 'Highlighted', Allocated: 'Active' }[state]];
+  }
+  function iconCategory(n) { return n.isKeystone ? 'keystone' : n.isNotable ? 'notable' : n.isMastery ? 'mastery' : 'normal'; }
+  function allocState(n) {
+    if (allocated.has(n.skill)) return 'Allocated';
+    const nb = neighbours[n.skill] || [];
+    return nb.some(o => allocated.has(o)) ? 'CanAllocate' : '';
+  }
+  function matches(n) {
+    if (!search) return false;
+    if ((n.name || '').toLowerCase().includes(search)) return true;
+    return (n.stats || []).some(s => s.toLowerCase().includes(search));
+  }
+
+  function draw() {
+    const W = canvas.width, H = canvas.height;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#0a0a0d';
+    ctx.fillRect(0, 0, W, H);
+    const bg = imgs['background'];
+    if (bg && bg.complete && bg.naturalWidth) {
+      const pat = ctx.createPattern(bg, 'repeat');
+      ctx.fillStyle = pat; ctx.globalAlpha = 0.9; ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;
+    }
+    const [vx0, vy0] = toWorld(0, 0), [vx1, vy1] = toWorld(W, H);
+    const inView = (x, y, m) => x > vx0 - m && x < vx1 + m && y > vy0 - m && y < vy1 + m;
+    ctx.setTransform(view.zoom, 0, 0, view.zoom, view.x, view.y);
+    ctx.imageSmoothingEnabled = true;
+
+    // centre art
+    const sizes = X.sizes || {};
+    if (selClass) {
+      const sheet = 'background-' + selClass.name.toLowerCase();
+      drawSprite(sprite(sheet, 'class' + selClass.name + ':Class0'), 0, 0, sizes.classIllustration || 2518);
+    }
+    drawSprite(sprite('group-background', 'startNode:MainCircle'), 0, 0, sizes.mainCircle || 3644);
+
+    // ascendancy plates
+    const plates = X.ascendancyPlates || {};
+    for (const c of classes) {
+      if (!showAll && c !== selClass) continue;
+      const sheet = 'background-' + c.name.toLowerCase();
+      let slot = 0;
+      for (const a of c.ascendancies) {
+        if (!a.name || !a.image) continue;
+        slot++;
+        const p = plates[a.id]; if (!p) continue;
+        if (!inView(p[0], p[1], 1500)) continue;
+        const dim = selAsc && a.id !== selAsc.id;
+        drawSprite(sprite(sheet, 'class' + c.name + ':Class' + slot), p[0], p[1], sizes.ascendancyPlate || 2518, dim ? 0.45 : 1);
+      }
+    }
+
+    // group backgrounds
+    const gbs = X.groupBackgrounds || {};
+    for (const gid in gbs) {
+      const g = groups[gid]; if (!g) continue;
+      const first = byId(g.nodes[0]); if (first && !nodeVisible(first) && !first.isMultipleChoiceOption) continue;
+      if (!inView(g.x, g.y, 800)) continue;
+      const sp = sprite('group-background', 'groupBackground:' + gbs[gid]); if (!sp) continue;
+      const w = sp.w / SHEET_SCALE, h = sp.h / SHEET_SCALE;
+      if (/Half/.test(gbs[gid])) {
+        ctx.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, g.x - w / 2, g.y - h, w, h);
+        ctx.save(); ctx.translate(g.x, g.y); ctx.scale(1, -1);
+        ctx.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, -w / 2, -h, w, h);
+        ctx.restore();
+      } else {
+        ctx.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, g.x - w / 2, g.y - h / 2, w, h);
+      }
+    }
+
+    // connectors
+    const radii = X.orbitRadii || [0, 82, 164, 334, 488, 657, 839, 250, 1076, 1320];
+    for (const e of edges) {
+      if (e.from === 'root') continue;
+      const a = byId(e.from), b = byId(e.to);
+      if (!a || !b || !nodeVisible(a) || !nodeVisible(b)) continue;
+      if (a.hideConnection || b.hideConnection) continue;
+      if (ascOfNode(a) !== ascOfNode(b)) continue;
+      if (!inView((a.x + b.x) / 2, (a.y + b.y) / 2, 1400)) continue;
+      const active = allocated.has(a.skill) && allocated.has(b.skill);
+      const kind = active ? 'Active' : 'Normal';
+      const alpha = (dimmed(a) || dimmed(b)) ? 0.4 : 1;
+      ctx.globalAlpha = alpha;
+      if (e.orbitX !== undefined) {
+        const r = radii[e.orbit + 1] || 0;
+        const sp = sprite('line', 'line:Orbit' + (e.orbit + 1) + kind);
+        drawArc(sp, e.orbitX, e.orbitY, r, Math.atan2(a.y - e.orbitY, a.x - e.orbitX), Math.atan2(b.y - e.orbitY, b.x - e.orbitX), active);
+      } else if (e.orbit === 0 && a.group === b.group && a.orbit === b.orbit && a.orbit > 0) {
+        const g = groups[String(a.group)];
+        const r = radii[a.orbit] || 0;
+        const sp = sprite('line', 'line:Orbit' + a.orbit + kind);
+        drawArc(sp, g.x, g.y, r, Math.atan2(a.y - g.y, a.x - g.x), Math.atan2(b.y - g.y, b.x - g.x), active);
+      } else {
+        drawLine(sprite('line', 'line:LineConnector' + kind), a.x, a.y, b.x, b.y, active);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // nodes
+    const hoverId = hovered ? hovered.skill : null;
+    for (const id of ids) {
+      const n = nodes[id];
+      if (!nodeVisible(n) || n.classStartIndex) continue;
+      if (!inView(n.x, n.y, 300)) continue;
+      const alpha = dimmed(n) ? 0.4 : 1;
+      const state = allocState(n);
+      const allocatedHere = state === 'Allocated';
+      ctx.globalAlpha = alpha;
+      if (n.isMastery && n.activeEffectImage) {
+        drawSprite(sprite(allocatedHere ? 'mastery-effect-active' : 'mastery-effect-disabled', (allocatedHere ? 'masteryEffectActive:' : 'masteryEffectInactive:') + n.activeEffectImage), n.x, n.y, 300);
+      }
+      const frame = firstSprite('frame', frameKeys(n, state));
+      if (n.icon && !n.isAscendancyStart && !n.isJewelSocket) {
+        const cat = iconCategory(n);
+        const icon = sprite(allocatedHere ? 'skills' : 'skills-disabled', (allocatedHere ? cat + 'Active:' : cat + 'Inactive:') + n.icon);
+        drawSprite(icon, n.x, n.y);
+      }
+      if (frame) drawSprite(frame, n.x, n.y);
+      else { ctx.fillStyle = n.isKeystone ? '#c96b3c' : n.isNotable ? '#d6b25a' : '#7a8ab0'; ctx.beginPath(); ctx.arc(n.x, n.y, n.isKeystone ? 60 : n.isNotable ? 45 : 30, 0, Math.PI * 2); ctx.fill(); }
+      if (n.skill === hoverId || matches(n)) {
+        ctx.strokeStyle = n.skill === hoverId ? '#ffffff' : '#ffd25a';
+        ctx.lineWidth = 6 / Math.max(view.zoom, 0.05) * 0.5 + 4;
+        ctx.beginPath(); ctx.arc(n.x, n.y, (frame ? frame.w / SHEET_SCALE : 100) * 0.62, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    status.textContent = `${allocated.size} allocated · zoom ${view.zoom.toFixed(3)} · ${selClass ? selClass.name : ''}${selAsc ? ' / ' + selAsc.name : ''} · drag to pan, wheel to zoom, click to allocate`;
+  }
+
+  function drawLine(sp, x1, y1, x2, y2, active) {
+    const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy);
+    if (len < 1) return;
+    if (!sp) {
+      ctx.strokeStyle = active ? '#6ec0ff' : '#8b7047'; ctx.lineWidth = 14;
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); return;
+    }
+    const h = sp.h / SHEET_SCALE;
+    const sw = Math.min(sp.w, len * SHEET_SCALE);
+    ctx.save(); ctx.translate(x1, y1); ctx.rotate(Math.atan2(dy, dx));
+    ctx.drawImage(sp.img, sp.x, sp.y, sw, sp.h, 0, -h / 2, len, h);
+    ctx.restore();
+  }
+  function drawArc(sp, cx, cy, r, a1, a2, active) {
+    let d = a2 - a1;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    const anticlockwise = d < 0;
+    if (!sp || r <= 0) {
+      ctx.strokeStyle = active ? '#6ec0ff' : '#8b7047'; ctx.lineWidth = 14;
+      ctx.beginPath(); ctx.arc(cx, cy, r, a1, a2, anticlockwise); ctx.stroke(); return;
+    }
+    ctx.save();
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.arc(cx, cy, r + 60, a1, a2, anticlockwise); ctx.closePath(); ctx.clip();
+    const S = sp.w / SHEET_SCALE;
+    ctx.translate(cx, cy);
+    for (let k = 0; k < 4; k++) {
+      ctx.drawImage(sp.img, sp.x, sp.y, sp.w, sp.h, -S, -S, S, S);
+      ctx.rotate(Math.PI / 2);
+    }
+    ctx.restore();
+  }
+
+  // ── interaction ───────────────────────────────────────────────────
+  function nodeAt(sx, sy) {
+    const [wx, wy] = toWorld(sx * devicePixelRatio, sy * devicePixelRatio);
+    let best = null, bestD = Infinity;
+    for (const id of ids) {
+      const n = nodes[id];
+      if (!nodeVisible(n) || n.classStartIndex) continue;
+      const radius = n.isKeystone ? 110 : (n.isNotable || ascOfNode(n)) ? 80 : 55;
+      const d = Math.hypot(n.x - wx, n.y - wy);
+      if (d < radius && d < bestD) { best = n; bestD = d; }
+    }
+    return best;
+  }
+  const clean = s => s.replace(/\[([^\]|]*)\|([^\]]*)\]/g, '$2').replace(/\[([^\]]*)\]/g, '$1').replace(/<[^>]+>\{([^}]*)\}/g, '$1');
+  function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+  function showTip(n, sx, sy) {
+    const cls = n.isKeystone ? 'keystone' : n.isNotable ? 'notable' : n.isMastery ? 'mastery' : n.isJewelSocket ? 'jewel' : 'normal';
+    let type = n.isKeystone ? 'Keystone' : n.isNotable ? 'Notable' : n.isMastery ? 'Mastery' : n.isJewelSocket ? 'Jewel Socket' : n.isGenericAttribute ? 'Attribute' : n.isAscendancyStart ? 'Ascendancy start' : 'Passive';
+    if (n.ascendancyId) { const a = D.classes.flatMap(c => c.ascendancies).find(a => a.id === n.ascendancyId); type = (a && a.name ? a.name : n.ascendancyId) + ' · ' + type; }
+    let html = `<div class="name ${cls}">${esc(n.name || ('#' + n.skill))}</div><div class="type">${esc(type)}${n.isBlighted ? ' · anoint only' : ''}${n.isFree ? ' · free' : ''}</div>`;
+    for (const s of n.stats || []) for (const line of s.split('\n')) html += `<div class="stat">${esc(clean(line))}</div>`;
+    if (n.grantedPassivePoints) html += `<div class="stat">Grants ${n.grantedPassivePoints} passive skill point(s)</div>`;
+    if (n.grantedSkill) html += `<div class="stat">Grants skill: ${esc(n.grantedSkill.typeLine || '')}</div>`;
+    if (n.unlockConstraint) html += `<div class="extra">Unlocked by node(s) ${esc(n.unlockConstraint.nodes.map(id => (byId(id) || {}).name || id).join(', '))}${n.unlockConstraint.ascendancy ? ' (' + esc(n.unlockConstraint.ascendancy) + ')' : ''}</div>`;
+    for (const o of optionsOf[n.skill] || []) html += `<div class="opt"><b>${esc(o.name)}</b>: ${esc((o.stats || []).map(clean).join('; '))}</div>`;
+    if (n.flavourText) html += `<div class="flav">${esc(n.flavourText.join('\n'))}</div>`;
+    if (n.recipe) html += `<div class="extra">Anoint: ${esc(n.recipe.map(r => r.replace(/([a-z])([A-Z])/g, '$1 $2')).join(' + '))}</div>`;
+    if (n.keystonesInRadius) html += `<div class="extra">Keystone in jewel radius: ${esc(n.keystonesInRadius.map(k => (byId(k) || {}).name || k).join(', '))}</div>`;
+    html += `<div class="extra">#${n.skill} · ${esc(n.id || '')}</div>`;
+    tip.innerHTML = html;
+    tip.style.display = 'block';
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    tip.style.left = Math.min(sx + 18, window.innerWidth - tw - 10) + 'px';
+    tip.style.top = Math.min(sy + 18, window.innerHeight - th - 10) + 'px';
+  }
+
+  canvas.addEventListener('mousedown', e => { dragging = true; dragMoved = false; last = [e.clientX, e.clientY]; canvas.classList.add('dragging'); });
+  window.addEventListener('mouseup', () => { dragging = false; canvas.classList.remove('dragging'); });
+  canvas.addEventListener('mousemove', e => {
+    if (dragging) {
+      const dx = (e.clientX - last[0]) * devicePixelRatio, dy = (e.clientY - last[1]) * devicePixelRatio;
+      if (Math.abs(dx) + Math.abs(dy) > 2) dragMoved = true;
+      view.x += dx; view.y += dy; last = [e.clientX, e.clientY];
+      tip.style.display = 'none';
+      requestDraw();
+      return;
+    }
+    const n = nodeAt(e.clientX, e.clientY);
+    if (n !== hovered) { hovered = n; requestDraw(); }
+    if (n) showTip(n, e.clientX, e.clientY); else tip.style.display = 'none';
+  });
+  canvas.addEventListener('mouseleave', () => { hovered = null; tip.style.display = 'none'; requestDraw(); });
+  canvas.addEventListener('click', e => {
+    if (dragMoved) return;
+    const n = nodeAt(e.clientX, e.clientY);
+    if (!n || n.isAscendancyStart) return;
+    if (allocated.has(n.skill)) allocated.delete(n.skill); else allocated.add(n.skill);
+    requestDraw();
+  });
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    const factor = Math.exp(-e.deltaY * 0.0015);
+    const sx = e.clientX * devicePixelRatio, sy = e.clientY * devicePixelRatio;
+    const nz = Math.min(2, Math.max(0.01, view.zoom * factor));
+    view.x = sx - (sx - view.x) * (nz / view.zoom);
+    view.y = sy - (sy - view.y) * (nz / view.zoom);
+    view.zoom = nz;
+    tip.style.display = 'none';
+    requestDraw();
+  }, { passive: false });
+  window.addEventListener('resize', resize);
+  resize();
+  if (!viewFromHash()) fit();
+})();
+</script>
+</body>
+</html>

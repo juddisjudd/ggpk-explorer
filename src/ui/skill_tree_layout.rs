@@ -46,6 +46,15 @@ const START_OFFSET_OVERRIDES: &[(&str, f32, f32)] = &[
     ("Sorceress3", 0.0, -486.0),
 ];
 
+/// Offset from an ascendancy's start group to the centre of its plate.
+pub fn plate_nudge(ascendancy_id: &str) -> Vec2 {
+    START_OFFSET_OVERRIDES
+        .iter()
+        .find(|(id, _, _)| *id == ascendancy_id)
+        .map(|(_, x, y)| vec2(*x, *y))
+        .unwrap_or(Vec2::ZERO)
+}
+
 #[derive(Debug, Clone)]
 pub struct Plate {
     pub ascendancy: usize,
@@ -149,11 +158,7 @@ pub fn compute(psg: &PsgFile, db: Option<&SkillGraphDatabase>) -> TreeLayout {
                 let a = &db.ascendancies[asc];
                 let Some(&angle) = layout.slots.get(&asc) else { continue };
                 let center = polar(ASCENDANCY_RING_RADIUS, angle);
-                let nudge = START_OFFSET_OVERRIDES
-                    .iter()
-                    .find(|(id, _, _)| *id == a.id)
-                    .map(|(_, x, y)| vec2(*x, *y))
-                    .unwrap_or(Vec2::ZERO);
+                let nudge = plate_nudge(&a.id);
                 let origin = pos2(psg.groups[gi].x, psg.groups[gi].y);
                 translation.insert(asc, (center + nudge) - origin);
                 if a.base_ascendancy.is_none() {

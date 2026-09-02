@@ -5,13 +5,19 @@ use std::collections::HashMap;
 /// text a `.csd` stat-description file specifies for that value.
 pub struct TranslationLookup {
     entries: Vec<CsdEntry>,
-    index: HashMap<Vec<String>, usize>,
+    /// Entries mentioning each stat id, for subset matching.
+    by_id: HashMap<String, Vec<usize>>,
+    /// Entries redefined by a later file/entry with the same id set. Files
+    /// are given generic first (`stat_descriptions.csd`) and tree-specific
+    /// last, so the specific text wins.
+    superseded: Vec<bool>,
 }
 
 impl TranslationLookup {
     pub fn build(csd_files: &[&CsdFile]) -> Self {
         let mut entries = Vec::new();
-        let mut index = HashMap::new();
+        let mut index: HashMap<Vec<String>, usize> = HashMap::new();
+        let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
         for file in csd_files {
             for entry in &file.entries {
                 if entry.ids.is_empty() {
@@ -19,56 +25,85 @@ impl TranslationLookup {
                 }
                 let idx = entries.len();
                 index.insert(entry.ids.clone(), idx);
+                for id in &entry.ids {
+                    by_id.entry(id.clone()).or_default().push(idx);
+                }
                 entries.push(entry.clone());
             }
         }
-        Self { entries, index }
+        let superseded = entries.iter().enumerate().map(|(i, e)| index.get(&e.ids) != Some(&i)).collect();
+        Self { entries, by_id, superseded }
     }
 
-    /// Resolves the full ordered set of stat ids/values as one combined
-    /// translation first (handles multi-stat lines like a breach pack-size
-    /// mod), falling back to translating each id independently and joining
-    /// the results when no combined entry exists.
-    pub fn translate(&self, stat_ids: &[String], values: &[i32]) -> Option<String> {
-        if stat_ids.is_empty() {
-            return None;
-        }
-        if let Some(text) = self.translate_exact(stat_ids, values) {
-            return Some(text);
-        }
-
-        let mut lines = Vec::new();
-        for (i, id) in stat_ids.iter().enumerate() {
-            let val = values.get(i).copied().unwrap_or(0);
-            let single_id = std::slice::from_ref(id);
-            let single_val = [val];
-            if let Some(text) = self.translate_exact(single_id, &single_val) {
-                lines.push(text);
+    /// Renders a node's stats the way the client does. Every entry that
+    /// mentions one of the stats is a candidate; the one covering the most
+    /// of them wins (then the most specific, then the latest definition),
+    /// stats it names that the node lacks count as zero, and the lines come
+    /// out in description-file order. Each string is one description, which
+    /// may span several lines.
+    pub fn translate_grouped(&self, stat_ids: &[String], values: &[i32]) -> Vec<String> {
+        let mut remaining: Vec<(String, i32)> = stat_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), values.get(i).copied().unwrap_or(0)))
+            .collect();
+        let mut out: Vec<(usize, String)> = Vec::new();
+        while !remaining.is_empty() {
+            let mut best: Option<(usize, usize)> = None; // (entry, covered)
+            for (id, _) in &remaining {
+                for &idx in self.by_id.get(id).map(|v| v.as_slice()).unwrap_or(&[]) {
+                    if self.superseded[idx] {
+                        continue;
+                    }
+                    let entry = &self.entries[idx];
+                    let covered = entry.ids.iter().filter(|e| remaining.iter().any(|(r, _)| r == *e)).count();
+                    let better = match best {
+                        None => true,
+                        Some((b, bc)) => {
+                            let be = &self.entries[b];
+                            covered > bc || (covered == bc && (entry.ids.len() < be.ids.len() || (entry.ids.len() == be.ids.len() && idx > b)))
+                        }
+                    };
+                    if better {
+                        best = Some((idx, covered));
+                    }
+                }
             }
+            let Some((idx, _)) = best else {
+                remaining.remove(0);
+                continue;
+            };
+            let entry = &self.entries[idx];
+            let vals: Vec<i32> = entry
+                .ids
+                .iter()
+                .map(|e| remaining.iter().find(|(r, _)| r == e).map(|(_, v)| *v).unwrap_or(0))
+                .collect();
+            if let Some(text) = render_entry(entry, &vals) {
+                out.push((idx, text));
+            }
+            remaining.retain(|(r, _)| !entry.ids.contains(r));
         }
-        if lines.is_empty() {
-            None
-        } else {
-            Some(lines.join("\n"))
-        }
+        out.sort_by_key(|(idx, _)| *idx);
+        out.into_iter().map(|(_, text)| text).collect()
     }
 
-    fn translate_exact(&self, stat_ids: &[String], values: &[i32]) -> Option<String> {
-        let idx = *self.index.get(stat_ids)?;
-        let entry = &self.entries[idx];
-        if entry.descriptions.is_empty() {
-            return None; // no_description: intentionally hidden stat
-        }
-        for sub in &entry.descriptions {
-            if sub.language.is_some() {
-                continue; // v1: base/English text only
-            }
-            if ranges_match(&sub.operator, stat_ids.len(), values) {
-                return Some(render(sub, values));
-            }
-        }
-        None
+}
+
+/// Base-language text of the first sub-entry whose ranges accept `values`.
+fn render_entry(entry: &CsdEntry, values: &[i32]) -> Option<String> {
+    if entry.descriptions.is_empty() {
+        return None; // no_description: intentionally hidden stat
     }
+    for sub in &entry.descriptions {
+        if sub.language.is_some() {
+            continue; // v1: base/English text only
+        }
+        if ranges_match(&sub.operator, entry.ids.len(), values) {
+            return Some(render(sub, values));
+        }
+    }
+    None
 }
 
 /// Text one entry renders for `values` in `language` (`None` = base/English): the first
@@ -181,6 +216,61 @@ fn apply_function(name: &str, mut fmt: ValueFmt) -> ValueFmt {
             fmt.decimals = 2;
             fmt.trim = true;
         }
+        "milliseconds_to_seconds" | "milliseconds_to_seconds_2dp" => {
+            fmt.value /= 1000.0;
+            fmt.decimals = 2;
+            fmt.trim = name == "milliseconds_to_seconds";
+        }
+        "milliseconds_to_seconds_1dp" => {
+            fmt.value /= 1000.0;
+            fmt.decimals = 1;
+            fmt.trim = false;
+        }
+        "deciseconds_to_seconds" => {
+            fmt.value /= 10.0;
+            fmt.decimals = 1;
+            fmt.trim = true;
+        }
+        "per_minute_to_per_second" | "per_minute_to_per_second_0dp" => {
+            fmt.value /= 60.0;
+            fmt.decimals = 1;
+            fmt.trim = true;
+        }
+        "per_minute_to_per_second_1dp" => {
+            fmt.value /= 60.0;
+            fmt.decimals = 1;
+            fmt.trim = false;
+        }
+        "per_minute_to_per_second_2dp" => {
+            fmt.value /= 60.0;
+            fmt.decimals = 2;
+            fmt.trim = false;
+        }
+        "per_minute_to_per_second_2dp_if_required" => {
+            fmt.value /= 60.0;
+            fmt.decimals = 2;
+            fmt.trim = true;
+        }
+        "divide_by_two_0dp" => {
+            fmt.value = (fmt.value / 2.0).floor();
+        }
+        "divide_by_three" => fmt.value /= 3.0,
+        "divide_by_four" => fmt.value /= 4.0,
+        "divide_by_five" => fmt.value /= 5.0,
+        "divide_by_six" => fmt.value /= 6.0,
+        "divide_by_twelve" => fmt.value /= 12.0,
+        "divide_by_fifteen_0dp" => fmt.value = (fmt.value / 15.0).floor(),
+        "divide_by_twenty_then_double_0dp" => fmt.value = (fmt.value / 20.0).floor() * 2.0,
+        "divide_by_fifty" => fmt.value /= 50.0,
+        "divide_by_one_thousand" => fmt.value /= 1000.0,
+        "double" => fmt.value *= 2.0,
+        "times_one_point_five" => fmt.value *= 1.5,
+        "times_twenty" => fmt.value *= 20.0,
+        "multiply_by_four" => fmt.value *= 4.0,
+        "plus_two_hundred" => fmt.value += 200.0,
+        "30%_of_value" => fmt.value *= 0.3,
+        "60%_of_value" => fmt.value *= 0.6,
+        "negate_and_double" => fmt.value *= -2.0,
         _ => {}
     }
     fmt
@@ -201,6 +291,7 @@ fn substitute(template: &str, values: &[ValueFmt]) -> String {
     let mut out = String::with_capacity(template.len());
     let chars: Vec<char> = template.chars().collect();
     let mut i = 0;
+    let mut anonymous = 0usize;
     while i < chars.len() {
         if chars[i] == '{' {
             if let Some(rel_end) = chars[i..].iter().position(|&c| c == '}') {
@@ -210,7 +301,14 @@ fn substitute(template: &str, values: &[ValueFmt]) -> String {
                     Some((a, b)) => (a, Some(b)),
                     None => (token.as_str(), None),
                 };
-                if let Ok(idx) = idx_str.parse::<usize>() {
+                // `{}` takes values in order of appearance.
+                let idx = if idx_str.is_empty() {
+                    anonymous += 1;
+                    Ok(anonymous - 1)
+                } else {
+                    idx_str.parse::<usize>()
+                };
+                if let Ok(idx) = idx {
                     if let Some(v) = values.get(idx) {
                         let mut s = v.format();
                         if spec == Some("+d") && v.value >= 0.0 {
@@ -238,6 +336,15 @@ fn substitute(template: &str, values: &[ValueFmt]) -> String {
 mod tests {
     use super::*;
     use crate::dat::csd::parse_csd;
+
+    impl TranslationLookup {
+        /// All lines for `stat_ids` joined, or `None` when nothing renders.
+        fn translate(&self, stat_ids: &[String], values: &[i32]) -> Option<String> {
+            let lines = self.translate_grouped(stat_ids, values);
+            (!lines.is_empty()).then(|| lines.join("
+"))
+        }
+    }
 
     fn parse(text: &str) -> CsdFile {
         let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
@@ -298,6 +405,26 @@ mod tests {
             lookup.translate(&["stat_a".to_string(), "stat_b".to_string()], &[3, 4]),
             Some("Stat A 3 and Stat B 4".to_string())
         );
+    }
+
+    #[test]
+    fn grouped_translation_prefers_largest_matching_entry() {
+        let file = parse(
+            "description\n\t2 stat_a stat_b\n\t1\n\t\t# # \"A {0} B {1}\"\ndescription\n\t1 stat_c\n\t1\n\t\t# \"C {0}\"\ndescription\n\t1 stat_a\n\t1\n\t\t# \"A alone {0}\"\ndescription\n\t2 mode count\n\t2\n\t\t0 1 \"one\"\n\t\t0 2|# \"{1} of them\"",
+        );
+        let lookup = TranslationLookup::build(&[&file]);
+        let ids = ["stat_c".to_string(), "stat_b".to_string(), "stat_a".to_string()];
+        assert_eq!(lookup.translate_grouped(&ids, &[3, 2, 1]), vec!["A 1 B 2".to_string(), "C 3".to_string()]);
+        // Output follows description-file order, whatever the stat order.
+        let single = ["stat_a".to_string(), "stat_c".to_string()];
+        assert_eq!(lookup.translate_grouped(&single, &[7, 3]), vec!["C 3".to_string(), "A alone 7".to_string()]);
+        // Ids the node lacks count as zero.
+        assert_eq!(lookup.translate_grouped(&["count".to_string()], &[1]), vec!["one".to_string()]);
+        assert_eq!(lookup.translate_grouped(&["count".to_string()], &[3]), vec!["3 of them".to_string()]);
+        // A later file redefining the same ids wins.
+        let specific = parse("description\n\t1 stat_c\n\t1\n\t\t# \"Specific C {0}\"");
+        let lookup = TranslationLookup::build(&[&file, &specific]);
+        assert_eq!(lookup.translate_grouped(&["stat_c".to_string()], &[3]), vec!["Specific C 3".to_string()]);
     }
 
     #[test]

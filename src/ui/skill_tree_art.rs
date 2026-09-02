@@ -16,6 +16,7 @@ pub enum NodeFrameKind {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FrameArt {
+    pub id: String,
     pub normal: String,
     pub can_allocate: String,
     pub active: String,
@@ -86,6 +87,7 @@ fn as_string(val: &DatValue) -> String {
 pub fn parse_node_frame_art(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<FrameArt>, String> {
     let table = find_table(schema, "PassiveSkillTreeNodeFrameArt")?;
     let reader = DatReader::new(bytes, "passiveskilltreenodeframeart.datc64").map_err(|e| e.to_string())?;
+    let id_col = col_index(table, "Id");
     let normal_col = col_index(table, "Normal");
     let can_allocate_col = col_index(table, "CanAllocate");
     let active_col = col_index(table, "Active");
@@ -97,6 +99,7 @@ pub fn parse_node_frame_art(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<Frame
         let row = reader.read_row(i, table).map_err(|e| e.to_string())?;
         let get = |c: Option<usize>| c.and_then(|c| row.get(c)).map(as_string).unwrap_or_default();
         out.push(FrameArt {
+            id: get(id_col),
             normal: get(normal_col),
             can_allocate: get(can_allocate_col),
             active: get(active_col),

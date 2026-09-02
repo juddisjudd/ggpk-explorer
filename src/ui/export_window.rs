@@ -24,6 +24,8 @@ pub enum DataFormat {
 pub enum PsgFormat {
     Original,
     Json,
+    /// `data.json` + sprite sheets + HTML viewer, like GGG's official export.
+    Tree,
 }
 
 #[derive(Clone)]
@@ -155,6 +157,9 @@ impl ExportWindow {
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.psg_format, PsgFormat::Original, "Original");
                         ui.radio_value(&mut self.settings.psg_format, PsgFormat::Json, "JSON");
+                        if !self.is_folder {
+                            ui.radio_value(&mut self.settings.psg_format, PsgFormat::Tree, "Skill tree (official layout + viewer)");
+                        }
                     });
                 }
 

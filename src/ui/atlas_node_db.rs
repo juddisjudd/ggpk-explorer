@@ -44,6 +44,32 @@ pub struct SkillGraphNodeInfo {
     pub node_frame_art: Option<usize>,
     /// `Characters` row indices for class-start nodes (empty otherwise).
     pub characters: Vec<usize>,
+    /// `PassiveSkills.Id`.
+    pub id: String,
+    pub is_multiple_choice_option: bool,
+    /// `IsAnointmentOnly`: Delirium-anoint-only notables ("blighted" in the web export).
+    pub is_anointment_only: bool,
+    pub is_free: bool,
+    /// Unnamed flag after `IsFree`; set on the Smith of Kitava armour nodes
+    /// whose connector the client does not draw.
+    pub hide_connection: bool,
+    pub skill_points_granted: i32,
+    pub weapon_points_granted: i32,
+    /// `UnlockedBy`, resolved to `PassiveSkillGraphId`s.
+    pub unlocked_by: Vec<u32>,
+    /// `VisibleForAscendancy` row index.
+    pub visible_for_ascendancy: Option<usize>,
+    /// `MasteryGroup` row index.
+    pub mastery_group: Option<usize>,
+    /// `GrantedSkill` (`SkillGems` row index).
+    pub granted_skill: Option<usize>,
+    pub stat_ids: Vec<String>,
+    pub stat_values: Vec<i32>,
+    /// One entry per rendered stat description (may contain newlines);
+    /// `stat_lines` is the same text split into lines.
+    pub stat_texts: Vec<String>,
+    /// `PassiveSkills` row index.
+    pub row: usize,
 }
 
 #[allow(dead_code)]
@@ -59,6 +85,14 @@ pub struct AscendancyInfo {
     pub base_ascendancy: Option<usize>,
     /// Row index into `SkillGraphDatabase::ui_art_ids`.
     pub ui_art: Option<usize>,
+    pub flavour_text: String,
+    /// `RGBFlavourTextColour` as "r,g,b".
+    pub flavour_text_colour: String,
+    /// `CoordinateRect` as "x,y,w,h".
+    pub coordinate_rect: String,
+    pub tree_region_vector: i32,
+    /// Unnamed column after `BackgroundImage` (135 for every row).
+    pub flavour_text_size: i32,
 }
 
 impl AscendancyInfo {
@@ -77,6 +111,13 @@ pub struct CharacterInfo {
     pub illustration: Option<String>,
     /// Attribute folder under `UIImages/InGame/Classes/` (`Str`, `DexInt`, …).
     pub attr_dir: String,
+    pub integer_id: i32,
+    pub base_strength: i32,
+    pub base_dexterity: i32,
+    pub base_intelligence: i32,
+    /// Unnamed float pair before `SkillTreeBackground`: where the class
+    /// illustration sits relative to the tree centre.
+    pub image_offset: (f32, f32),
 }
 
 /// `PassiveTreeDecorators` row: art anchored to a node (atlas blockers).
@@ -109,6 +150,9 @@ pub struct SkillGraphDatabase {
     pub ascendancies: Vec<AscendancyInfo>,
     pub characters: Vec<CharacterInfo>,
     pub decorators: Vec<Decorator>,
+    /// `PassiveSkillGraphId` of every `PassiveSkills` row (0 when unset), so
+    /// tables that reference passives by row can be resolved to graph ids.
+    pub row_graph_ids: Vec<u32>,
 }
 
 impl SkillGraphDatabase {
@@ -183,6 +227,24 @@ fn col_index(table: &Table, name: &str) -> Option<usize> {
     table.columns.iter().position(|c| c.name.as_deref() == Some(name))
 }
 
+/// Index of the column `offset` places after `anchor`, if it is unnamed and
+/// of type `ty` — the community schema leaves a few columns this code needs
+/// unnamed, so they are located relative to a named neighbour.
+fn unnamed_col_near(table: &Table, anchor: &str, offset: isize, ty: &str) -> Option<usize> {
+    let base = col_index(table, anchor)? as isize + offset;
+    let col = table.columns.get(usize::try_from(base).ok()?)?;
+    (col.name.is_none() && col.r#type == ty && !col.array).then_some(base as usize)
+}
+
+fn as_row_index(val: &DatValue) -> Option<usize> {
+    match val {
+        DatValue::ForeignRow(idx) if *idx != usize::MAX => Some(*idx),
+        DatValue::Int(i) if *i >= 0 => Some(*i as usize),
+        DatValue::Long(l) => Some(*l as usize),
+        _ => None,
+    }
+}
+
 fn as_string(val: &DatValue) -> Option<String> {
     match val {
         DatValue::String(s) if !s.is_empty() => Some(s.clone()),
@@ -237,16 +299,29 @@ fn parse_characters(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<CharacterInfo
     let id_col = col_index(table, "Id").ok_or("Characters missing Id")?;
     let name_col = col_index(table, "Name");
     let img_col = col_index(table, "PassiveTreeImage");
+    let int_id_col = col_index(table, "IntegerId");
+    let str_col = col_index(table, "BaseStrength");
+    let dex_col = col_index(table, "BaseDexterity");
+    let int_col = col_index(table, "BaseIntelligence");
+    let off_x_col = unnamed_col_near(table, "SkillTreeBackground", -2, "f32");
+    let off_y_col = unnamed_col_near(table, "SkillTreeBackground", -1, "f32");
     let mut out = Vec::with_capacity(reader.row_count as usize);
     for i in 0..reader.row_count {
         let row = reader.read_row(i, table).map_err(|e| e.to_string())?;
         let id = row.get(id_col).and_then(as_string).unwrap_or_default();
         // "Metadata/Characters/StrDex/StrDexFourb" -> "StrDex"
         let attr_dir = id.split('/').nth(2).unwrap_or("").to_string();
+        let int = |c: Option<usize>| c.and_then(|c| row.get(c)).map(as_int).unwrap_or(0);
+        let float = |c: Option<usize>| c.and_then(|c| row.get(c)).map(as_float).unwrap_or(0.0);
         out.push(CharacterInfo {
             name: name_col.and_then(|c| row.get(c)).and_then(as_string).unwrap_or_else(|| id.clone()),
             illustration: img_col.and_then(|c| row.get(c)).and_then(as_string),
             attr_dir,
+            integer_id: int(int_id_col),
+            base_strength: int(str_col),
+            base_dexterity: int(dex_col),
+            base_intelligence: int(int_col),
+            image_offset: (float(off_x_col), float(off_y_col)),
             id,
         });
     }
@@ -262,9 +337,13 @@ fn parse_ascendancies(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<AscendancyI
         get("Name"), get("Character"), get("ClassNo"), get("PassiveTreeImage"),
         get("TreeRegionAngle"), get("Disabled"), get("BaseAscendancy"), get("UIArt"),
     );
+    let (flavour_col, colour_col, rect_col, vector_col) =
+        (get("FlavourText"), get("RGBFlavourTextColour"), get("CoordinateRect"), get("TreeRegionVector"));
+    let size_col = unnamed_col_near(table, "BackgroundImage", 1, "i32");
     let mut out = Vec::with_capacity(reader.row_count as usize);
     for i in 0..reader.row_count {
         let row = reader.read_row(i, table).map_err(|e| e.to_string())?;
+        let text = |c: Option<usize>| c.and_then(|c| row.get(c)).and_then(as_string).unwrap_or_default();
         out.push(AscendancyInfo {
             id: row.get(id_col).and_then(as_string).unwrap_or_default(),
             name: name_col.and_then(|c| row.get(c)).and_then(as_string).unwrap_or_default(),
@@ -275,6 +354,11 @@ fn parse_ascendancies(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<AscendancyI
             disabled: disabled_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             base_ascendancy: base_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
             ui_art: ui_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
+            flavour_text: text(flavour_col),
+            flavour_text_colour: text(colour_col),
+            coordinate_rect: text(rect_col),
+            tree_region_vector: vector_col.and_then(|c| row.get(c)).map(as_int).unwrap_or(0),
+            flavour_text_size: size_col.and_then(|c| row.get(c)).map(as_int).unwrap_or(0),
         });
     }
     Ok(out)
@@ -395,6 +479,7 @@ pub fn build(
     let is_notable_col = col_index(ps_table, "IsNotable");
     let is_jewel_col = col_index(ps_table, "IsJewelSocket");
     let is_mastery_col = col_index(ps_table, "MasteryGroup");
+    let is_just_icon_col = col_index(ps_table, "IsJustIcon");
     let is_ascendancy_start_col = col_index(ps_table, "IsAscendancyStartingNode");
     let is_multiple_choice_col = col_index(ps_table, "IsMultipleChoice");
     let ascendancy_key_col = col_index(ps_table, "Ascendancy");
@@ -405,7 +490,29 @@ pub fn build(
     let flavour_col = col_index(ps_table, "FlavourText");
     let stats_col = col_index(ps_table, "Stats");
     let stat_value_cols: Vec<Option<usize>> =
-        (1..=5).map(|n| col_index(ps_table, &format!("Stat{}Value", n))).collect();
+        (1..=7).map(|n| col_index(ps_table, &format!("Stat{}Value", n))).collect();
+    let id_col = col_index(ps_table, "Id");
+    let is_option_col = col_index(ps_table, "IsMultipleChoiceOption");
+    let anoint_col = col_index(ps_table, "IsAnointmentOnly");
+    let is_free_col = col_index(ps_table, "IsFree");
+    let hide_connection_col = unnamed_col_near(ps_table, "IsFree", 1, "bool");
+    let points_col = col_index(ps_table, "SkillPointsGranted");
+    let weapon_points_col = col_index(ps_table, "WeaponPointsGranted");
+    let unlocked_by_col = col_index(ps_table, "UnlockedBy");
+    let visible_for_col = col_index(ps_table, "VisibleForAscendancy");
+    let granted_skill_col = col_index(ps_table, "GrantedSkill");
+
+    // `UnlockedBy` references rows of this same table, so graph ids are
+    // needed for every row before any node is built.
+    let mut row_graph_ids: Vec<u32> = Vec::with_capacity(ps_reader.row_count as usize);
+    for i in 0..ps_reader.row_count {
+        let gid = ps_reader
+            .read_row(i, ps_table)
+            .ok()
+            .and_then(|row| row.get(graph_id_col).map(as_int))
+            .unwrap_or(0);
+        row_graph_ids.push(gid.max(0) as u32);
+    }
 
     let mut nodes = HashMap::new();
     for i in 0..ps_reader.row_count {
@@ -420,6 +527,17 @@ pub fn build(
         }
 
         let name = row.get(name_col).and_then(as_string).unwrap_or_default();
+        let read_row_refs = |col: Option<usize>| -> Vec<usize> {
+            match col.and_then(|c| row.get(c).map(|v| (c, v))) {
+                Some((c, DatValue::List(count, offset))) if *count > 0 => ps_reader
+                    .read_list_values(*offset, *count, &ps_table.columns[c])
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(as_row_index)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
 
         let stat_id_list: Vec<String> = if let Some(sc) = stats_col {
             match row.get(sc) {
@@ -445,13 +563,18 @@ pub fn build(
             .iter()
             .filter_map(|c| c.and_then(|idx| row.get(idx)).map(as_int))
             .collect();
+        // The client skips stats whose value is zero.
+        let (stat_id_list, stat_values): (Vec<String>, Vec<i32>) = stat_id_list
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, id)| {
+                let v = stat_values.get(i).copied().unwrap_or(0);
+                (v != 0).then_some((id, v))
+            })
+            .unzip();
 
-        let mut stat_lines = Vec::new();
-        if !stat_id_list.is_empty() {
-            if let Some(text) = lookup.translate(&stat_id_list, &stat_values) {
-                stat_lines.extend(text.lines().map(|l| l.to_string()));
-            }
-        }
+        let stat_texts = if stat_id_list.is_empty() { Vec::new() } else { lookup.translate_grouped(&stat_id_list, &stat_values) };
+        let stat_lines: Vec<String> = stat_texts.iter().flat_map(|t| t.lines().map(|l| l.to_string())).collect();
 
         let is_ascendancy_start = is_ascendancy_start_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false);
         let ascendancy = ascendancy_key_col.and_then(|c| row.get(c)).and_then(as_foreign_row);
@@ -468,18 +591,12 @@ pub fn build(
         let atlas_subtree_background = subtree.and_then(|s| s.0.clone());
         let atlas_subtree_icon = subtree.and_then(|s| s.1.clone());
 
-        let characters: Vec<usize> = match characters_col.and_then(|c| row.get(c)) {
-            Some(DatValue::List(count, offset)) if *count > 0 => {
-                let list_col = &ps_table.columns[characters_col.unwrap()];
-                ps_reader
-                    .read_list_values(*offset, *count, list_col)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(as_foreign_row)
-                    .collect()
-            }
-            _ => Vec::new(),
-        };
+        let characters: Vec<usize> = read_row_refs(characters_col);
+        let unlocked_by: Vec<u32> = read_row_refs(unlocked_by_col)
+            .into_iter()
+            .filter_map(|r| row_graph_ids.get(r).copied().filter(|g| *g > 0))
+            .collect();
+        let flag = |c: Option<usize>| c.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false);
 
         let info = SkillGraphNodeInfo {
             name,
@@ -487,7 +604,8 @@ pub fn build(
             is_keystone: is_keystone_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             is_notable: is_notable_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             is_jewel_socket: is_jewel_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
-            is_mastery: is_mastery_col.and_then(|c| row.get(c)).and_then(as_foreign_row).is_some(),
+            // Notables can belong to a mastery group too; the mastery node itself is the icon-only one.
+            is_mastery: flag(is_just_icon_col) && is_mastery_col.and_then(|c| row.get(c)).and_then(as_foreign_row).is_some(),
             is_ascendancy_start,
             is_multiple_choice: is_multiple_choice_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             flavour_text: flavour_col.and_then(|c| row.get(c)).and_then(as_string),
@@ -499,6 +617,21 @@ pub fn build(
             is_attribute: is_attribute_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             node_frame_art: node_frame_art_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
             characters,
+            id: id_col.and_then(|c| row.get(c)).and_then(as_string).unwrap_or_default(),
+            is_multiple_choice_option: flag(is_option_col),
+            is_anointment_only: flag(anoint_col),
+            is_free: flag(is_free_col),
+            hide_connection: flag(hide_connection_col),
+            skill_points_granted: points_col.and_then(|c| row.get(c)).map(as_int).unwrap_or(0),
+            weapon_points_granted: weapon_points_col.and_then(|c| row.get(c)).map(as_int).unwrap_or(0),
+            unlocked_by,
+            visible_for_ascendancy: visible_for_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
+            mastery_group: is_mastery_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
+            granted_skill: granted_skill_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
+            stat_ids: stat_id_list,
+            stat_values,
+            stat_texts,
+            row: i as usize,
         };
 
         nodes.insert(graph_id as u32, info);
@@ -512,5 +645,6 @@ pub fn build(
         ascendancies,
         characters,
         decorators,
+        row_graph_ids,
     })
 }

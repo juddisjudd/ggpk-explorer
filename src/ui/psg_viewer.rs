@@ -99,6 +99,11 @@ pub struct PsgViewerState {
     /// `Ascendancy` row drawn at full colour; the others are dimmed.
     pub selected_ascendancy: Option<usize>,
     pub dim_other_ascendancies: bool,
+    /// Set by the toolbar's export button; `content_view` picks it up,
+    /// asks for a folder and runs the export.
+    pub export_requested: bool,
+    /// Progress/result text of the last skill tree export.
+    pub export_status: Option<String>,
     layout: Option<(usize, Arc<TreeLayout>)>,
 }
 
@@ -113,6 +118,8 @@ impl Default for PsgViewerState {
             selected_class: None,
             selected_ascendancy: None,
             dim_other_ascendancies: true,
+            export_requested: false,
+            export_status: None,
             layout: None,
         }
     }
@@ -286,6 +293,20 @@ impl<'a> PsgViewer<'a> {
                         }
                     }
                 }
+            }
+
+            ui.separator();
+            let can_export = self.state.skill_db.is_some();
+            if ui
+                .add_enabled(can_export, egui::Button::new("Export tree…"))
+                .on_hover_text("Writes data.json, sprite sheets and an HTML viewer in the layout of GGG's official passive tree export")
+                .on_disabled_hover_text("Waiting for node data…")
+                .clicked()
+            {
+                self.state.export_requested = true;
+            }
+            if let Some(status) = &self.state.export_status {
+                ui.label(egui::RichText::new(status).size(11.0));
             }
 
             if self.is_loading_art {

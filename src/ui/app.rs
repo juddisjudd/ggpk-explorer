@@ -591,6 +591,48 @@ impl ExplorerApp {
         }
     }
 
+    /// Runs the official-layout skill tree export when the export dialog
+    /// targeted a single `.psg` with the "Skill tree" format selected.
+    fn try_start_tree_export(&mut self, hashes: &[u64], target_dir: &std::path::Path) -> bool {
+        if self.export_window.settings.psg_format != crate::ui::export_window::PsgFormat::Tree || hashes.len() != 1 {
+            return false;
+        }
+        let Some(index) = self.bundle_index.clone() else { return false };
+        let Some(info) = index.files.get(&hashes[0]).cloned() else { return false };
+        if !info.path.to_ascii_lowercase().ends_with(".psg") {
+            return false;
+        }
+        let Some(schema) = self.content_view.dat_viewer.schema.clone() else {
+            self.status_msg = "Schema not loaded yet — open a DAT file first".to_string();
+            return true;
+        };
+        let source = crate::skill_tree_export::TreeExportSource {
+            reader: self.reader.clone(),
+            index,
+            steam: self.content_view.steam_loader.clone(),
+            schema,
+        };
+        let db = self.content_view.skill_graph_db.clone();
+        let out_dir = target_dir.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.export_status_rx = Some(rx);
+        self.status_msg = "Starting skill tree export...".to_string();
+        self.is_loading = true;
+        std::thread::spawn(move || {
+            let Some(bytes) = source.fetch(&info.path) else {
+                let _ = tx.send(crate::export::ExportStatus::Error(format!("Could not read {}", info.path)));
+                return;
+            };
+            match crate::dat::psg::parse_psg(&bytes) {
+                Ok(psg) => crate::skill_tree_export::run_tree_export(source, info.path.clone(), psg, db, crate::skill_tree_export::TreeExportOptions::default(), out_dir, tx),
+                Err(e) => {
+                    let _ = tx.send(crate::export::ExportStatus::Error(format!("Could not parse {}: {}", info.path, e)));
+                }
+            }
+        });
+        true
+    }
+
     fn show_inspector(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("inspector_panel")
             .resizable(true)
@@ -945,7 +987,9 @@ impl eframe::App for ExplorerApp {
                          .unwrap_or_else(|| self.export_window.hashes.clone())
                  };
                  
-                 if self.reader.is_some() || self.bundle_index.is_some() {
+                 if self.try_start_tree_export(&hashes, &target_dir) {
+                     // handled by the skill tree exporter
+                 } else if self.reader.is_some() || self.bundle_index.is_some() {
                      let bundle_index = self.bundle_index.clone();
                      let reader_clone = self.reader.clone();
                      

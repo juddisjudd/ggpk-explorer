@@ -10,6 +10,7 @@ pub mod cli;
 pub mod diff;
 pub mod update;
 pub mod export;
+pub mod skill_tree_export;
 pub mod parsers;
 pub mod adapters;
 
