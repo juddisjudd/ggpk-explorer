@@ -186,8 +186,12 @@ fn matching_sub<'e>(entry: &'e CsdEntry, values: &[(i32, i32)]) -> Option<&'e Cs
         .filter(|s| ranges_match(&s.operator, n, values))
         // Several lines can accept the same numbers; the one that says most
         // about them wins, which is how the client picks between "Fires 8" and
-        // "Fires +8".
-        .max_by_key(|s| specificity(&s.operator, n))
+        // "Fires +8". Equally specific lines are settled by which comes first,
+        // so `1|#` beats the `-1|#` that follows it for a positive value.
+        .fold(None, |best: Option<&CsdSubEntry>, sub| match best {
+            Some(b) if specificity(&b.operator, n) >= specificity(&sub.operator, n) => Some(b),
+            _ => Some(sub),
+        })
 }
 
 /// How tightly a set of conditions pins its values down: an exact number says

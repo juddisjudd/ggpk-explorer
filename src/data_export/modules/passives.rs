@@ -72,12 +72,14 @@ pub fn passives(ctx: &Ctx) -> Result<(), String> {
                     .set("radius", int(node.radius as i64))
                     .set("position_clockwise", int(node.position as i64))
                     .set("connections", json::arr(node.connections.iter().map(|c| int(c.node_id as i64))))
+                    // Each connection curves along an orbit; one number per link.
+                    .set("splines", json::arr(node.connections.iter().map(|c| int(c.orbit as i64))))
                     .build()
             });
             Obj::new()
                 .set("x", json::float(group.x))
                 .set("y", json::float(group.y))
-                .set("flag", J::Bool(group.is_proxy))
+                .set("flag", int(group.background_flag as i64))
                 .set("passives", json::arr(members))
                 .build()
         });
@@ -168,8 +170,9 @@ pub fn passive(ctx: &Ctx, row: Row<'_>, translations: Option<&TranslationLookup>
     entry = entry.set("stats", J::Obj(stats));
 
     if let Some(translations) = translations {
-        let lines = translations.translate_grouped(&stat_ids, &values);
-        entry = entry.set("stat_text", text(lines.join("\n")));
+        // Lines follow the node's own stat order, not the description file's.
+        let ranges: Vec<(i32, i32)> = values.iter().map(|&v| (v, v)).collect();
+        entry = entry.set("stat_text", json::strings(translations.translate_ranges(&stat_ids, &ranges)));
     }
     entry.build()
 }
