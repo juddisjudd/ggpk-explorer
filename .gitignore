@@ -8,3 +8,6 @@
 RELEASE_PROCESS.md
 /examples
 CLAUDE.md
+.claude
+.remember
+ggpk-explorer.code-workspace
