@@ -845,8 +845,8 @@ fn export_file_data(
                 if let Ok(source) = rodio::Decoder::new(cursor) {
                     use rodio::Source;
                     let spec = hound::WavSpec {
-                        channels: source.channels(),
-                        sample_rate: source.sample_rate(),
+                        channels: source.channels().get(),
+                        sample_rate: source.sample_rate().get(),
                         bits_per_sample: 16,
                         sample_format: hound::SampleFormat::Int,
                     };
@@ -854,7 +854,9 @@ fn export_file_data(
                     let mut writer =
                         hound::WavWriter::create(dest, spec).map_err(|e| e.to_string())?;
                     for sample in source {
-                        let _ = writer.write_sample(sample);
+                        // Decoded audio arrives as floats in -1..=1; the file is 16-bit PCM.
+                        let scaled = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                        let _ = writer.write_sample(scaled);
                     }
                     writer.finalize().map_err(|e| e.to_string())?;
                 } else {

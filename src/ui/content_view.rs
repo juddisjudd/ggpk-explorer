@@ -65,8 +65,9 @@ pub struct ContentView {
     /// Models the user switched from the 3D preview to the structure summary.
     model_summary_view: std::collections::HashSet<u64>,
     pub dat_viewer: DatViewer,
-    audio_stream_handle: Option<(rodio::OutputStream, rodio::OutputStreamHandle)>,
-    audio_sink: Option<rodio::Sink>,
+    /// The output device owns the mixer a player connects to.
+    audio_device: Option<rodio::MixerDeviceSink>,
+    audio_sink: Option<rodio::Player>,
     pub last_error: Option<String>,
     pub failed_loads: std::collections::HashSet<u64>,
     image_view_states: HashMap<u64, ImageViewState>,
@@ -170,7 +171,7 @@ impl Default for ContentView {
             mesh_view_state: HashMap::new(),
             model_summary_view: std::collections::HashSet::new(),
             dat_viewer: DatViewer::default(),
-            audio_stream_handle: None,
+            audio_device: None,
             audio_sink: None,
             last_error: None,
             failed_loads: std::collections::HashSet::new(),
@@ -1646,22 +1647,20 @@ impl ContentView {
     }
 
     fn play_audio_bytes(&mut self, bytes: Vec<u8>) {
-        if self.audio_stream_handle.is_none() {
-            if let Ok(stream_handle) = rodio::OutputStream::try_default() {
-                self.audio_stream_handle = Some(stream_handle);
+        if self.audio_device.is_none() {
+            if let Ok(device) = rodio::DeviceSinkBuilder::open_default_sink() {
+                self.audio_device = Some(device);
             }
         }
-        if let Some((_, stream_handle)) = &self.audio_stream_handle {
+        if let Some(device) = &self.audio_device {
             match rodio::Decoder::new(std::io::Cursor::new(bytes)) {
-                Ok(decoder) => match rodio::Sink::try_new(stream_handle) {
-                    Ok(sink) => {
-                        sink.set_volume(self.audio_volume);
-                        sink.append(decoder);
-                        sink.play();
-                        self.audio_sink = Some(sink);
-                    }
-                    Err(_) => self.last_error = Some("Failed to create audio sink".to_string()),
-                },
+                Ok(decoder) => {
+                    let sink = rodio::Player::connect_new(device.mixer());
+                    sink.set_volume(self.audio_volume);
+                    sink.append(decoder);
+                    sink.play();
+                    self.audio_sink = Some(sink);
+                }
                 Err(e) => self.last_error = Some(format!("Failed to decode audio stream: {}", e)),
             }
         } else {
@@ -2581,28 +2580,25 @@ impl ContentView {
                           println!("Audio file selected: {}", path);
                           
                           // Initialize audio if needed
-                          if self.audio_stream_handle.is_none() {
-                              if let Ok(stream_handle) = rodio::OutputStream::try_default() {
-                                  self.audio_stream_handle = Some(stream_handle);
+                          if self.audio_device.is_none() {
+                              if let Ok(device) = rodio::DeviceSinkBuilder::open_default_sink() {
+                                  self.audio_device = Some(device);
                               } else {
                                   println!("Failed to get default audio output device");
                               }
                           }
                           
-                          if let Some((_, stream_handle)) = &self.audio_stream_handle {
+                          if let Some(device) = &self.audio_device {
                               use std::io::Cursor;
                               let cursor = Cursor::new(file_data);
                               
                               if let Ok(decoder) = rodio::Decoder::new(cursor) {
                                    // Recreate sink for each playback to avoid state issues
-                                   if let Ok(sink) = rodio::Sink::try_new(stream_handle) {
-                                       sink.set_volume(self.audio_volume);
-                                       sink.append(decoder);
-                                       sink.play(); 
-                                       self.audio_sink = Some(sink);
-                                   } else {
-                                        self.last_error = Some("Failed to create audio sink".to_string());
-                                   }
+                                   let sink = rodio::Player::connect_new(device.mixer());
+                                   sink.set_volume(self.audio_volume);
+                                   sink.append(decoder);
+                                   sink.play();
+                                   self.audio_sink = Some(sink);
                               } else {
                                   self.last_error = Some("Failed to decode Audio (Might be Wwise WEM)".to_string());
                               }
