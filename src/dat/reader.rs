@@ -341,7 +341,9 @@ fn read_string_at(data: &[u8], offset: usize) -> String {
         if u == 0 { break; } // Null terminator
         vec_u16.push(u);
         i += 2;
-        if vec_u16.len() > 1000 { break; } // Limit
+        // Long lore strings run to several thousand characters; the bound
+        // only exists so a missing terminator cannot read the whole file.
+        if vec_u16.len() > 1_000_000 { break; }
     }
     
     if !vec_u16.is_empty() {

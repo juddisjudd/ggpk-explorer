@@ -3,7 +3,7 @@
 use serde::Serialize;
 use std::collections::HashSet;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CsdFile {
     pub path: String,
     pub entries: Vec<CsdEntry>,
@@ -12,13 +12,13 @@ pub struct CsdFile {
     pub includes: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CsdEntry {
     pub ids: Vec<String>,
     pub descriptions: Vec<CsdSubEntry>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CsdSubEntry {
     pub operator: String,
     pub description: String,
@@ -27,10 +27,15 @@ pub struct CsdSubEntry {
     pub language: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CsdParameter {
     pub name: String,
+    /// 1-based index of the value the handler applies to; zero when the
+    /// handler takes a name instead (`reminderstring`).
     pub value: i32,
+    /// The name a non-numeric handler was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 pub fn parse_csd(data: &[u8], file_path: &str) -> Result<CsdFile, String> {
@@ -42,6 +47,8 @@ pub fn parse_csd(data: &[u8], file_path: &str) -> Result<CsdFile, String> {
 
     let content = String::from_utf16(&u16_vec)
         .map_err(|e| format!("Failed to decode UTF-16LE: {}", e))?;
+    // The byte-order mark would otherwise glue itself to the first keyword.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(&content);
 
     let mut entries = Vec::new();
     let mut includes = Vec::new();
@@ -164,13 +171,24 @@ pub fn parse_csd(data: &[u8], file_path: &str) -> Result<CsdFile, String> {
                                 p_idx += 1;
                             } else if p_idx + 1 < param_parts.len() {
                                 let name = param_parts[p_idx].to_string();
-                                if let Ok(val) = param_parts[p_idx+1].parse::<i32>() {
-                                    parameters.push(CsdParameter { name, value: val });
-                                    p_idx += 2;
-                                } else {
-                                    p_idx += 1;
+                                let arg = param_parts[p_idx + 1];
+                                match arg.parse::<i32>() {
+                                    Ok(val) => parameters.push(CsdParameter { name, value: val, text: None }),
+                                    // A handler whose argument names something
+                                    // (`reminderstring ReminderTextX`).
+                                    Err(_) => parameters.push(CsdParameter {
+                                        name,
+                                        value: 0,
+                                        text: Some(arg.to_string()),
+                                    }),
                                 }
+                                p_idx += 2;
                             } else {
+                                parameters.push(CsdParameter {
+                                    name: param_parts[p_idx].to_string(),
+                                    value: 0,
+                                    text: None,
+                                });
                                 p_idx += 1;
                             }
                         }

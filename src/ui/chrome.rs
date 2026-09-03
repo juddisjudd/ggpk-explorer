@@ -5,6 +5,7 @@ pub struct ChromeActions {
     pub open_steam: bool,
     pub open_settings: bool,
     pub open_diff: bool,
+    pub export_data: bool,
     pub open_about: bool,
     pub open_command_palette: bool,
     pub toggle_inspector: bool,
@@ -17,6 +18,7 @@ impl ChromeActions {
             open_steam: false,
             open_settings: false,
             open_diff: false,
+            export_data: false,
             open_about: false,
             open_command_palette: false,
             toggle_inspector: false,
@@ -300,6 +302,7 @@ impl AppChrome {
 
                         let mut open_ggpk = false;
                         let mut open_steam = false;
+                        let mut export_data = false;
                         let mut toggle_inspector = false;
                         Self::nav_button_menu(ui, "File", |ui| {
                             if ui.button("Open GGPK...").clicked() {
@@ -308,6 +311,17 @@ impl AppChrome {
                             }
                             if ui.button("Open Steam Folder...").clicked() {
                                 open_steam = true;
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui
+                                .button("Export Game Data...")
+                                .on_hover_text(
+                                    "Write the semantic JSON dumps: mods, skills, base items, stat translations",
+                                )
+                                .clicked()
+                            {
+                                export_data = true;
                                 ui.close_menu();
                             }
                             ui.separator();
@@ -326,6 +340,9 @@ impl AppChrome {
                         }
                         if open_steam {
                             actions.open_steam = true;
+                        }
+                        if export_data {
+                            actions.export_data = true;
                         }
                         if toggle_inspector {
                             actions.toggle_inspector = true;

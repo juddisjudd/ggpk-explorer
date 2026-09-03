@@ -10,6 +10,7 @@ pub mod cli;
 pub mod diff;
 pub mod update;
 pub mod export;
+pub mod data_export;
 pub mod skill_tree_export;
 pub mod parsers;
 pub mod adapters;
@@ -53,12 +54,26 @@ fn main() -> eframe::Result<()> {
     
 
     let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && args[1] == "inspect" {
-
-        if let Err(e) = cli::run_inspect() {
-            eprintln!("Inspection failed: {}", e);
+    match args.get(1).map(String::as_str) {
+        Some("inspect") => {
+            if let Err(e) = cli::run_inspect() {
+                eprintln!("Inspection failed: {}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
         }
-        return Ok(());
+        Some("export-data") => {
+            if let Err(e) = cli::run_data_export(&args[2..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some("-h") | Some("--help") | Some("help") => {
+            println!("{}", cli::USAGE);
+            return Ok(());
+        }
+        _ => {}
     }
 
 

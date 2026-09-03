@@ -85,4 +85,14 @@ impl CdnBundleLoader {
     pub fn set_patch_version(&mut self, ver: &str) {
         self.patch_ver = ver.to_string();
     }
+
+    /// The bundle index for this patch, so an export can run with no install
+    /// on disk. The index is itself a bundle and arrives compressed.
+    pub fn fetch_index(&self) -> Result<crate::bundles::index::Index, Box<dyn Error>> {
+        let raw = self.fetch_bundle("_.index.bin")?;
+        let mut cursor = std::io::Cursor::new(raw);
+        let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor)?;
+        let decompressed = bundle.decompress(&mut cursor)?;
+        Ok(crate::bundles::index::Index::read(&decompressed)?)
+    }
 }

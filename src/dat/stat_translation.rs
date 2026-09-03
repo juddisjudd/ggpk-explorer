@@ -4,7 +4,10 @@ use std::collections::HashMap;
 /// Resolves (stat id, numeric value) pairs from a DAT row into the rendered
 /// text a `.csd` stat-description file specifies for that value.
 pub struct TranslationLookup {
-    entries: Vec<CsdEntry>,
+    /// Each entry as `(the file it came from, its position in that file)`.
+    /// Hundreds of skill-specific files share the same two large includes, so
+    /// the entries are pointed at rather than copied.
+    entries: Vec<(std::rc::Rc<CsdFile>, usize)>,
     /// Entries mentioning each stat id, for subset matching.
     by_id: HashMap<String, Vec<usize>>,
     /// Entries redefined by a later file/entry with the same id set. Files
@@ -15,24 +18,44 @@ pub struct TranslationLookup {
 
 impl TranslationLookup {
     pub fn build(csd_files: &[&CsdFile]) -> Self {
-        let mut entries = Vec::new();
-        let mut index: HashMap<Vec<String>, usize> = HashMap::new();
+        let owned: Vec<std::rc::Rc<CsdFile>> =
+            csd_files.iter().map(|f| std::rc::Rc::new((*f).clone())).collect();
+        Self::build_shared(&owned)
+    }
+
+    /// Builds from files the caller already holds, sharing them rather than
+    /// copying their entries.
+    pub fn build_shared(csd_files: &[std::rc::Rc<CsdFile>]) -> Self {
+        let mut entries: Vec<(std::rc::Rc<CsdFile>, usize)> = Vec::new();
         let mut by_id: HashMap<String, Vec<usize>> = HashMap::new();
+        // Last entry to claim each set of ids; earlier ones are superseded.
+        let mut last: HashMap<&[String], usize> = HashMap::new();
         for file in csd_files {
-            for entry in &file.entries {
+            for (position, entry) in file.entries.iter().enumerate() {
                 if entry.ids.is_empty() {
                     continue;
                 }
                 let idx = entries.len();
-                index.insert(entry.ids.clone(), idx);
                 for id in &entry.ids {
                     by_id.entry(id.clone()).or_default().push(idx);
                 }
-                entries.push(entry.clone());
+                last.insert(entry.ids.as_slice(), idx);
+                entries.push((std::rc::Rc::clone(file), position));
             }
         }
-        let superseded = entries.iter().enumerate().map(|(i, e)| index.get(&e.ids) != Some(&i)).collect();
+        let mut superseded = Vec::with_capacity(entries.len());
+        for file in csd_files {
+            for entry in file.entries.iter().filter(|e| !e.ids.is_empty()) {
+                let i = superseded.len();
+                superseded.push(last.get(entry.ids.as_slice()) != Some(&i));
+            }
+        }
         Self { entries, by_id, superseded }
+    }
+
+    fn entry(&self, index: usize) -> &CsdEntry {
+        let (file, position) = &self.entries[index];
+        &file.entries[*position]
     }
 
     /// Renders a node's stats the way the client does. Every entry that
@@ -42,12 +65,34 @@ impl TranslationLookup {
     /// out in description-file order. Each string is one description, which
     /// may span several lines.
     pub fn translate_grouped(&self, stat_ids: &[String], values: &[i32]) -> Vec<String> {
-        let mut remaining: Vec<(String, i32)> = stat_ids
+        let ranges: Vec<(i32, i32)> = values.iter().map(|&v| (v, v)).collect();
+        self.resolve(stat_ids, &ranges, Order::File).into_iter().map(|line| line.text).filter(|t| !t.is_empty()).collect()
+    }
+
+    /// Like [`translate_grouped`](Self::translate_grouped) but every stat
+    /// carries a `(min, max)` range, which renders as `(min-max)` the way the
+    /// text on an unrolled mod does. Lines follow the order the stats were
+    /// given in, which is how a mod lists them.
+    pub fn translate_ranges(&self, stat_ids: &[String], values: &[(i32, i32)]) -> Vec<String> {
+        self.resolve(stat_ids, values, Order::Stat).into_iter().map(|line| line.text).filter(|t| !t.is_empty()).collect()
+    }
+
+    /// Like [`translate_grouped`](Self::translate_grouped) but reporting which
+    /// stats each line consumed and where its description sits in the file, so
+    /// a caller can key lines by stat and order them the way a tooltip does.
+    pub fn translate_detailed(&self, stat_ids: &[String], values: &[i32]) -> Vec<Line> {
+        let ranges: Vec<(i32, i32)> = values.iter().map(|&v| (v, v)).collect();
+        self.resolve(stat_ids, &ranges, Order::File)
+    }
+
+    fn resolve(&self, stat_ids: &[String], values: &[(i32, i32)], order: Order) -> Vec<Line> {
+        let position = |id: &str| stat_ids.iter().position(|s| s == id).unwrap_or(usize::MAX);
+        let mut remaining: Vec<(String, (i32, i32))> = stat_ids
             .iter()
             .enumerate()
-            .map(|(i, id)| (id.clone(), values.get(i).copied().unwrap_or(0)))
+            .map(|(i, id)| (id.clone(), values.get(i).copied().unwrap_or((0, 0))))
             .collect();
-        let mut out: Vec<(usize, String)> = Vec::new();
+        let mut out: Vec<(usize, usize, Line)> = Vec::new();
         while !remaining.is_empty() {
             let mut best: Option<(usize, usize)> = None; // (entry, covered)
             for (id, _) in &remaining {
@@ -55,12 +100,12 @@ impl TranslationLookup {
                     if self.superseded[idx] {
                         continue;
                     }
-                    let entry = &self.entries[idx];
+                    let entry = self.entry(idx);
                     let covered = entry.ids.iter().filter(|e| remaining.iter().any(|(r, _)| r == *e)).count();
                     let better = match best {
                         None => true,
                         Some((b, bc)) => {
-                            let be = &self.entries[b];
+                            let be = self.entry(b);
                             covered > bc || (covered == bc && (entry.ids.len() < be.ids.len() || (entry.ids.len() == be.ids.len() && idx > b)))
                         }
                     };
@@ -73,211 +118,243 @@ impl TranslationLookup {
                 remaining.remove(0);
                 continue;
             };
-            let entry = &self.entries[idx];
-            let vals: Vec<i32> = entry
+            let entry = self.entry(idx);
+            let vals: Vec<(i32, i32)> = entry
                 .ids
                 .iter()
-                .map(|e| remaining.iter().find(|(r, _)| r == e).map(|(_, v)| *v).unwrap_or(0))
+                .map(|e| remaining.iter().find(|(r, _)| r == e).map(|(_, v)| *v).unwrap_or((0, 0)))
                 .collect();
-            if let Some(text) = render_entry(entry, &vals) {
-                out.push((idx, text));
+            // A described stat stays described even when none of the entry's
+            // conditions accept its numbers; it just has nothing to say.
+            if !entry.descriptions.is_empty() {
+                let sub = matching_sub(entry, &vals);
+                let first = entry.ids.iter().map(|id| position(id)).min().unwrap_or(usize::MAX);
+                out.push((
+                    idx,
+                    first,
+                    Line {
+                        ids: entry.ids.clone(),
+                        text: sub.map(|s| render(s, &vals)).unwrap_or_default(),
+                        template: sub.map(|s| template(s, &entry.ids)).unwrap_or_default(),
+                        index: idx,
+                    },
+                ));
             }
             remaining.retain(|(r, _)| !entry.ids.contains(r));
         }
-        out.sort_by_key(|(idx, _)| *idx);
-        out.into_iter().map(|(_, text)| text).collect()
+        match order {
+            Order::File => out.sort_by_key(|(idx, _, _)| *idx),
+            Order::Stat => out.sort_by_key(|(_, first, _)| *first),
+        }
+        out.into_iter().map(|(_, _, line)| line).collect()
     }
-
 }
 
-/// Base-language text of the first sub-entry whose ranges accept `values`.
-fn render_entry(entry: &CsdEntry, values: &[i32]) -> Option<String> {
+/// One rendered description line.
+pub struct Line {
+    /// Every stat id the description covers, in its own order.
+    pub ids: Vec<String>,
+    pub text: String,
+    /// The line with each slot written as `{stat_id/handler}` rather than a
+    /// number, which is how quality effects are described.
+    pub template: String,
+    /// Position of the description in the file, for tooltip ordering.
+    pub index: usize,
+}
+
+/// Which order rendered lines come out in.
+#[derive(Clone, Copy, PartialEq)]
+enum Order {
+    /// As the description file lists them — what the passive tree shows.
+    File,
+    /// As the caller listed the stats — what mod and skill text does.
+    Stat,
+}
+
+/// The first sub-entry whose conditions the values can satisfy. Nothing
+/// matches when none of them can — a stat sitting at zero in a "more or less"
+/// pair contributes no line at all.
+fn matching_sub<'e>(entry: &'e CsdEntry, values: &[(i32, i32)]) -> Option<&'e CsdSubEntry> {
     if entry.descriptions.is_empty() {
         return None; // no_description: intentionally hidden stat
     }
-    for sub in &entry.descriptions {
-        if sub.language.is_some() {
-            continue; // v1: base/English text only
+    let n = entry.ids.len();
+    entry
+        .descriptions
+        .iter()
+        .filter(|s| s.language.is_none() && !is_variant(&s.operator))
+        .filter(|s| ranges_match(&s.operator, n, values))
+        // Several lines can accept the same numbers; the one that says most
+        // about them wins, which is how the client picks between "Fires 8" and
+        // "Fires +8".
+        .max_by_key(|s| specificity(&s.operator, n))
+}
+
+/// How tightly a set of conditions pins its values down: an exact number says
+/// more than a half-open range, which says more than `#`.
+fn specificity(operator: &str, n: usize) -> usize {
+    let tokens: Vec<&str> = operator.split_whitespace().filter(|t| is_range_token(t)).collect();
+    (0..n)
+        .map(|i| {
+            let token = tokens.get(i).copied().unwrap_or("#").trim_start_matches('!');
+            let (min, max) = token.split_once('|').unwrap_or((token, token));
+            1 + (min != "#") as usize + (max != "#") as usize
+        })
+        .sum()
+}
+
+/// A word among the conditions (`table_only`, `gem_quality`, …) marks wording
+/// meant for one particular screen. The plain line is the one with conditions
+/// alone, so a flagged variant is never the description of a stat.
+fn is_variant(operator: &str) -> bool {
+    operator.split_whitespace().any(|token| !is_range_token(token))
+}
+
+fn is_range_token(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_digit() || matches!(c, '#' | '|' | '!' | '-'))
+}
+
+/// The description with each value slot replaced by the stat it shows and the
+/// handlers applied to it, e.g. `{support_damage_+%_final/divide_by_one_hundred}`.
+fn template(sub: &CsdSubEntry, ids: &[String]) -> String {
+    let mut out = String::with_capacity(sub.description.len());
+    let chars: Vec<char> = sub.description.chars().collect();
+    let mut i = 0;
+    let mut anonymous = 0usize;
+    while i < chars.len() {
+        if chars[i] == '{' && i.checked_sub(1).map(|p| chars[p]) != Some('{') {
+            if let Some(rel) = chars[i..].iter().position(|&c| c == '}') {
+                let token: String = chars[i + 1..i + rel].iter().collect();
+                let index_part = token.split(':').next().unwrap_or("");
+                let index = if index_part.is_empty() {
+                    anonymous += 1;
+                    Some(anonymous - 1)
+                } else {
+                    index_part.parse::<usize>().ok()
+                };
+                if let Some(index) = index {
+                    let mut parts = vec![ids.get(index).cloned().unwrap_or_default()];
+                    parts.extend(
+                        sub.parameters
+                            .iter()
+                            .filter(|p| p.value as usize == index + 1)
+                            .map(|p| p.name.clone()),
+                    );
+                    out.push('{');
+                    out.push_str(&parts.join("/"));
+                    out.push('}');
+                    i += rel + 1;
+                    continue;
+                }
+            }
         }
-        if ranges_match(&sub.operator, entry.ids.len(), values) {
-            return Some(render(sub, values));
-        }
+        out.push(chars[i]);
+        i += 1;
     }
-    None
+    out
 }
 
 /// Text one entry renders for `values` in `language` (`None` = base/English): the first
 /// sub-entry of that language whose ranges match, falling back to the base language.
 pub fn preview(entry: &CsdEntry, language: Option<&str>, values: &[i32]) -> Option<String> {
     let n = entry.ids.len().max(1);
+    let values: Vec<(i32, i32)> = values.iter().map(|&v| (v, v)).collect();
     let pick = |lang: Option<&str>| {
         entry
             .descriptions
             .iter()
-            .find(|s| s.language.as_deref() == lang && ranges_match(&s.operator, n, values))
-            .map(|s| render(s, values))
+            .find(|s| s.language.as_deref() == lang && ranges_match(&s.operator, n, &values))
+            .map(|s| render(s, &values))
     };
     pick(language).or_else(|| if language.is_some() { pick(None) } else { None })
 }
 
-fn ranges_match(operator: &str, n: usize, values: &[i32]) -> bool {
-    let tokens: Vec<&str> = operator.split_whitespace().collect();
-    for i in 0..n {
-        let val = values.get(i).copied().unwrap_or(0);
-        let token = tokens.get(i).copied().unwrap_or("#|#");
-        if !range_matches_one(token, val) {
-            return false;
-        }
-    }
-    true
+/// Whether a description's conditions accept these values. A stat that rolls
+/// a range is judged on the top of that range, so a mod rolling `1 to 3` reads
+/// as the plural line rather than the singular one its floor would pick.
+fn ranges_match(operator: &str, n: usize, values: &[(i32, i32)]) -> bool {
+    let tokens: Vec<&str> = operator.split_whitespace().filter(|t| is_range_token(t)).collect();
+    (0..n).all(|i| {
+        let (_, top) = values.get(i).copied().unwrap_or((0, 0));
+        condition_holds(tokens.get(i).copied().unwrap_or("#|#"), top)
+    })
 }
 
-fn range_matches_one(token: &str, val: i32) -> bool {
+/// `#` accepts anything, `a|b` a span with either end open, a bare number an
+/// exact value, and a leading `!` inverts the whole test.
+fn condition_holds(token: &str, value: i32) -> bool {
+    if let Some(rest) = token.strip_prefix('!') {
+        return !condition_holds(rest, value);
+    }
     let (min_s, max_s) = token.split_once('|').unwrap_or((token, token));
     let min = if min_s == "#" { i32::MIN } else { min_s.parse().unwrap_or(i32::MIN) };
     let max = if max_s == "#" { i32::MAX } else { max_s.parse().unwrap_or(i32::MAX) };
-    val >= min && val <= max
+    value >= min && value <= max
 }
 
+/// A value being rendered. Mods carry a min/max range rather than a single
+/// number, and a range whose ends differ prints as `(min-max)`.
 #[derive(Clone, Copy)]
 struct ValueFmt {
-    value: f64,
-    decimals: usize,
+    min: f64,
+    max: f64,
+    /// `None` prints the value as short as it goes, which is what a handler
+    /// with no stated precision does.
+    decimals: Option<usize>,
     trim: bool,
 }
 
 impl ValueFmt {
-    fn from_i32(v: i32) -> Self {
-        Self { value: v as f64, decimals: 0, trim: false }
+    fn from_range(min: i32, max: i32) -> Self {
+        Self { min: min as f64, max: max as f64, decimals: None, trim: false }
+    }
+
+    /// The end of the range a `+d` sign is decided on: a roll that can reach
+    /// a positive number is written with a leading plus.
+    fn value(&self) -> f64 {
+        self.max
+    }
+
+    fn one(&self, v: f64) -> String {
+        let Some(decimals) = self.decimals else {
+            return if v.fract() == 0.0 { format!("{}", v as i64) } else { format!("{}", v) };
+        };
+        let s = format!("{:.*}", decimals, v);
+        if self.trim && s.contains('.') {
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        } else {
+            s
+        }
     }
 
     fn format(&self) -> String {
-        if self.decimals == 0 {
-            format!("{}", self.value.round() as i64)
-        } else {
-            let s = format!("{:.*}", self.decimals, self.value);
-            if self.trim {
-                s.trim_end_matches('0').trim_end_matches('.').to_string()
-            } else {
-                s
-            }
+        if self.min == self.max {
+            return self.one(self.min);
         }
+        // A range that is negative throughout shows the sign once, in front.
+        if self.min < 0.0 && self.max < 0.0 {
+            return format!("-({}-{})", self.one(-self.min), self.one(-self.max));
+        }
+        format!("({}-{})", self.one(self.min), self.one(self.max))
     }
 }
 
-fn apply_function(name: &str, mut fmt: ValueFmt) -> ValueFmt {
-    match name {
-        "negate" => {
-            fmt.value = -fmt.value;
-        }
-        "subtract_one" => {
-            fmt.value -= 1.0;
-        }
-        "multiply_by_ten" => {
-            fmt.value *= 10.0;
-        }
-        "divide_by_ten_1dp" => {
-            fmt.value /= 10.0;
-            fmt.decimals = 1;
-            fmt.trim = false;
-        }
-        "divide_by_ten_1dp_if_required" => {
-            fmt.value /= 10.0;
-            fmt.decimals = 1;
-            fmt.trim = true;
-        }
-        "divide_by_one_hundred" => {
-            fmt.value /= 100.0;
-            fmt.decimals = 2;
-            fmt.trim = true;
-        }
-        "divide_by_one_hundred_0dp" => {
-            fmt.value /= 100.0;
-            fmt.decimals = 0;
-            fmt.trim = false;
-        }
-        "divide_by_one_hundred_1dp" => {
-            fmt.value /= 100.0;
-            fmt.decimals = 1;
-            fmt.trim = false;
-        }
-        "divide_by_one_hundred_2dp_if_required" => {
-            fmt.value /= 100.0;
-            fmt.decimals = 2;
-            fmt.trim = true;
-        }
-        "milliseconds_to_seconds_0dp" => {
-            fmt.value /= 1000.0;
-            fmt.decimals = 0;
-            fmt.trim = false;
-        }
-        "milliseconds_to_seconds_2dp_if_required" => {
-            fmt.value /= 1000.0;
-            fmt.decimals = 2;
-            fmt.trim = true;
-        }
-        "milliseconds_to_seconds" | "milliseconds_to_seconds_2dp" => {
-            fmt.value /= 1000.0;
-            fmt.decimals = 2;
-            fmt.trim = name == "milliseconds_to_seconds";
-        }
-        "milliseconds_to_seconds_1dp" => {
-            fmt.value /= 1000.0;
-            fmt.decimals = 1;
-            fmt.trim = false;
-        }
-        "deciseconds_to_seconds" => {
-            fmt.value /= 10.0;
-            fmt.decimals = 1;
-            fmt.trim = true;
-        }
-        "per_minute_to_per_second" | "per_minute_to_per_second_0dp" => {
-            fmt.value /= 60.0;
-            fmt.decimals = 1;
-            fmt.trim = true;
-        }
-        "per_minute_to_per_second_1dp" => {
-            fmt.value /= 60.0;
-            fmt.decimals = 1;
-            fmt.trim = false;
-        }
-        "per_minute_to_per_second_2dp" => {
-            fmt.value /= 60.0;
-            fmt.decimals = 2;
-            fmt.trim = false;
-        }
-        "per_minute_to_per_second_2dp_if_required" => {
-            fmt.value /= 60.0;
-            fmt.decimals = 2;
-            fmt.trim = true;
-        }
-        "divide_by_two_0dp" => {
-            fmt.value = (fmt.value / 2.0).floor();
-        }
-        "divide_by_three" => fmt.value /= 3.0,
-        "divide_by_four" => fmt.value /= 4.0,
-        "divide_by_five" => fmt.value /= 5.0,
-        "divide_by_six" => fmt.value /= 6.0,
-        "divide_by_twelve" => fmt.value /= 12.0,
-        "divide_by_fifteen_0dp" => fmt.value = (fmt.value / 15.0).floor(),
-        "divide_by_twenty_then_double_0dp" => fmt.value = (fmt.value / 20.0).floor() * 2.0,
-        "divide_by_fifty" => fmt.value /= 50.0,
-        "divide_by_one_thousand" => fmt.value /= 1000.0,
-        "double" => fmt.value *= 2.0,
-        "times_one_point_five" => fmt.value *= 1.5,
-        "times_twenty" => fmt.value *= 20.0,
-        "multiply_by_four" => fmt.value *= 4.0,
-        "plus_two_hundred" => fmt.value += 200.0,
-        "30%_of_value" => fmt.value *= 0.3,
-        "60%_of_value" => fmt.value *= 0.6,
-        "negate_and_double" => fmt.value *= -2.0,
-        _ => {}
+/// Applies a named handler to both ends of a range. The ends keep the slots
+/// they were stored in, so `negate` on `-40 to -36` reads `(40-36)`, exactly
+/// as the client shows it.
+fn apply_function(name: &str, fmt: ValueFmt) -> ValueFmt {
+    let Some(handler) = crate::dat::stat_handlers::lookup(name) else { return fmt };
+    let (precision, fixed) = crate::dat::stat_handlers::precision(&handler.kind);
+    ValueFmt {
+        min: crate::dat::stat_handlers::apply(&handler.kind, fmt.min),
+        max: crate::dat::stat_handlers::apply(&handler.kind, fmt.max),
+        decimals: precision.map(|p| p as usize).or(fmt.decimals),
+        trim: !fixed,
     }
-    fmt
 }
 
-fn render(sub: &CsdSubEntry, raw_values: &[i32]) -> String {
-    let mut fmts: Vec<ValueFmt> = raw_values.iter().map(|&v| ValueFmt::from_i32(v)).collect();
+fn render(sub: &CsdSubEntry, raw_values: &[(i32, i32)]) -> String {
+    let mut fmts: Vec<ValueFmt> = raw_values.iter().map(|&(a, b)| ValueFmt::from_range(a, b)).collect();
     for param in &sub.parameters {
         let idx = (param.value as usize).saturating_sub(1);
         if let Some(f) = fmts.get_mut(idx) {
@@ -311,7 +388,7 @@ fn substitute(template: &str, values: &[ValueFmt]) -> String {
                 if let Ok(idx) = idx {
                     if let Some(v) = values.get(idx) {
                         let mut s = v.format();
-                        if spec == Some("+d") && v.value >= 0.0 {
+                        if spec == Some("+d") && v.value() >= 0.0 {
                             s = format!("+{}", s);
                         }
                         out.push_str(&s);

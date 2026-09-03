@@ -591,6 +591,48 @@ impl ExplorerApp {
         }
     }
 
+    /// Writes the semantic JSON dumps (mods, skills, base items, stat
+    /// translations) into a folder the user picks. Same work as the
+    /// `export-data` subcommand, reported through the usual status channel.
+    fn start_data_export(&mut self) {
+        let Some(index) = self.bundle_index.clone() else {
+            self.status_msg = "Open a GGPK or Steam folder first".to_string();
+            return;
+        };
+        let Some(schema) = self.content_view.dat_viewer.schema.clone() else {
+            self.status_msg = "Schema not loaded yet — open a DAT file first".to_string();
+            return;
+        };
+        let Some(out_dir) = rfd::FileDialog::new()
+            .set_title("Choose a folder for the game data export")
+            .pick_folder()
+        else {
+            return;
+        };
+
+        let files = crate::data_export::source::GameFiles::new(
+            self.reader.clone(),
+            index,
+            self.content_view.steam_loader.clone(),
+            self.content_view.cdn_loader.clone(),
+        );
+        let is_poe2 = self.settings.poe2_patch_version.starts_with('4');
+        let (tx, rx) = channel();
+        self.export_status_rx = Some(rx);
+        self.status_msg = "Starting game data export...".to_string();
+        self.is_loading = true;
+        thread::spawn(move || {
+            crate::data_export::run(
+                files,
+                schema,
+                is_poe2,
+                out_dir,
+                crate::data_export::DataExportOptions::default(),
+                tx,
+            );
+        });
+    }
+
     /// Runs the official-layout skill tree export when the export dialog
     /// targeted a single `.psg` with the "Skill tree" format selected.
     fn try_start_tree_export(&mut self, hashes: &[u64], target_dir: &std::path::Path) -> bool {
@@ -936,6 +978,9 @@ impl eframe::App for ExplorerApp {
         }
         if chrome_actions.open_steam {
             self.open_steam_dir(ctx);
+        }
+        if chrome_actions.export_data {
+            self.start_data_export();
         }
         if chrome_actions.open_settings {
             self.settings_window.open();
