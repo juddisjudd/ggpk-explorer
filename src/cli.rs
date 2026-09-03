@@ -78,7 +78,16 @@ ggpk-explorer — Path of Exile asset explorer
 USAGE:
     ggpk-explorer                          Launch the GUI
     ggpk-explorer inspect                  Print GGPK/bundle index diagnostics
+    ggpk-explorer export <PATH> [OPTIONS]  Extract game files, e.g. Art/2DArt
     ggpk-explorer export-data [OPTIONS]    Write RePoE-style semantic JSON dumps
+
+EXPORT OPTIONS:
+    -o, --out <DIR>        Output folder (default: ./export)
+        --textures <FMT>   dds (default), png or webp
+        --audio <FMT>      ogg (default) or wav
+        --data <FMT>       original (default) or json for .dat/.csd
+        --dry-run          Count the files instead of writing them
+    Plus the source options below (--ggpk / --steam / --cdn / --schema).
 
 EXPORT-DATA OPTIONS:
     -o, --out <DIR>        Output folder (default: ./data)
@@ -87,8 +96,10 @@ EXPORT-DATA OPTIONS:
         --cdn [<VERSION>]  Read from the patch CDN, no install needed
         --schema <FILE>    dat-schema JSON (default: the cached schema.min.json)
         --only <A,B,...>   Run only these modules
-        --images           Also write the .dds-derived icons the dumps name
-        --trade-stats      Attach trade ids from the official trade API
+        --images           Also export item, skill and buff icons as png + webp
+        --trade-stats      Add official trade site search ids to the stat text
+        --flat             Write into <DIR> itself, not a patch-version subfolder
+        --version <VER>    Name the patch instead of reading it from the install
         --poe1             Read a Path of Exile 1 install instead of PoE 2
     -l, --list             List module names and exit
         --ls <PREFIX>      List indexed game files under a path prefix and exit
@@ -138,6 +149,8 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
             "--cat" => cat = Some(value(&mut i)?),
             "--images" => options.images = true,
             "--trade-stats" => options.trade_stats = true,
+            "--flat" => options.flat = true,
+            "--version" => options.version = Some(value(&mut i)?),
             "--poe1" => is_poe2 = false,
             "-l" | "--list" => {
                 for name in crate::data_export::module_names() {
@@ -165,6 +178,21 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
 
     let ggpk = ggpk.or_else(|| if steam.is_some() || cdn.is_some() { None } else { settings.ggpk_path.clone() });
     let steam = steam.or_else(|| if ggpk.is_some() || cdn.is_some() { None } else { settings.steam_path.clone() });
+
+    // The patch names the output folder: taken from the CDN version when one
+    // was asked for, otherwise from the install's own client log.
+    if options.version.is_none() && !options.flat {
+        options.version = match &cdn {
+            Some(cdn) => Some(cdn.patch_version().to_string()),
+            None => install_root(ggpk.as_deref(), steam.as_deref())
+                .as_deref()
+                .and_then(crate::data_export::detect_version),
+        };
+        match &options.version {
+            Some(version) => println!("Exporting patch {}", version),
+            None => println!("Could not tell which patch this install is on; writing to {}", out.display()),
+        }
+    }
 
     let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref())?;
     println!("Index loaded: {} files", index.files.len());
@@ -208,6 +236,146 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
         return Err(format!("{} module(s) failed — see {}/data_export_errors.log", failed, out_display));
     }
     Ok(())
+}
+
+/// Extracts raw game files under a path, converting textures, audio and DAT
+/// tables on the way out — the same work the GUI's tree export does.
+pub fn run_file_export(args: &[String]) -> Result<(), String> {
+    use crate::ui::export_window::{AudioFormat, DataFormat, ExportSettings, PsgFormat, TextureFormat};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let mut prefix: Option<String> = None;
+    let mut out = PathBuf::from("export");
+    let mut ggpk: Option<String> = None;
+    let mut steam: Option<String> = None;
+    let mut cdn_version: Option<Option<String>> = None;
+    let mut schema_path: Option<String> = None;
+    let mut settings = ExportSettings { psg_format: PsgFormat::Original, is_poe2: true, ..Default::default() };
+    let mut dry_run = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let value = |i: &mut usize| -> Result<String, String> {
+            *i += 1;
+            args.get(*i).cloned().ok_or_else(|| format!("{} needs a value", arg))
+        };
+        match arg {
+            "-o" | "--out" => out = PathBuf::from(value(&mut i)?),
+            "--ggpk" => ggpk = Some(value(&mut i)?),
+            "--steam" => steam = Some(value(&mut i)?),
+            "--schema" => schema_path = Some(value(&mut i)?),
+            "--cdn" => {
+                let explicit = args.get(i + 1).filter(|v| !v.starts_with('-')).cloned();
+                if explicit.is_some() {
+                    i += 1;
+                }
+                cdn_version = Some(explicit);
+            }
+            "--textures" => {
+                settings.texture_format = match value(&mut i)?.to_ascii_lowercase().as_str() {
+                    "dds" => TextureFormat::OriginalDds,
+                    "png" => TextureFormat::Png,
+                    "webp" => TextureFormat::WebP,
+                    other => return Err(format!("--textures takes dds, png or webp, not {}", other)),
+                }
+            }
+            "--audio" => {
+                settings.audio_format = match value(&mut i)?.to_ascii_lowercase().as_str() {
+                    "ogg" | "original" => AudioFormat::Original,
+                    "wav" => AudioFormat::Wav,
+                    other => return Err(format!("--audio takes ogg or wav, not {}", other)),
+                }
+            }
+            "--data" => {
+                settings.data_format = match value(&mut i)?.to_ascii_lowercase().as_str() {
+                    "original" => DataFormat::Original,
+                    "json" => DataFormat::Json,
+                    other => return Err(format!("--data takes original or json, not {}", other)),
+                }
+            }
+            "--poe1" => settings.is_poe2 = false,
+            "--dry-run" => dry_run = true,
+            "-h" | "--help" => {
+                println!("{}", USAGE);
+                return Ok(());
+            }
+            other if other.starts_with('-') => return Err(format!("Unknown option {}\n\n{}", other, USAGE)),
+            path => prefix = Some(path.to_string()),
+        }
+        i += 1;
+    }
+
+    let prefix = prefix.ok_or_else(|| format!("Name a path to export, e.g. Art/2DArt\n\n{}", USAGE))?;
+    let saved = AppSettings::load();
+    let schema = load_schema(schema_path.or_else(|| saved.schema_local_path.clone())).ok();
+
+    let cdn = cdn_version.map(|explicit| {
+        let version = explicit.unwrap_or_else(|| saved.poe2_patch_version.clone());
+        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::get_app_data_dir().join("cache"), Some(&version))
+    });
+    let ggpk = ggpk.or_else(|| if steam.is_some() || cdn.is_some() { None } else { saved.ggpk_path.clone() });
+    let steam = steam.or_else(|| if ggpk.is_some() || cdn.is_some() { None } else { saved.steam_path.clone() });
+    let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref())?;
+
+    // A path with no extension is a folder; everything under it comes along.
+    // An empty one would otherwise match the entries whose path never resolved.
+    let wanted = prefix.trim_end_matches('/').to_ascii_lowercase();
+    if wanted.is_empty() {
+        return Err(format!("Name a path to export, e.g. Art/2DArt\n\n{}", USAGE));
+    }
+    let hashes: Vec<u64> = index
+        .files
+        .iter()
+        .filter(|(_, file)| {
+            let path = file.path.to_ascii_lowercase();
+            path == wanted || path.starts_with(&format!("{}/", wanted))
+        })
+        .map(|(hash, _)| *hash)
+        .collect();
+
+    if hashes.is_empty() {
+        return Err(format!("Nothing in the index under {}", prefix));
+    }
+    println!("{} files under {}", hashes.len(), prefix);
+    if dry_run {
+        return Ok(());
+    }
+
+    let index = Arc::new(index);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        crate::export::run_export(hashes, reader, Some(index), settings, out, cdn, steam_loader, schema, tx, None);
+    });
+
+    let mut failed = 0;
+    for status in rx {
+        match status {
+            crate::export::ExportStatus::Progress { current, total, filename } => {
+                // Only the milestones; a texture folder can hold tens of thousands.
+                if current == total || current % 500 == 0 {
+                    println!("[{}/{}] {}", current, total, filename);
+                }
+            }
+            crate::export::ExportStatus::Complete { errors, message, .. } => {
+                failed = errors;
+                println!("{}", message);
+            }
+            crate::export::ExportStatus::Error(e) => return Err(e),
+        }
+    }
+    if failed > 0 {
+        return Err(format!("{} file(s) failed; see export_errors.log", failed));
+    }
+    Ok(())
+}
+
+/// The game folder holding the logs: the one containing `Content.ggpk`, or the
+/// parent of a Steam `Bundles2` directory.
+fn install_root(ggpk: Option<&str>, steam: Option<&str>) -> Option<std::path::PathBuf> {
+    let path = ggpk.or(steam)?;
+    std::path::Path::new(path).parent().map(|p| p.to_path_buf())
 }
 
 fn load_schema(path: Option<String>) -> Result<crate::dat::schema::Schema, String> {

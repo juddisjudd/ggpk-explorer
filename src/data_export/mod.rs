@@ -19,20 +19,58 @@ use source::GameFiles;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DataExportOptions {
     /// Module names to run; empty runs all of them.
     pub only: Vec<String>,
-    /// Also write the `.dds`-derived icons the modules reference.
+    /// Also export the icons the dumps point at, as png and webp.
     pub images: bool,
     /// Look up trade stat ids from the official trade API (needs network).
     pub trade_stats: bool,
+    /// Patch the data is being read from. The export goes in a folder named
+    /// after it, so several patches can sit side by side.
+    pub version: Option<String>,
+    /// Write straight into the chosen folder, without a version subfolder.
+    pub flat: bool,
 }
 
-impl Default for DataExportOptions {
-    fn default() -> Self {
-        Self { only: Vec::new(), images: false, trade_stats: false }
+/// The patch an install is on, read from the client log it writes on every
+/// launch (`Web root: https://patch-poe2.poecdn.com/<version>/`).
+pub fn detect_version(install_root: &Path) -> Option<String> {
+    for name in ["logs/LatestClient.txt", "logs/Client.txt"] {
+        let Ok(text) = read_tail(&install_root.join(name), 512 * 1024) else { continue };
+        if let Some(version) = scan_version(&text) {
+            return Some(version);
+        }
     }
+    None
+}
+
+/// The last patch a client log mentions fetching from, which is the one the
+/// install currently holds.
+fn scan_version(log: &str) -> Option<String> {
+    const MARKER: &str = "poecdn.com/";
+    log.match_indices(MARKER)
+        .filter_map(|(at, _)| {
+            let rest = &log[at + MARKER.len()..];
+            let version = &rest[..rest.find('/')?];
+            let numbered = version.split('.').count() >= 3
+                && version.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()));
+            numbered.then(|| version.to_string())
+        })
+        .last()
+}
+
+/// Reads the last `limit` bytes of a file; logs grow to hundreds of megabytes
+/// and only the newest lines say which patch is installed.
+fn read_tail(path: &Path, limit: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    file.seek(SeekFrom::Start(size.saturating_sub(limit)))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// What a module needs to do its job.
@@ -163,12 +201,12 @@ impl<'a> Ctx<'a> {
 pub type ModuleFn = fn(&Ctx) -> Result<(), String>;
 
 /// Every module, in the order they run.
-pub fn registry() -> Vec<(&'static str, ModuleFn)> {
+pub fn registry() -> Vec<modules::Module> {
     modules::registry()
 }
 
 pub fn module_names() -> Vec<&'static str> {
-    registry().into_iter().map(|(n, _)| n).collect()
+    registry().into_iter().map(|m| m.name).collect()
 }
 
 /// Runs the export, reporting progress the way `export::run_export` does.
@@ -180,9 +218,9 @@ pub fn run(
     options: DataExportOptions,
     tx: Sender<ExportStatus>,
 ) {
-    let selected: Vec<(&str, ModuleFn)> = registry()
+    let selected: Vec<modules::Module> = registry()
         .into_iter()
-        .filter(|(name, _)| options.only.is_empty() || options.only.iter().any(|n| n == name))
+        .filter(|m| options.only.is_empty() || options.only.iter().any(|n| n == m.name))
         .collect();
 
     if selected.is_empty() {
@@ -194,9 +232,17 @@ pub fn run(
         return;
     }
 
+    // Each patch gets its own folder so exports do not overwrite each other.
+    let out = match (&options.version, options.flat) {
+        (Some(version), false) => out.join(version),
+        _ => out,
+    };
     if let Err(e) = std::fs::create_dir_all(&out) {
         let _ = tx.send(ExportStatus::Error(format!("Could not create {}: {}", out.display(), e)));
         return;
+    }
+    if let Some(version) = &options.version {
+        let _ = std::fs::write(out.join("version.txt"), format!("{}\n", version));
     }
 
     let rr = RelationalReader::new(&files, &schema, is_poe2);
@@ -204,13 +250,13 @@ pub fn run(
 
     let total = selected.len();
     let mut failures = Vec::new();
-    for (i, (name, run_module)) in selected.iter().enumerate() {
+    for (i, module) in selected.iter().enumerate() {
         let _ = tx.send(ExportStatus::Progress {
             current: i + 1,
             total,
-            filename: format!("{}.json", name),
+            filename: format!("{}.json", module.name),
         });
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_module(&ctx)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (module.run)(&ctx)));
         let message = match outcome {
             Ok(Ok(())) => None,
             Ok(Err(e)) => Some(e),
@@ -223,8 +269,8 @@ pub fn run(
             }),
         };
         if let Some(message) = message {
-            eprintln!("data export: {} failed: {}", name, message);
-            failures.push(format!("{}: {}", name, message));
+            eprintln!("data export: {} failed: {}", module.name, message);
+            failures.push(format!("{}: {}", module.name, message));
         }
     }
 
@@ -247,4 +293,29 @@ pub fn run(
             )
         },
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_newest_patch_in_the_log_wins() {
+        let log = "\
+[INFO Client] Web root: https://patch-poe2.poecdn.com/4.4.0.13/\n\
+[INFO Client] Connecting to 64.87.52.91\n\
+[INFO Client] Web root: https://patch-poe2.poecdn.com/4.5.4.11/\n";
+        assert_eq!(scan_version(log).as_deref(), Some("4.5.4.11"));
+    }
+
+    #[test]
+    fn addresses_and_other_urls_are_not_versions() {
+        assert_eq!(scan_version("no patch url here at all"), None);
+        assert_eq!(scan_version("https://web.poecdn.com/image/thing.png"), None);
+        // Path of Exile 1 uses the same log line on its own host.
+        assert_eq!(
+            scan_version("Web root: https://patch.poecdn.com/3.25.0.1/").as_deref(),
+            Some("3.25.0.1")
+        );
+    }
 }

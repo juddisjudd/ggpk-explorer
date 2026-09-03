@@ -4,6 +4,7 @@ pub mod content_view;
 mod dat_viewer;
 pub mod hex_viewer;
 pub mod settings_window;
+pub mod data_export_window;
 pub mod export_window;
 pub mod diff_window;
 pub mod json_viewer;

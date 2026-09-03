@@ -62,6 +62,13 @@ fn main() -> eframe::Result<()> {
             }
             return Ok(());
         }
+        Some("export") => {
+            if let Err(e) = cli::run_file_export(&args[2..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some("export-data") => {
             if let Err(e) = cli::run_data_export(&args[2..]) {
                 eprintln!("{}", e);
