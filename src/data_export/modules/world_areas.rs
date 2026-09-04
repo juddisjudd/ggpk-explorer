@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 pub fn world_areas(ctx: &Ctx) -> Result<(), String> {
     let areas = ctx.table("WorldAreas")?;
-    let packs = ctx.rr.table("MonsterPacks");
+    let packs = ctx.optional_table("MonsterPacks");
     let packs_by_area = packs_by_area(ctx);
     let entries_by_pack = entries_by_pack(ctx);
 
@@ -59,11 +59,11 @@ pub fn world_areas(ctx: &Ctx) -> Result<(), String> {
         })
         .collect();
 
-    json::write(ctx.out, "world_areas", &J::Obj(root))
+    ctx.write("world_areas", &J::Obj(root))
 }
 
 fn pack_json(ctx: &Ctx, pack: Row<'_>, entries: &HashMap<usize, Vec<usize>>) -> J {
-    let entry_table = ctx.rr.table("MonsterPackEntries");
+    let entry_table = ctx.optional_table("MonsterPackEntries");
     let monsters: Vec<(String, J)> = entries
         .get(&pack.index)
         .map(Vec::as_slice)
@@ -142,7 +142,7 @@ fn unnamed_columns(row: Row<'_>) -> J {
 }
 
 fn packs_by_area(ctx: &Ctx) -> HashMap<usize, Vec<usize>> {
-    let Some(table) = ctx.rr.table("MonsterPacks") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("MonsterPacks") else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
     for row in table.rows() {
         for area in row.list_keys("WorldAreas") {
@@ -153,7 +153,7 @@ fn packs_by_area(ctx: &Ctx) -> HashMap<usize, Vec<usize>> {
 }
 
 fn entries_by_pack(ctx: &Ctx) -> HashMap<usize, Vec<usize>> {
-    let Some(table) = ctx.rr.table("MonsterPackEntries") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("MonsterPackEntries") else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
     for row in table.rows() {
         if let Some(pack) = row.key("MonsterPacksKey") {

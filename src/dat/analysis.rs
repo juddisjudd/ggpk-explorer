@@ -794,6 +794,138 @@ pub fn reference_to(table: &str) -> TableReference {
     TableReference { table: table.to_string(), column: None }
 }
 
+
+/// Evidence that a schema no longer describes a file. Every variable-length
+/// column stores an offset into the data section, so a read taken at the wrong
+/// offset almost always yields a pointer that cannot be real — which is the
+/// difference between a table that merely grew a column at the end (harmless,
+/// the named columns still land where the schema says) and one whose columns
+/// shifted (every value past the shift is fiction).
+#[derive(Debug, Default, Clone)]
+pub struct FitReport {
+    /// Bytes the schema accounts for, and what the file's rows actually are.
+    pub schema_len: usize,
+    pub row_len: usize,
+    pub sampled: usize,
+    /// Named columns that read impossible values, worst first, with the share
+    /// of sampled rows that came out impossible.
+    pub impossible: Vec<(String, f32)>,
+}
+
+impl FitReport {
+    /// The share of sampled rows misread by the worst-hit column.
+    pub fn worst(&self) -> f32 {
+        self.impossible.first().map(|(_, share)| *share).unwrap_or(0.0)
+    }
+
+    /// Whether the schema is too far off this file to read from. A single
+    /// column misreading a few rows is normal noise in hand-written schemas;
+    /// a shifted layout wrecks most rows of every column past the shift.
+    pub fn is_broken(&self) -> bool {
+        self.worst() >= 0.25
+    }
+
+    /// One line naming what went wrong, for an error a user has to act on.
+    pub fn summary(&self) -> String {
+        let cols: Vec<String> = self
+            .impossible
+            .iter()
+            .take(4)
+            .map(|(name, share)| format!("{} ({:.0}% of rows)", name, share * 100.0))
+            .collect();
+        format!(
+            "the schema describes a {}-byte row but the file's rows are {} bytes, and {} read impossible values: {}",
+            self.schema_len,
+            self.row_len,
+            self.impossible.len(),
+            cols.join(", ")
+        )
+    }
+}
+
+/// Reads `sample` rows through `table` and counts the values that cannot be
+/// real: list and string offsets outside the file, absurd list lengths, and
+/// foreign keys past any plausible row count. Cheap enough to run before every
+/// table read.
+pub fn check_fit(reader: &DatReader, table: &Table, sample: usize) -> FitReport {
+    let data_len = reader.get_data().len();
+    let var_start = reader.data_section_offset as usize;
+    let mut report = FitReport {
+        schema_len: table.columns.iter().map(|c| get_column_size(c, reader.is_64bit)).sum(),
+        row_len: reader.row_length.unwrap_or(0),
+        ..Default::default()
+    };
+    if reader.row_count == 0 {
+        return report;
+    }
+
+    let step = ((reader.row_count as usize) / sample.max(1)).max(1);
+    let indices: Vec<u32> = (0..reader.row_count).step_by(step).take(sample).collect();
+    report.sampled = indices.len();
+
+    let mut bad = vec![0usize; table.columns.len()];
+    for &i in &indices {
+        let Ok(values) = reader.read_row(i, table) else { continue };
+        for (c, value) in values.iter().enumerate() {
+            let Some(col) = table.columns.get(c) else { continue };
+            if !value_is_possible(value, col, reader, var_start, data_len) {
+                bad[c] += 1;
+            }
+        }
+    }
+
+    let sampled = report.sampled.max(1) as f32;
+    for (c, count) in bad.iter().enumerate() {
+        if *count == 0 {
+            continue;
+        }
+        let name = table.columns[c]
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("column {}", c));
+        report.impossible.push((name, *count as f32 / sampled));
+    }
+    report.impossible.sort_by(|a, b| b.1.total_cmp(&a.1));
+    report
+}
+
+/// No table in the game has this many rows, so a key at or past it is a misread
+/// rather than a key into something large.
+const MAX_PLAUSIBLE_ROWS: usize = 5_000_000;
+
+pub fn value_is_possible(
+    value: &DatValue,
+    col: &Column,
+    reader: &DatReader,
+    var_start: usize,
+    data_len: usize,
+) -> bool {
+    match value {
+        DatValue::List(count, offset) => {
+            if *count == 0 {
+                return true;
+            }
+            if *count > 100_000 {
+                return false;
+            }
+            let elem = Column { array: false, interval: false, ..col.clone() };
+            let size = get_column_size(&elem, reader.is_64bit);
+            let start = var_start + (*offset as usize).saturating_sub(8);
+            match size.checked_mul(*count) {
+                Some(span) => start.saturating_add(span) <= data_len,
+                None => false,
+            }
+        }
+        DatValue::ForeignRow(index) => *index == usize::MAX || *index < MAX_PLAUSIBLE_ROWS,
+        DatValue::Interval(a, b) => {
+            let elem = Column { interval: false, ..col.clone() };
+            value_is_possible(a, &elem, reader, var_start, data_len)
+                && value_is_possible(b, &elem, reader, var_start, data_len)
+        }
+        DatValue::Unknown => false,
+        _ => true,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1144,72 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod fit_real_data_tests {
+    use super::*;
+    use crate::bundles::index::Index as BundleIndex;
+
+    /// Scores every schema table on the installed patch, so the fit check's
+    /// threshold can be set against how the community schema really behaves.
+    /// Run with: cargo test --release fit_check_real_data -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn fit_check_real_data() {
+        let settings = crate::settings::AppSettings::load();
+        let ggpk = settings.ggpk_path.expect("no ggpk_path configured");
+        let reader = std::sync::Arc::new(crate::ggpk::reader::GgpkReader::open(&ggpk).unwrap());
+        let cache = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
+        let index = BundleIndex::load_from_cache(&cache).expect("run the app once first");
+        let schema_text = std::fs::read_to_string(
+            crate::settings::AppSettings::get_app_data_dir().join("schema.min.json"),
+        )
+        .unwrap();
+        let schema: crate::dat::schema::Schema = serde_json::from_str(&schema_text).unwrap();
+
+        let mut scored: Vec<(f32, String, FitReport)> = Vec::new();
+        for file in index.files.values() {
+            let path = file.path.to_ascii_lowercase();
+            let Some(rest) = path.strip_prefix("data/balance/") else { continue };
+            if rest.contains('/') || !rest.ends_with(".datc64") {
+                continue;
+            }
+            let name = rest.trim_end_matches(".datc64");
+            let Some(def) = schema.find_table(name, true) else { continue };
+            let Some(bytes) = crate::ui::content_view::extract_bundle_file_sync(file, &index, Some(&reader), None)
+            else {
+                continue;
+            };
+            let Ok(dat) = DatReader::new(bytes, &path) else { continue };
+            if dat.row_count < 4 {
+                continue;
+            }
+            let report = check_fit(&dat, def, 40);
+            scored.push((report.worst(), def.name.clone(), report));
+        }
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+
+        let broken = scored.iter().filter(|(_, _, r)| r.is_broken()).count();
+        let grew = scored.iter().filter(|(_, _, r)| r.schema_len != r.row_len).count();
+        println!(
+            "scored {} tables · row length differs from the schema on {} · fit check calls {} broken",
+            scored.len(), grew, broken
+        );
+        println!("\nworst 25:");
+        for (worst, name, r) in scored.iter().take(25) {
+            println!(
+                "  {:>5.1}%  {:<40} schema {:>4}B file {:>4}B  {}",
+                worst * 100.0, name, r.schema_len, r.row_len,
+                r.impossible.iter().take(3).map(|(c, s)| format!("{} {:.0}%", c, s * 100.0)).collect::<Vec<_>>().join(", ")
+            );
+        }
+        println!("\nscore distribution:");
+        for (lo, hi) in [(0.0, 0.001), (0.001, 0.05), (0.05, 0.25), (0.25, 0.75), (0.75, 1.01)] {
+            let n = scored.iter().filter(|(w, _, _)| *w >= lo && *w < hi).count();
+            println!("  {:>5.1}%–{:<5.1}% : {}", lo * 100.0, hi * 100.0, n);
         }
     }
 }

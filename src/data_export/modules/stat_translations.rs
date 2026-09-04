@@ -51,7 +51,7 @@ pub fn stat_translations(ctx: &Ctx) -> Result<(), String> {
             .map(|entry| convert_entry(entry, &source, &mut lookup, &trade))
             .collect();
         let name = format!("stat_translations/{}", relative.trim_end_matches(".csd"));
-        json::write(ctx.out, &name, &J::Arr(entries))?;
+        ctx.write(&name, &J::Arr(entries))?;
         written += 1;
     }
 
@@ -59,8 +59,8 @@ pub fn stat_translations(ctx: &Ctx) -> Result<(), String> {
         return Err(format!("no .csd files found under {}", DIR));
     }
 
-    json::write(ctx.out, "stat_value_handlers", &value_handlers(ctx))?;
-    json::write(ctx.out, "stats_by_file", &lookup.build())
+    ctx.write("stat_value_handlers", &value_handlers(ctx))?;
+    ctx.write("stats_by_file", &lookup.build())
 }
 
 /// The entries a description file actually contributes.
@@ -544,7 +544,7 @@ fn relational_values(
     index_column: Option<&str>,
     predicate: Option<(&str, i64)>,
 ) -> J {
-    let Some(table) = ctx.rr.table(dat_file) else { return J::Obj(Vec::new()) };
+    let Some(table) = ctx.optional_table(dat_file) else { return J::Obj(Vec::new()) };
     let mut out = Vec::new();
     for row in table.rows() {
         if let Some((column, wanted)) = predicate {

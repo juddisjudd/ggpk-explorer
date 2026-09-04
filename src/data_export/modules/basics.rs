@@ -7,7 +7,7 @@ use crate::data_export::Ctx;
 pub fn active_skill_types(ctx: &Ctx) -> Result<(), String> {
     let table = ctx.table("ActiveSkillType")?;
     let types = json::strings(table.rows().map(|r| r.id().to_string()));
-    json::write(ctx.out, "active_skill_types", &types)
+    ctx.write("active_skill_types", &types)
 }
 
 pub fn characters(ctx: &Ctx) -> Result<(), String> {
@@ -38,7 +38,7 @@ pub fn characters(ctx: &Ctx) -> Result<(), String> {
                 .build()
         })
         .collect::<Vec<_>>();
-    json::write(ctx.out, "characters", &J::Arr(root))
+    ctx.write("characters", &J::Arr(root))
 }
 
 pub fn cost_types(ctx: &Ctx) -> Result<(), String> {
@@ -54,7 +54,7 @@ pub fn cost_types(ctx: &Ctx) -> Result<(), String> {
             (row.id().to_string(), entry)
         })
         .collect::<Vec<_>>();
-    json::write(ctx.out, "cost_types", &J::Obj(root))
+    ctx.write("cost_types", &J::Obj(root))
 }
 
 pub fn default_monster_stats(ctx: &Ctx) -> Result<(), String> {
@@ -76,7 +76,7 @@ pub fn default_monster_stats(ctx: &Ctx) -> Result<(), String> {
             (row.str("DisplayLevel").to_string(), entry)
         })
         .collect::<Vec<_>>();
-    json::write(ctx.out, "default_monster_stats", &J::Obj(root))
+    ctx.write("default_monster_stats", &J::Obj(root))
 }
 
 pub fn flavour(ctx: &Ctx) -> Result<(), String> {
@@ -89,7 +89,7 @@ pub fn flavour(ctx: &Ctx) -> Result<(), String> {
         }
         root.push((id, text(row.str("Text"))));
     }
-    json::write(ctx.out, "flavour", &J::Obj(root))
+    ctx.write("flavour", &J::Obj(root))
 }
 
 pub fn gem_tags(ctx: &Ctx) -> Result<(), String> {
@@ -98,7 +98,7 @@ pub fn gem_tags(ctx: &Ctx) -> Result<(), String> {
         .rows()
         .map(|row| (row.id().to_string(), json::opt_text(row.str("Name")).unwrap_or(J::Null)))
         .collect::<Vec<_>>();
-    json::write(ctx.out, "gem_tags", &J::Obj(root))
+    ctx.write("gem_tags", &J::Obj(root))
 }
 
 pub fn item_classes(ctx: &Ctx) -> Result<(), String> {
@@ -116,7 +116,7 @@ pub fn item_classes(ctx: &Ctx) -> Result<(), String> {
             (row.id().to_string(), entry)
         })
         .collect::<Vec<_>>();
-    json::write(ctx.out, "item_classes", &J::Obj(root))
+    ctx.write("item_classes", &J::Obj(root))
 }
 
 pub fn keywords(ctx: &Ctx) -> Result<(), String> {
@@ -132,13 +132,13 @@ pub fn keywords(ctx: &Ctx) -> Result<(), String> {
         })
         .collect::<Vec<_>>();
     root.sort_by(|a, b| a.0.cmp(&b.0));
-    json::write(ctx.out, "keywords", &J::Obj(root))
+    ctx.write("keywords", &J::Obj(root))
 }
 
 pub fn tags(ctx: &Ctx) -> Result<(), String> {
     let table = ctx.table("Tags")?;
     let names = json::strings(table.rows().map(|r| r.id().to_string()));
-    json::write(ctx.out, "tags", &names)?;
+    ctx.write("tags", &names)?;
 
     let mut details = table
         .rows()
@@ -152,5 +152,5 @@ pub fn tags(ctx: &Ctx) -> Result<(), String> {
         })
         .collect::<Vec<_>>();
     details.sort_by(|a, b| a.0.cmp(&b.0));
-    json::write(ctx.out, "tag_details", &J::Obj(details))
+    ctx.write("tag_details", &J::Obj(details))
 }

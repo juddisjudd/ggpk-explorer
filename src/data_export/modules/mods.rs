@@ -99,12 +99,59 @@ pub fn domain_name(value: i64) -> Option<&'static str> {
     name_of(&DOMAINS, value)
 }
 
+/// Renders a mod's stat lines. Held apart from `mods` because `base_items`
+/// reports the same text for the implicits it names.
+pub struct ModText {
+    stat_columns: Vec<(String, String)>,
+}
+
+impl ModText {
+    pub fn new(table: &LoadedTable) -> Self {
+        Self {
+            stat_columns: (1..=MAX_STATS)
+                .filter(|i| table.has_col(&format!("Stat{}", i)))
+                .map(|i| (format!("Stat{}", i), format!("Stat{}Value", i)))
+                .collect(),
+        }
+    }
+
+    fn stats(&self, ctx: &Ctx, row: Row<'_>) -> Vec<Stat> {
+        read_stats(ctx, row, &self.stat_columns)
+    }
+
+    fn describe(ctx: &Ctx, row: Row<'_>, stats: &[Stat]) -> Vec<String> {
+        // A stat pinned to zero grants nothing, so it contributes no line.
+        let described: Vec<&Stat> = stats.iter().filter(|s| s.min != 0 || s.max != 0).collect();
+        let ids: Vec<String> = described.iter().map(|s| s.id.clone()).collect();
+        let ranges: Vec<(i32, i32)> = described.iter().map(|s| (s.min as i32, s.max as i32)).collect();
+        ctx.translations(translation_file(row.int("Domain"))).translate_ranges(&ids, &ranges)
+    }
+
+    /// The lines one mod shows, as the client draws them.
+    pub fn lines(&self, ctx: &Ctx, row: Row<'_>) -> Vec<String> {
+        Self::describe(ctx, row, &self.stats(ctx, row))
+    }
+}
+
+/// Stat text keeps the client's link markup: `[Resistances|Fire Resistance]`
+/// draws the part after the bar, `[Resistances]` the whole token.
+pub fn display_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(open) = rest.find('[') {
+        let Some(close) = rest[open..].find(']').map(|i| open + i) else { break };
+        out.push_str(&rest[..open]);
+        let token = &rest[open + 1..close];
+        out.push_str(token.rsplit('|').next().unwrap_or(token));
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 pub fn mods(ctx: &Ctx) -> Result<(), String> {
     let table = ctx.table("Mods")?;
-    let stat_columns: Vec<(String, String)> = (1..=MAX_STATS)
-        .filter(|i| table.has_col(&format!("Stat{}", i)))
-        .map(|i| (format!("Stat{}", i), format!("Stat{}Value", i)))
-        .collect();
+    let renderer = ModText::new(&table);
 
     let prices = gold_prices(ctx);
 
@@ -116,13 +163,8 @@ pub fn mods(ctx: &Ctx) -> Result<(), String> {
             continue; // first definition wins, as RePoE reports duplicates
         }
         let domain = row.int("Domain");
-        let stats = read_stats(ctx, row, &stat_columns);
-
-        // A stat pinned to zero grants nothing, so it contributes no line.
-        let described: Vec<&Stat> = stats.iter().filter(|s| s.min != 0 || s.max != 0).collect();
-        let ids: Vec<String> = described.iter().map(|s| s.id.clone()).collect();
-        let ranges: Vec<(i32, i32)> = described.iter().map(|s| (s.min as i32, s.max as i32)).collect();
-        let lines = ctx.translations(translation_file(domain)).translate_ranges(&ids, &ranges);
+        let stats = renderer.stats(ctx, row);
+        let lines = ModText::describe(ctx, row, &stats);
 
         let entry = Obj::new()
             .set("adds_tags", json::strings(ctx.rr.deref_list_ids(row, "Tags")))
@@ -144,7 +186,7 @@ pub fn mods(ctx: &Ctx) -> Result<(), String> {
         root.push((id, entry));
     }
 
-    json::write(ctx.out, "mods", &J::Obj(root))
+    ctx.write("mods", &J::Obj(root))
 }
 
 struct Stat {
@@ -197,7 +239,7 @@ fn granted_effects(ctx: &Ctx, row: Row<'_>) -> J {
 
 /// `GoldModPrices` keyed by the mod row it prices.
 fn gold_prices(ctx: &Ctx) -> HashMap<usize, i64> {
-    let Some(table) = ctx.rr.table("GoldModPrices") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("GoldModPrices") else { return HashMap::new() };
     let mut out = HashMap::new();
     for row in table.rows() {
         if let Some(target) = row.key("Mod") {
@@ -248,7 +290,7 @@ pub fn mods_by_base(ctx: &Ctx) -> Result<(), String> {
             (class_name, J::Obj(by_tags))
         })
         .collect();
-    json::write(ctx.out, "mods_by_base", &J::Obj(fields))
+    ctx.write("mods_by_base", &J::Obj(fields))
 }
 
 /// One base-item tag set: which bases share it and what can roll on them.
@@ -397,5 +439,14 @@ mod tests {
         assert_eq!(entry.weight_for(&HashSet::from(["ring"])), Some(500));
         assert_eq!(entry.weight_for(&HashSet::from(["default"])), Some(0));
         assert_eq!(entry.weight_for(&HashSet::from(["amulet"])), None);
+    }
+
+    #[test]
+    fn link_markup_is_reduced_to_what_the_client_draws() {
+        assert_eq!(display_text("+(20-30)% to [Resistances|Fire Resistance]"), "+(20-30)% to Fire Resistance");
+        assert_eq!(display_text("+(7-10)% to all [ElementalDamage|Elemental] [Resistances]"), "+(7-10)% to all Elemental Resistances");
+        assert_eq!(display_text("+1 Prefix Modifier allowed\n-1 Suffix Modifier allowed"), "+1 Prefix Modifier allowed\n-1 Suffix Modifier allowed");
+        // An unclosed bracket is left as it stands rather than swallowing the rest.
+        assert_eq!(display_text("adds [Fire to attacks"), "adds [Fire to attacks");
     }
 }

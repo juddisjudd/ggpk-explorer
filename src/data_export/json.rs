@@ -50,6 +50,23 @@ pub fn sorted(value: J) -> J {
     }
 }
 
+/// The same value with every null-valued object key dropped, so an entry
+/// carries only what the thing it describes actually has. Array elements keep
+/// their places — position is meaning there.
+pub fn without_nulls(value: &J) -> J {
+    match value {
+        J::Obj(fields) => J::Obj(
+            fields
+                .iter()
+                .filter(|(_, v)| !matches!(v, J::Null))
+                .map(|(k, v)| (k.clone(), without_nulls(v)))
+                .collect(),
+        ),
+        J::Arr(items) => J::Arr(items.iter().map(without_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
 pub fn text(s: impl AsRef<str>) -> J {
     J::Str(s.as_ref().to_string())
 }
@@ -210,6 +227,23 @@ mod tests {
             compact(&value),
             "{\"name\":\"Marauder\",\"life\":16,\"damage\":9.15999984741211,\
              \"tags\":[\"fire\",\"melee\"],\"missing\":null}"
+        );
+    }
+
+    #[test]
+    fn stripping_nulls_leaves_arrays_and_their_positions_alone() {
+        let value = Obj::new()
+            .set("name", text("Gold Amulet"))
+            .or_null("requirements", None)
+            .set("properties", Obj::new().or_null("armour", None).build())
+            .set("implicits", strings(["AmuletImplicitItemFoundRarityIncrease1"]))
+            .set("weights", J::Arr(vec![int(1), J::Null, int(3)]))
+            .build();
+        assert_eq!(
+            compact(&without_nulls(&value)),
+            "{\"name\":\"Gold Amulet\",\"properties\":{},\
+             \"implicits\":[\"AmuletImplicitItemFoundRarityIncrease1\"],\
+             \"weights\":[1,null,3]}"
         );
     }
 

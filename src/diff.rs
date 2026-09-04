@@ -316,3 +316,60 @@ mod tests {
         assert_eq!(index2.files.len(), 1);
     }
 }
+
+#[cfg(test)]
+mod real_snapshot_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Diffs the two newest saved snapshots and prints a patch report, with the
+    /// `data/` tables (the ones the schema has to keep up with) broken out.
+    /// Run with: cargo test --release patch_report_real_snapshots -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn patch_report_real_snapshots() {
+        let snaps = list_snapshots();
+        assert!(snaps.len() >= 2, "need two snapshots, found {}", snaps.len());
+        let (new_path, new_meta) = &snaps[0];
+        let (old_path, old_meta) = &snaps[1];
+        println!(
+            "old {} ({}, {} files)\nnew {} ({}, {} files)",
+            old_meta.patch_version, old_meta.created_at_label(), old_meta.file_count,
+            new_meta.patch_version, new_meta.created_at_label(), new_meta.file_count
+        );
+
+        let (_, old_index) = load_snapshot(old_path).unwrap();
+        let (_, new_index) = load_snapshot(new_path).unwrap();
+        let diff = diff_indexes(&old_index, &new_index);
+        println!(
+            "\nadded {}  removed {}  modified {}  touched {}  (total {})",
+            diff.added.len(), diff.removed.len(), diff.modified.len(), diff.touched.len(), diff.total()
+        );
+
+        let top = |p: &str| p.split('/').next().unwrap_or("<root>").to_string();
+        let mut folders: BTreeMap<String, [usize; 4]> = BTreeMap::new();
+        for (slot, list) in [(0, &diff.added), (1, &diff.removed), (2, &diff.modified), (3, &diff.touched)] {
+            for e in list {
+                folders.entry(top(&e.display_path())).or_insert([0; 4])[slot] += 1;
+            }
+        }
+        let mut rows: Vec<_> = folders.into_iter().collect();
+        rows.sort_by_key(|(_, c)| std::cmp::Reverse(c.iter().sum::<usize>()));
+        println!("\n{:<28} {:>8} {:>8} {:>8} {:>8}", "top folder", "added", "removed", "modif", "touched");
+        for (folder, c) in rows.iter().take(25) {
+            println!("{:<28} {:>8} {:>8} {:>8} {:>8}", folder, c[0], c[1], c[2], c[3]);
+        }
+
+        let is_data = |p: &str| p.starts_with("data/") && (p.ends_with(".datc64") || p.ends_with(".dat64") || p.ends_with(".dat"));
+        println!("\n--- data tables ---");
+        for (label, list) in [("added", &diff.added), ("removed", &diff.removed), ("modified", &diff.modified)] {
+            let hits: Vec<String> = list.iter().map(|e| e.display_path()).filter(|p| is_data(p)).collect();
+            println!("{} ({}):", label, hits.len());
+            for p in &hits {
+                println!("  {}", p);
+            }
+        }
+        let touched_data = diff.touched.iter().map(|e| e.display_path()).filter(|p| is_data(p)).count();
+        println!("touched (repacked, content may be unchanged): {}", touched_data);
+    }
+}

@@ -123,6 +123,24 @@ impl DatReader {
         })
     }
 
+
+    /// Reads one column as if it began `offset` bytes into the row. Tools that
+    /// are working out where a column moved to need to read a candidate offset
+    /// without inventing a whole table definition to do it.
+    pub fn read_cell_at(&self, row: u32, offset: usize, col: &Column) -> io::Result<DatValue> {
+        let row_len = self.row_length.unwrap_or(0);
+        let size = get_column_size(col, self.is_64bit);
+        if row_len == 0 || offset + size > row_len {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "column does not fit the row"));
+        }
+        let start = 4 + (row as usize * row_len) + offset;
+        let end = start + size;
+        if end > self.data.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "row out of bounds"));
+        }
+        let mut cursor = Cursor::new(&self.data[start..end]);
+        read_column_value(&mut cursor, col, &self.data, self.data_section_offset, self.is_64bit)
+    }
     pub fn read_row(&self, index: u32, table: &Table) -> io::Result<Vec<DatValue>> {
 
         

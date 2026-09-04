@@ -114,7 +114,7 @@ pub fn passives(ctx: &Ctx) -> Result<(), String> {
             .set("art", ui_art(ctx, ctx.rr.deref(tree, "UIArt").as_ref()))
             .build();
 
-        json::write(ctx.out, &format!("passive_skill_trees/{}", tree.id()), &json::sorted(document))?;
+        ctx.write(&format!("passive_skill_trees/{}", tree.id()), &json::sorted(document))?;
         written += 1;
     }
 

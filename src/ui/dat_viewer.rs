@@ -70,6 +70,10 @@ pub struct DatViewer {
     fk_suggestions: Option<(usize, HashMap<usize, Vec<FkCandidate>>)>,
     editor: Option<SchemaEditor>,
     notice: Option<String>,
+    /// Column names being carried over from an earlier patch, in the background.
+    refit: Option<RefitJob>,
+    /// The patch to carry names from, looked up once.
+    prev_patch: Option<Option<String>>,
 }
 
 impl Default for DatViewer {
@@ -108,6 +112,8 @@ impl Default for DatViewer {
             fk_suggestions: None,
             editor: None,
             notice: None,
+            refit: None,
+            prev_patch: None,
         }
     }
 }
@@ -122,6 +128,53 @@ enum Layout {
 }
 
 /// Mutations collected while the table is drawn and applied once its borrows end.
+/// A re-fit running against an earlier patch fetched from the CDN. The download
+/// and the column search both take seconds, so they happen off the UI thread.
+struct RefitJob {
+    version: String,
+    table: String,
+    rx: std::sync::mpsc::Receiver<Result<crate::dat::refit::RefitReport, String>>,
+}
+
+
+/// Reads one table out of an earlier patch and works out where this patch moved
+/// its columns to. Runs on a worker thread: the CDN fetch alone can take a while.
+fn refit_against(
+    version: &str,
+    path: &str,
+    new_bytes: Vec<u8>,
+    def: Table,
+) -> Result<crate::dat::refit::RefitReport, String> {
+    use crate::dat::relational::FileSource;
+
+    let cdn = crate::bundles::cdn::CdnBundleLoader::new(
+        &crate::settings::AppSettings::get_app_data_dir().join("cache"),
+        Some(version),
+    );
+    let index = cdn.fetch_index().map_err(|e| format!("could not read patch {}: {}", version, e))?;
+    let files = crate::data_export::source::GameFiles::new(None, Arc::new(index), None, Some(cdn));
+    let old_bytes = files
+        .fetch(path)
+        .ok_or_else(|| format!("{} is not in patch {}", path, version))?;
+
+    let old = DatReader::new(old_bytes, path).map_err(|e| e.to_string())?;
+    let new = DatReader::new(new_bytes, path).map_err(|e| e.to_string())?;
+    if analysis::check_fit(&old, &def, 40).is_broken() {
+        return Err(format!("the schema does not describe patch {} either, so there is nothing to carry", version));
+    }
+    crate::dat::refit::carry_across_patch(&old, &def, &new)
+}
+/// The patch before the one installed, taken from the newest saved index
+/// snapshot that is not the current patch. Snapshots are written automatically
+/// when the app notices a patch change, so this is normally the patch just gone.
+fn previous_patch() -> Option<String> {
+    let current = crate::settings::AppSettings::load().poe2_patch_version;
+    crate::diff::list_snapshots()
+        .into_iter()
+        .map(|(_, meta)| meta.patch_version)
+        .find(|version| *version != current)
+}
+
 enum Deferred {
     Save { name: String, columns: Vec<Column> },
     Revert(String),
@@ -596,6 +649,89 @@ impl DatViewer {
         });
     }
 
+    /// Starts carrying this table's column names over from `version`, which is
+    /// read from the patch CDN. The community schema is what gets carried, not
+    /// the layout on screen: an override that is already wrong would only teach
+    /// the search the wrong thing.
+    /// Offers to carry this table's names over from the patch before this one.
+    /// Nothing is shown when there is no earlier snapshot to compare against.
+    fn refit_button(&mut self, ui: &mut egui::Ui, table_name: &str, is_poe2: bool) {
+        if let Some(job) = &self.refit {
+            if job.table == table_name {
+                ui.spinner();
+                ui.label(
+                    RichText::new(format!("reading patch {} to see where the columns went…", job.version))
+                        .weak()
+                        .size(11.0),
+                );
+                return;
+            }
+        }
+        // Reading the snapshot directory is disk work, so the answer is kept.
+        if self.prev_patch.is_none() {
+            self.prev_patch = Some(previous_patch());
+        }
+        let Some(version) = self.prev_patch.clone().flatten() else { return };
+        if ui
+            .small_button(format!("Carry names from {}", version))
+            .on_hover_text("Match this file's rows against that patch's copy of it, and move each column's name to wherever its values went")
+            .clicked()
+        {
+            self.start_refit(table_name, version, is_poe2);
+        }
+    }
+
+    fn start_refit(&mut self, table_name: &str, version: String, is_poe2: bool) {
+        let Some(reader) = self.reader.as_ref() else { return };
+        let Some(def) = self
+            .base_schema
+            .as_ref()
+            .and_then(|s| s.find_table(table_name, is_poe2))
+            .cloned()
+        else {
+            self.notice = Some(format!("{} is not in the community schema, so there are no names to carry", table_name));
+            return;
+        };
+        let path = reader.filename.clone();
+        let bytes = reader.get_data().to_vec();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job_version = version.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(refit_against(&job_version, &path, bytes, def));
+        });
+        self.refit = Some(RefitJob { version, table: table_name.to_string(), rx });
+    }
+
+    /// Takes the result of a finished re-fit: a layout that reads cleanly is
+    /// saved as a custom layout, the way the CLI's `--write` does.
+    fn poll_refit(&mut self, is_poe2: bool) {
+        let Some(job) = self.refit.as_ref() else { return };
+        let message = match job.rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err(format!("the re-fit of {} stopped without a result", job.table))
+            }
+            Ok(result) => result.map_err(|e| format!("{}: {}", job.table, e)),
+        };
+        let (version, name) = (job.version.clone(), job.table.clone());
+        self.refit = None;
+
+        match message {
+            Ok(report) => {
+                let carried = report.carried.len();
+                let total = carried + report.lost.len();
+                self.notice = Some(match report.lost.is_empty() {
+                    true => format!("{}: all {} columns carried over from {} and saved", name, total, version),
+                    false => format!(
+                        "{}: {} of {} columns carried over from {} and saved. Still unnamed: {}",
+                        name, carried, total, version, report.lost.join(", ")
+                    ),
+                });
+                self.save_override(&name, report.table.columns, is_poe2);
+            }
+            Err(e) => self.notice = Some(e),
+        }
+    }
     fn save_override(&mut self, name: &str, columns: Vec<Column>, is_poe2: bool) {
         self.overrides.upsert(Table { name: name.to_string(), columns, tags: None, valid_for: Some(game_mask(is_poe2)), custom: true });
         self.persist_overrides();
@@ -725,6 +861,7 @@ impl DatViewer {
             return;
         }
 
+        self.poll_refit(is_poe2);
         self.ensure_table(is_poe2);
         let table = self.table.as_ref().and_then(|t| t.2.clone());
         match table {
@@ -937,6 +1074,7 @@ impl DatViewer {
                     if ui.small_button("Save as custom layout").on_hover_text("Keep this layout in schema_overrides.json").clicked() {
                         pending.push(Deferred::Save { name: table.name.clone(), columns: table.columns.clone() });
                     }
+                    self.refit_button(ui, &table.name, is_poe2);
                 });
             }
             Layout::Schema if !width_ok => {
@@ -948,10 +1086,14 @@ impl DatViewer {
                     if ui.small_button("Re-fit to data").clicked() {
                         self.use_aligned = true;
                     }
+                    self.refit_button(ui, &table.name, is_poe2);
                 });
             }
             Layout::Custom if !width_ok => {
-                ui.colored_label(amber, format!("⚠ Custom layout describes {}-byte rows but this file has {}-byte rows — fix it under Edit columns.", schema_width, file_width));
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(amber, format!("⚠ Custom layout describes {}-byte rows but this file has {}-byte rows — fix it under Edit columns.", schema_width, file_width));
+                    self.refit_button(ui, &table.name, is_poe2);
+                });
             }
             _ => {}
         }

@@ -29,19 +29,18 @@ impl CdnBundleLoader {
     }
 
     pub fn fetch_bundle(&self, bundle_name: &str) -> Result<Vec<u8>, Box<dyn Error>> {
-        // Reject bundle names that are clearly index-internal paths, not real CDN bundles.
-        // The index uses "Folders/" prefix for directory-structure metadata bundles that
-        // don't exist as individual files on the CDN.
-        if bundle_name.starts_with("Folders/") || bundle_name.starts_with("folders/") {
-            return Err(format!(
-                "Bundle name '{}' starts with 'Folders/' which is an index-internal path, not a valid CDN bundle",
-                bundle_name
-            ).into());
-        }
+        // The index names bundles without their file extension; the CDN serves them with it.
+        let bundle_name = if bundle_name.ends_with(".bundle.bin") || bundle_name.ends_with(".index.bin") {
+            bundle_name.to_string()
+        } else {
+            format!("{}.bundle.bin", bundle_name)
+        };
 
-        // 1. Check Local Cache
+        // 1. Check Local Cache. Keyed by patch version: the same bundle name holds
+        // different content in every patch.
         let safe_name = bundle_name.replace("/", "@");
-        let cache_path = self.cache_dir.join(&safe_name);
+        let cache_dir = self.cache_dir.join(&self.patch_ver);
+        let cache_path = cache_dir.join(&safe_name);
 
         if cache_path.exists() {
             let data = fs::read(&cache_path)?;
@@ -76,6 +75,7 @@ impl CdnBundleLoader {
         let data = bytes.to_vec();
 
         // 3. Save to Cache
+        let _ = fs::create_dir_all(&cache_dir);
         let mut f = fs::File::create(&cache_path)?;
         f.write_all(&data)?;
         

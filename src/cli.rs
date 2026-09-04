@@ -80,6 +80,7 @@ USAGE:
     ggpk-explorer inspect                  Print GGPK/bundle index diagnostics
     ggpk-explorer export <PATH> [OPTIONS]  Extract game files, e.g. Art/2DArt
     ggpk-explorer export-data [OPTIONS]    Write RePoE-style semantic JSON dumps
+    ggpk-explorer refit [OPTIONS]          Re-derive drifted table layouts from an earlier patch
 
 EXPORT OPTIONS:
     -o, --out <DIR>        Output folder (default: ./export)
@@ -99,8 +100,16 @@ EXPORT-DATA OPTIONS:
         --images           Also export item, skill and buff icons as png + webp
         --trade-stats      Add official trade site search ids to the stat text
         --flat             Write into <DIR> itself, not a patch-version subfolder
+        --strip-null       Leave out keys with no value, shrinking every dump
         --version <VER>    Name the patch instead of reading it from the install
         --poe1             Read a Path of Exile 1 install instead of PoE 2
+
+REFIT OPTIONS:
+        --old <VERSION>    The patch to carry column names from, read over the CDN (required)
+        --table <A,B,..>   Re-fit only these tables (default: the ones this patch broke)
+        --all              Re-fit every table in the schema, not just the broken ones
+        --write            Store the result in schema_overrides.json
+        --ggpk / --steam / --schema as above
     -l, --list             List module names and exit
         --ls <PREFIX>      List indexed game files under a path prefix and exit
         --cat <PATH>       Write one game file to stdout (text) and exit
@@ -150,6 +159,7 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
             "--images" => options.images = true,
             "--trade-stats" => options.trade_stats = true,
             "--flat" => options.flat = true,
+            "--strip-null" => options.strip_null = true,
             "--version" => options.version = Some(value(&mut i)?),
             "--poe1" => is_poe2 = false,
             "-l" | "--list" => {
@@ -208,7 +218,13 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
 
     if let Some(path) = cat {
         use crate::dat::relational::FileSource;
-        let bytes = files.fetch(&path).ok_or_else(|| format!("{} is not in the index", path))?;
+        let bytes = files.fetch(&path).ok_or_else(|| {
+            if files.exists(&path) {
+                format!("{} is indexed but its bundle could not be read", path)
+            } else {
+                format!("{} is not in the index", path)
+            }
+        })?;
         print!("{}", crate::parsers::utils::decode_text_lossy(&bytes));
         return Ok(());
     }
@@ -373,6 +389,21 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
 
 /// The game folder holding the logs: the one containing `Content.ggpk`, or the
 /// parent of a Steam `Bundles2` directory.
+/// Drops disk caches left over from an earlier patch before anything reads
+/// them. The GUI does this when it notices the patch change; a CLI run may be
+/// the first thing to touch the caches after an update.
+fn sync_caches_to_install(ggpk: Option<&str>, steam: Option<&str>) {
+    let Some(version) = install_root(ggpk, steam).as_deref().and_then(crate::data_export::detect_version)
+    else {
+        return;
+    };
+    match AppSettings::sync_cache_to_patch(&version) {
+        Ok(true) => println!("Patch {} — cleared caches built for an earlier patch", version),
+        Ok(false) => {}
+        Err(e) => println!("Could not clear the caches for patch {}: {}", version, e),
+    }
+}
+
 fn install_root(ggpk: Option<&str>, steam: Option<&str>) -> Option<std::path::PathBuf> {
     let path = ggpk.or(steam)?;
     std::path::Path::new(path).parent().map(|p| p.to_path_buf())
@@ -391,7 +422,18 @@ fn load_schema(path: Option<String>) -> Result<crate::dat::schema::Schema, Strin
         ));
     }
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
-    serde_json::from_str(&text).map_err(|e| format!("{}: {}", path.display(), e))
+    let mut schema: crate::dat::schema::Schema =
+        serde_json::from_str(&text).map_err(|e| format!("{}: {}", path.display(), e))?;
+
+    // Hand-edited and re-fitted layouts win over the community schema, the same
+    // way they do in the viewer — otherwise a table put right after a patch
+    // would still be read the broken way here.
+    let overrides = crate::dat::overrides::Overrides::load(&crate::dat::overrides::Overrides::default_path());
+    if !overrides.is_empty() {
+        println!("Applying {} schema override(s)", overrides.tables.len());
+        schema.apply_overrides(&overrides.tables);
+    }
+    Ok(schema)
 }
 
 type OpenedSource = (
@@ -411,6 +453,7 @@ fn open_source(
 
     if let Some(path) = ggpk {
         println!("Opening GGPK at {}", path);
+        sync_caches_to_install(Some(&path), None);
         let reader = Arc::new(GgpkReader::open(&path).map_err(|e| format!("Failed to open GGPK: {}", e))?);
         let cache = AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
         if let Ok(index) = crate::bundles::index::Index::load_from_cache(&cache) {
@@ -430,6 +473,7 @@ fn open_source(
 
     if let Some(dir) = steam {
         println!("Opening Steam bundles at {}", dir);
+        sync_caches_to_install(None, Some(&dir));
         let loader = crate::bundles::steam::SteamBundleLoader::new(std::path::PathBuf::from(&dir));
         let bytes = loader.load_index_bytes().map_err(|e| format!("Failed to read _.index.bin: {}", e))?;
         let index = read_index_bundle(&bytes)?;
@@ -451,4 +495,177 @@ fn read_index_bundle(data: &[u8]) -> Result<crate::bundles::index::Index, String
         .map_err(|e| format!("Bundle header error: {}", e))?;
     let decompressed = bundle.decompress(&mut cursor).map_err(|e| format!("Decompress error: {}", e))?;
     crate::bundles::index::Index::read(&decompressed).map_err(|e| format!("Index parse error: {}", e))
+}
+
+/// Parses `refit` arguments: re-derives drifted table layouts from the patch
+/// before them and, on request, stores the result as a schema override.
+pub fn run_refit(args: &[String]) -> Result<(), String> {
+    use crate::data_export::source::GameFiles;
+    use crate::dat::relational::FileSource;
+    use std::sync::Arc;
+
+    let mut old_version: Option<String> = None;
+    let mut only: Vec<String> = Vec::new();
+    let mut write = false;
+    let mut all = false;
+    let mut ggpk: Option<String> = None;
+    let mut steam: Option<String> = None;
+    let mut schema_path: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let value = |i: &mut usize| -> Result<String, String> {
+            *i += 1;
+            args.get(*i).cloned().ok_or_else(|| format!("{} needs a value", arg))
+        };
+        match arg {
+            "--old" => old_version = Some(value(&mut i)?),
+            "--table" => only.extend(value(&mut i)?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())),
+            "--ggpk" => ggpk = Some(value(&mut i)?),
+            "--steam" => steam = Some(value(&mut i)?),
+            "--schema" => schema_path = Some(value(&mut i)?),
+            "--write" => write = true,
+            "--all" => all = true,
+            "-h" | "--help" => {
+                println!("{}", USAGE);
+                return Ok(());
+            }
+            other => return Err(format!("Unknown option {}\n\n{}", other, USAGE)),
+        }
+        i += 1;
+    }
+
+    let old_version = old_version.ok_or(
+        "refit needs --old <VERSION>: the patch to learn the layout from, e.g. --old 4.5.4.11",
+    )?;
+    let settings = AppSettings::load();
+    let schema = load_schema(schema_path.or_else(|| settings.schema_local_path.clone()))?;
+
+    let ggpk = ggpk.or_else(|| if steam.is_some() { None } else { settings.ggpk_path.clone() });
+    let steam = steam.or_else(|| if ggpk.is_some() { None } else { settings.steam_path.clone() });
+    let (reader, steam_loader, index) = open_source(ggpk, steam, None)?;
+    let new_files = GameFiles::new(reader, Arc::new(index), steam_loader, None);
+
+    println!("Reading patch {} from the CDN to compare against", old_version);
+    let cdn = crate::bundles::cdn::CdnBundleLoader::new(
+        &AppSettings::get_app_data_dir().join("cache"),
+        Some(&old_version),
+    );
+    let old_index = cdn.fetch_index().map_err(|e| format!("Failed to fetch the CDN index: {}", e))?;
+    let old_files = GameFiles::new(None, Arc::new(old_index), None, Some(cdn));
+
+    // Which tables to work on: the ones this patch broke, unless told otherwise.
+    let mut names: Vec<String> = Vec::new();
+    if !only.is_empty() {
+        names = only;
+    } else {
+        for path in new_files.list_dir("data/balance/") {
+            let lower = path.to_ascii_lowercase();
+            let Some(rest) = lower.strip_prefix("data/balance/") else { continue };
+            if rest.contains('/') || !rest.ends_with(".datc64") {
+                continue;
+            }
+            let stem = rest.trim_end_matches(".datc64");
+            let Some(def) = schema.find_table(stem, true) else { continue };
+            let Some(bytes) = new_files.fetch(&lower) else { continue };
+            let Ok(dat) = crate::dat::reader::DatReader::new(bytes, &lower) else { continue };
+            if dat.row_count < 4 {
+                continue;
+            }
+            if all || crate::dat::analysis::check_fit(&dat, def, 40).is_broken() {
+                names.push(def.name.clone());
+            }
+        }
+        names.sort();
+    }
+
+    if names.is_empty() {
+        println!("Nothing to re-fit: every table still matches the schema.");
+        return Ok(());
+    }
+    println!("Re-fitting {} table(s): {}\n", names.len(), names.join(", "));
+
+    let mut overrides = crate::dat::overrides::Overrides::load(&crate::dat::overrides::Overrides::default_path());
+    let mut written = 0;
+    for name in &names {
+        let Some(def) = schema.find_table(name, true) else {
+            println!("{}: not in the schema, so there are no names to carry", name);
+            continue;
+        };
+        let file = format!("data/balance/{}.datc64", name.to_ascii_lowercase());
+        let (Some(old_bytes), Some(new_bytes)) = (old_files.fetch(&file), new_files.fetch(&file)) else {
+            println!("{}: not in both patches", name);
+            continue;
+        };
+        let (old_dat, new_dat) = (
+            crate::dat::reader::DatReader::new(old_bytes, &file).map_err(|e| e.to_string())?,
+            crate::dat::reader::DatReader::new(new_bytes, &file).map_err(|e| e.to_string())?,
+        );
+        let before = crate::dat::analysis::check_fit(&old_dat, def, 40);
+        if before.is_broken() {
+            let overridden = overrides.tables.iter().any(|t| t.name.eq_ignore_ascii_case(name));
+            println!(
+                "{}: the schema does not fit patch {} either — nothing to carry{}",
+                name,
+                old_version,
+                match overridden {
+                    true => " (this table already has a re-fitted override; delete it to derive one afresh)",
+                    false => "",
+                }
+            );
+            continue;
+        }
+        match crate::dat::refit::carry_across_patch(&old_dat, def, &new_dat) {
+            Ok(report) => {
+                println!("{}", report.summary());
+                let by_value = report.carried.iter().filter(|c| !c.by_position).count();
+                println!(
+                    "  {} matched on their values, {} placed by the bytes their neighbours left over",
+                    by_value,
+                    report.carried.len() - by_value
+                );
+                for column in &report.carried {
+                    if column.old_offset == column.new_offset && !column.by_position {
+                        continue;
+                    }
+                    let how = match column.by_position {
+                        true => "by position".to_string(),
+                        false => format!(
+                            "{:.0}% of rows agree, {} distinct values",
+                            column.agreement * 100.0, column.distinct
+                        ),
+                    };
+                    println!(
+                        "  {:>4} → {:<4} {:<40} ({})",
+                        column.old_offset, column.new_offset, column.name, how
+                    );
+                }
+                let after = crate::dat::analysis::check_fit(&new_dat, &report.table, 40);
+                match after.is_broken() {
+                    true => println!("  ! the re-fitted layout still reads impossible values: {}", after.summary()),
+                    false => {
+                        println!("  the re-fitted layout reads cleanly");
+                        if write {
+                            overrides.upsert(report.table.clone());
+                            written += 1;
+                        }
+                    }
+                }
+                println!();
+            }
+            Err(e) => println!("{}: {}\n", name, e),
+        }
+    }
+
+    if write && written > 0 {
+        let path = crate::dat::overrides::Overrides::default_path();
+        overrides.save(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+        println!("Wrote {} table(s) to {}", written, path.display());
+    } else if write {
+        println!("Nothing was written: no table re-fitted cleanly.");
+    } else if written == 0 {
+        println!("Re-run with --write to store these layouts as schema overrides.");
+    }
+    Ok(())
 }

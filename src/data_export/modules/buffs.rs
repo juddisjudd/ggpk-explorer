@@ -31,7 +31,7 @@ pub fn buffs(ctx: &Ctx) -> Result<(), String> {
     let table = ctx.table("BuffDefinitions")?;
     let stats_column = table.require(&["Stats", "StatsKeys"])?;
     let visual_column = table.require(&["BuffVisual", "BuffVisualsKey"])?;
-    let templates = ctx.rr.table("BuffTemplates");
+    let templates = ctx.optional_table("BuffTemplates");
     let by_definition = group_by_key(ctx, "BuffTemplates", "BuffDefinition");
     let template_users = template_users(ctx);
     let translations = ctx.translations("stat_descriptions");
@@ -112,12 +112,12 @@ pub fn buffs(ctx: &Ctx) -> Result<(), String> {
         })
         .collect();
 
-    json::write(ctx.out, "buffs", &J::Obj(root))
+    ctx.write("buffs", &J::Obj(root))
 }
 
 /// Row indices of `table` grouped by the row `column` points at.
 fn group_by_key(ctx: &Ctx, table: &str, column: &str) -> HashMap<usize, Vec<usize>> {
-    let Some(table) = ctx.rr.table(table) else { return HashMap::new() };
+    let Some(table) = ctx.optional_table(table) else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
     for row in table.rows() {
         if let Some(target) = row.key(column) {
@@ -138,7 +138,7 @@ fn template_users(ctx: &Ctx) -> HashMap<usize, Vec<(&'static str, String)>> {
         ("UltimatumModifiers", "BuffTemplates", true),
     ];
     for (name, column, is_list) in sources {
-        let Some(table) = ctx.rr.table(name) else { continue };
+        let Some(table) = ctx.optional_table(name) else { continue };
         if !table.has_col(column) {
             continue;
         }
@@ -157,8 +157,8 @@ fn template_users(ctx: &Ctx) -> HashMap<usize, Vec<(&'static str, String)>> {
 /// that puts it on screen.
 pub fn buff_visuals(ctx: &Ctx) -> Result<(), String> {
     let table = ctx.table("BuffVisuals")?;
-    let definitions = ctx.rr.table("BuffDefinitions");
-    let templates = ctx.rr.table("BuffTemplates");
+    let definitions = ctx.optional_table("BuffDefinitions");
+    let templates = ctx.optional_table("BuffTemplates");
     let by_definition = group_by_key(ctx, "BuffDefinitions", "BuffVisual");
     let by_template = group_by_key(ctx, "BuffTemplates", "BuffVisual");
 
@@ -212,7 +212,7 @@ pub fn buff_visuals(ctx: &Ctx) -> Result<(), String> {
             (row.id().to_string(), entry)
         })
         .collect();
-    json::write(ctx.out, "buff_visuals", &J::Obj(root))
+    ctx.write("buff_visuals", &J::Obj(root))
 }
 
 /// A custom buff frame is a rectangle of a shared UI sheet rather than a file
@@ -291,7 +291,7 @@ pub fn audio(ctx: &Ctx) -> Result<(), String> {
         .collect();
 
     // Character-specific lines live in a second table, keyed by the same ids.
-    if let Some(events) = ctx.rr.table("CharacterEventTextAudio") {
+    if let Some(events) = ctx.optional_table("CharacterEventTextAudio") {
         for row in events.rows() {
             let event = ctx.rr.deref_id(row, "Event");
             let character = ctx.rr.deref(row, "Character").map(|c| c.row().string("Name"));
@@ -316,5 +316,5 @@ pub fn audio(ctx: &Ctx) -> Result<(), String> {
         }
     }
 
-    json::write(ctx.out, "audio", &J::Obj(root))
+    ctx.write("audio", &J::Obj(root))
 }

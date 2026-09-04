@@ -108,6 +108,7 @@ pub fn base_items(ctx: &Ctx) -> Result<(), String> {
     let currency = by_base(ctx, "CurrencyItems");
     let requirements = by_base(ctx, "AttributeRequirements");
     let skills = inherent_skills(ctx);
+    let implicit_text = ctx.table("Mods").map(|mods| super::mods::ModText::new(&mods)).ok();
     let states: HashMap<&str, &str> = RELEASE_STATES.iter().copied().collect();
 
     let mut inherited = InheritedTags::default();
@@ -140,10 +141,27 @@ pub fn base_items(ctx: &Ctx) -> Result<(), String> {
                 .build()
         });
 
+        let implicits = ctx.rr.deref_list(row, "Implicit_Mods");
+
         let entry = Obj::new()
             .set("domain", text(domain_of(row)))
             .set("drop_level", int(drop_level))
-            .set("implicits", json::strings(ctx.rr.deref_list_ids(row, "Implicit_Mods")))
+            .set("implicits", json::strings(implicits.iter().map(|m| m.id()).collect::<Vec<_>>()))
+            .set(
+                "implicit_text",
+                json::strings(
+                    implicits
+                        .iter()
+                        .map(|m| {
+                            let lines = implicit_text
+                                .as_ref()
+                                .map(|r| r.lines(ctx, m.row()))
+                                .unwrap_or_default();
+                            super::mods::display_text(&lines.join("\n"))
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+            )
             .set("inventory_height", int(row.int("Height")))
             .set("inventory_width", int(row.int("Width")))
             .set("inherits_from", text(row.str("InheritsFrom")))
@@ -173,9 +191,9 @@ pub fn base_items(ctx: &Ctx) -> Result<(), String> {
         root.push((id, entry));
     }
 
-    json::write(ctx.out, "base_items", &J::Obj(root))?;
+    ctx.write("base_items", &J::Obj(root))?;
     for (class, items) in by_class {
-        json::write(ctx.out, &format!("base_items/{}", class), &J::Obj(items))?;
+        ctx.write(&format!("base_items/{}", class), &J::Obj(items))?;
     }
     Ok(())
 }
@@ -260,7 +278,7 @@ fn properties(
 }
 
 fn table_row(ctx: &Ctx, table: &str, index: usize) -> Option<Ref> {
-    let table = ctx.rr.table(table)?;
+    let table = ctx.optional_table(table)?;
     (index < table.len()).then_some(Ref { table, index })
 }
 
@@ -275,9 +293,9 @@ fn export_art(ctx: &Ctx, visual: Row<'_>) {
 /// these tables point at the item by row and others by its id string, so both
 /// are resolved back to the row.
 fn by_base(ctx: &Ctx, name: &str) -> HashMap<usize, usize> {
-    let Some(table) = ctx.rr.table(name) else { return HashMap::new() };
+    let Some(table) = ctx.optional_table(name) else { return HashMap::new() };
     let Some(column) = table.pick(&["BaseItemType", "BaseItemTypesKey"]) else { return HashMap::new() };
-    let bases = ctx.rr.table("BaseItemTypes");
+    let bases = ctx.optional_table("BaseItemTypes");
     let mut out = HashMap::new();
     for row in table.rows() {
         let base = row.key(column).or_else(|| {
@@ -293,7 +311,7 @@ fn by_base(ctx: &Ctx, name: &str) -> HashMap<usize, usize> {
 
 /// Skills an item grants just by being equipped, named by their gem's base item.
 fn inherent_skills(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
-    let Some(table) = ctx.rr.table("ItemInherentSkills") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("ItemInherentSkills") else { return HashMap::new() };
     let mut out = HashMap::new();
     for row in table.rows() {
         let Some(base) = row.key("BaseItemType") else { continue };
@@ -366,7 +384,7 @@ pub fn uniques(ctx: &Ctx) -> Result<(), String> {
 
     // The stash layout misses some unique art, so anything whose file name
     // says "unique" is written too — RePoE lists those separately.
-    if let Some(visuals) = ctx.rr.table("ItemVisualIdentity") {
+    if let Some(visuals) = ctx.optional_table("ItemVisualIdentity") {
         for visual in visuals.rows() {
             if visual.str("DDSFile").to_ascii_lowercase().contains("unique") {
                 export_art(ctx, visual);
@@ -374,7 +392,137 @@ pub fn uniques(ctx: &Ctx) -> Result<(), String> {
         }
     }
 
-    json::write(ctx.out, "uniques", &J::Obj(root))
+    ctx.write("uniques", &J::Obj(root))
+}
+
+/// An art id repeats its flavour id with trailing underscores, and a unique
+/// drawn several ways suffixes a letter — `FourUniqueRing33_a`. Every form
+/// names the one flavour entry.
+fn flavour_key(id: &str) -> String {
+    let trimmed = id.trim_end_matches('_');
+    let bytes = trimmed.as_bytes();
+    let stripped = match bytes.len() >= 2 {
+        true if bytes[bytes.len() - 2] == b'_' && bytes[bytes.len() - 1].is_ascii_lowercase() => {
+            &trimmed[..trimmed.len() - 2]
+        }
+        _ => trimmed,
+    };
+    stripped.trim_end_matches('_').to_string()
+}
+
+/// `unique_details.json` — what the client files say about a unique beyond its
+/// stash entry: flavour text, vendor price, where it came from, and the limit
+/// on wearing several at once. Keyed by the same row ids as `uniques.json`.
+///
+/// The mods a unique rolls are not here, because the game files do not say.
+/// They sit in `Mods.dat` under `generation_type: "unique"`, but nothing binds
+/// one to the item that carries it — see `docs/Data-Export.md`.
+pub fn unique_details(ctx: &Ctx) -> Result<(), String> {
+    let layout = ctx.table("UniqueStashLayout")?;
+
+    // One name can own several layout rows — Grip of Kulemak has five, one per
+    // art variant — so anything keyed by name feeds all of them.
+    let mut by_word: HashMap<usize, Vec<usize>> = HashMap::new();
+    for row in layout.rows() {
+        if let Some(word) = row.key("WordsKey") {
+            by_word.entry(word).or_default().push(row.index);
+        }
+    }
+    let spread = |table: &str, key: &str, read: &dyn Fn(Row<'_>) -> Option<J>| {
+        let mut out: HashMap<usize, J> = HashMap::new();
+        let Some(table) = ctx.optional_table(table) else { return out };
+        for row in table.rows() {
+            let (Some(word), Some(value)) = (row.key(key), read(row)) else { continue };
+            for &entry in by_word.get(&word).into_iter().flatten() {
+                out.insert(entry, value.clone());
+            }
+        }
+        out
+    };
+
+    let price = spread("UniqueGoldPrices", "Name", &|row| {
+        // Most rows are priced; an unpriced one says nothing, so it is dropped.
+        let value = row.int("Price");
+        (value > 0).then(|| int(value))
+    });
+    let origin = spread("UniqueOrigins", "Unique", &|row| {
+        ctx.rr.deref(row, "Origin").and_then(|o| json::opt_text(o.row().id()))
+    });
+    let jewel_limit = spread("UniqueJewelLimits", "JewelName", &|row| Some(int(row.int("Limit"))));
+    let flavour = flavour_by_art(ctx);
+    let legacies = mages_legacies(ctx);
+
+    let root = layout
+        .rows()
+        .map(|row| {
+            let name = ctx.rr.deref(row, "WordsKey").map(|w| w.row().string("Text2")).unwrap_or_default();
+            let art = ctx.rr.deref(row, "ItemVisualIdentityKey").map(|v| flavour_key(v.row().id()));
+            let entry = Obj::new()
+                .set("name", text(&name))
+                .set(
+                    "item_class",
+                    text(ctx.rr.deref(row, "UniqueStashTypesKey").map(|s| s.row().string("Id")).unwrap_or_default()),
+                )
+                .or_null("flavour_text", art.and_then(|key| flavour.get(&key).cloned()).map(text))
+                .or_null("gold_price", price.get(&row.index).cloned())
+                .or_null("origin", origin.get(&row.index).cloned())
+                .or_null("jewel_limit", jewel_limit.get(&row.index).cloned())
+                .or_null("mages_legacies", legacies.as_ref().filter(|_| name == MAGES_LEGACY_ITEM).cloned())
+                .build();
+            (row.index.to_string(), entry)
+        })
+        .collect();
+
+    ctx.write("unique_details", &J::Obj(root))
+}
+
+/// Flavour text under the art id that names it, with anything two entries
+/// disagree on left out rather than guessed at.
+fn flavour_by_art(ctx: &Ctx) -> HashMap<String, String> {
+    let Some(table) = ctx.optional_table("FlavourText") else { return HashMap::new() };
+    let mut out: HashMap<String, Option<String>> = HashMap::new();
+    for row in table.rows() {
+        // The game writes these with CRLF; `flavour.json` keeps them as found,
+        // but nothing downstream of here wants the carriage returns.
+        let body = row.str("Text").replace("\r\n", "\n");
+        if body.is_empty() {
+            continue; // Tabula Rasa, fittingly, carries no line at all.
+        }
+        out.entry(flavour_key(row.id()))
+            .and_modify(|held| {
+                if held.as_deref() != Some(body.as_str()) {
+                    *held = None;
+                }
+            })
+            .or_insert(Some(body));
+    }
+    out.into_iter().filter_map(|(k, v)| Some((k, v?))).collect()
+}
+
+/// The unique whose mods read `All Mage's Legacies…`. `UniqueMagesLegacy`
+/// names no item, so the one item that uses it is named here.
+const MAGES_LEGACY_ITEM: &str = "Mageblood";
+
+/// The flask legacies Mageblood grants, each with the line it draws.
+fn mages_legacies(ctx: &Ctx) -> Option<J> {
+    let table = ctx.optional_table("UniqueMagesLegacy")?;
+    let lookup = ctx.translations("stat_descriptions");
+    let entries: Vec<J> = table
+        .rows()
+        .map(|row| {
+            let ids = ctx.rr.deref_list_ids(row, "Stats");
+            let values: Vec<i32> = row.list_int("StatValues").into_iter().map(|v| v as i32).collect();
+            let lines = lookup.translate_grouped(&ids, &values);
+            Obj::new()
+                .set("id", text(row.str("Name")))
+                .set("name", text(super::mods::display_text(row.str("DisplayText"))))
+                .set("stats", json::strings(ids))
+                .set("stat_values", J::Arr(values.iter().map(|v| int(*v as i64)).collect()))
+                .set("text", text(super::mods::display_text(&lines.join("\n"))))
+                .build()
+        })
+        .collect();
+    (!entries.is_empty()).then(|| J::Arr(entries))
 }
 
 pub fn augments(ctx: &Ctx) -> Result<(), String> {
@@ -462,6 +610,24 @@ pub fn augments(ctx: &Ctx) -> Result<(), String> {
     }
     root.sort_by(|a, b| a.0.cmp(&b.0));
 
-    json::write(ctx.out, "augments", &J::Obj(root))
+    ctx.write("augments", &J::Obj(root))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn art_ids_reduce_to_the_flavour_entry_they_name() {
+        // The plain form, and the same id padded with underscores.
+        assert_eq!(flavour_key("FourUniqueAmulet15"), "FourUniqueAmulet15");
+        assert_eq!(flavour_key("FourUniqueAmulet15_"), "FourUniqueAmulet15");
+        assert_eq!(flavour_key("FourUniqueBodyDex1___"), "FourUniqueBodyDex1");
+        // One unique drawn several ways suffixes a letter.
+        assert_eq!(flavour_key("FourUniqueRing33_a"), "FourUniqueRing33");
+        assert_eq!(flavour_key("FourUniqueRing33__e"), "FourUniqueRing33");
+        // A letter that is part of the name is not a variant suffix.
+        assert_eq!(flavour_key("FourUniqueBreach4b"), "FourUniqueBreach4b");
+    }
+}

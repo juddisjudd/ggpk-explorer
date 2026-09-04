@@ -43,7 +43,7 @@ fn attribute_requirement(level: i64, weight: i64) -> i64 {
 /// Gem level to the character level it asks for, per `ItemExperienceTypes`
 /// row. The curve starts at zero, which the client shows as level one.
 fn level_curves(ctx: &Ctx) -> HashMap<usize, Vec<(i64, i64)>> {
-    let Some(table) = ctx.rr.table("ItemExperiencePerLevel") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("ItemExperiencePerLevel") else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<(i64, i64)>> = HashMap::new();
     for row in table.rows() {
         if let Some(kind) = row.key("ItemExperienceType") {
@@ -82,7 +82,7 @@ pub fn skill_gems(ctx: &Ctx) -> Result<(), String> {
 
             let support = supports.get(&gem.index).copied();
             let base_icon = if gem_type == "support" {
-                support.and_then(|i| ctx.rr.table("SupportGems").and_then(|t| t.row(i).map(|r| r.string("Icon"))))
+                support.and_then(|i| ctx.optional_table("SupportGems").and_then(|t| t.row(i).map(|r| r.string("Icon"))))
             } else {
                 ctx.rr
                     .deref(effect, "GrantedEffect")
@@ -162,7 +162,7 @@ pub fn skill_gems(ctx: &Ctx) -> Result<(), String> {
 
             if gem_type == "support" {
                 let lineage = support
-                    .and_then(|i| ctx.rr.table("SupportGems").and_then(|t| t.row(i).map(|r| r.bool("IsLineage"))))
+                    .and_then(|i| ctx.optional_table("SupportGems").and_then(|t| t.row(i).map(|r| r.bool("IsLineage"))))
                     .unwrap_or(false);
                 entry = entry.set("is_lineage", J::Bool(lineage));
             } else {
@@ -176,12 +176,12 @@ pub fn skill_gems(ctx: &Ctx) -> Result<(), String> {
     root.sort_by(|a, b| a.0.cmp(&b.0));
     root.dedup_by(|a, b| a.0 == b.0);
 
-    json::write(ctx.out, "skill_gems", &J::Obj(root))
+    ctx.write("skill_gems", &J::Obj(root))
 }
 
 /// `SupportGems` row for each skill gem it describes.
 fn support_gems(ctx: &Ctx) -> HashMap<usize, usize> {
-    let Some(table) = ctx.rr.table("SupportGems") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("SupportGems") else { return HashMap::new() };
     let mut out = HashMap::new();
     for row in table.rows() {
         if let Some(gem) = row.key("SkillGem") {
@@ -193,7 +193,7 @@ fn support_gems(ctx: &Ctx) -> HashMap<usize, usize> {
 
 /// Base item ids of the supports the client suggests for each skill gem.
 fn recommended_supports(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
-    let Some(table) = ctx.rr.table("SkillGemSupports") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("SkillGemSupports") else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<String>> = HashMap::new();
     for row in table.rows() {
         let Some(gem) = row.key("SkillGem") else { continue };
@@ -235,7 +235,7 @@ pub fn ascendancies(ctx: &Ctx) -> Result<(), String> {
                 .set("art", super::passives::ui_art(ctx, ctx.rr.deref(row, "UIArt").as_ref()));
 
             if row.key("BaseAscendancy").is_some() {
-                let table = ctx.rr.table("AscendancyPassiveSkillOverrides");
+                let table = ctx.optional_table("AscendancyPassiveSkillOverrides");
                 let replacements = overrides.get(&row.index).map(Vec::as_slice).unwrap_or_default();
                 entry = entry.set(
                     "passive_overrides",
@@ -257,11 +257,11 @@ pub fn ascendancies(ctx: &Ctx) -> Result<(), String> {
         .collect::<Vec<_>>();
 
     root.sort_by(|a, b| a.0.cmp(&b.0));
-    json::write(ctx.out, "ascendancies", &J::Obj(root))
+    ctx.write("ascendancies", &J::Obj(root))
 }
 
 fn ascendancy_overrides(ctx: &Ctx) -> HashMap<usize, Vec<usize>> {
-    let Some(table) = ctx.rr.table("AscendancyPassiveSkillOverrides") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("AscendancyPassiveSkillOverrides") else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
     for row in table.rows() {
         if let Some(asc) = row.key("AscendancyToOverrideFor") {
@@ -315,7 +315,7 @@ pub fn skills(ctx: &Ctx) -> Result<(), String> {
         let mut level_keys: Vec<String> = Vec::new();
         let mut level_values: Vec<J> = Vec::new();
         let mut rows: Vec<usize> = levels_by_effect.get(&effect.index).cloned().unwrap_or_default();
-        let per_level_table = ctx.rr.table("GrantedEffectsPerLevel");
+        let per_level_table = ctx.optional_table("GrantedEffectsPerLevel");
         rows.sort_by_key(|&i| per_level_table.as_ref().and_then(|t| t.row(i)).map(|r| r.int("Level")).unwrap_or(0));
         for index in rows {
             let Some(level) = per_level_table.as_ref().and_then(|t| t.row(index)) else { continue };
@@ -351,7 +351,7 @@ pub fn skills(ctx: &Ctx) -> Result<(), String> {
     }
     root.sort_by(|a, b| a.0.cmp(&b.0));
 
-    json::write(ctx.out, "skills", &J::Obj(root))
+    ctx.write("skills", &J::Obj(root))
 }
 
 fn types(ctx: &Ctx, row: Row<'_>, column: &str) -> Option<J> {
@@ -404,7 +404,7 @@ fn active_skill(ctx: &Ctx, row: Row<'_>, totems: &HashMap<i64, f64>) -> J {
 /// A totem skill is one the client has a totem monster for; the monster's life
 /// multiplier is what the totem is worth.
 fn skill_totem_multipliers(ctx: &Ctx) -> HashMap<i64, f64> {
-    let Some(table) = ctx.rr.table("SkillTotemVariations") else { return HashMap::new() };
+    let Some(table) = ctx.optional_table("SkillTotemVariations") else { return HashMap::new() };
     let mut out = HashMap::new();
     for row in table.rows() {
         let Some(monster) = ctx.rr.deref(row, "MonsterVarietiesKey") else { continue };
@@ -517,7 +517,7 @@ fn stat_set(
     quality_rows: &[usize],
 ) -> J {
     let (file_name, translations) = pick_translation_file(ctx, skill_id, position);
-    let per_level_table = ctx.rr.table("GrantedEffectStatSetsPerLevel");
+    let per_level_table = ctx.optional_table("GrantedEffectStatSetsPerLevel");
 
     let order = |index: usize| -> i64 {
         per_level_table.as_ref().and_then(|t| t.row(index)).map(|r| r.int("GemLevel")).unwrap_or(0)
@@ -727,7 +727,7 @@ fn quality_stats(
     rows: &[usize],
     position: usize,
 ) -> Quality {
-    let table = ctx.rr.table("GrantedEffectQualityStats");
+    let table = ctx.optional_table("GrantedEffectQualityStats");
     let mut out = Quality::default();
     for &index in rows {
         let Some(row) = table.as_ref().and_then(|t| t.row(index)) else { continue };
@@ -808,7 +808,7 @@ fn quality_bonus(
 
 /// Row indices of `table` grouped by the row `column` points at.
 fn group_by(ctx: &Ctx, table: &str, column: &str) -> HashMap<usize, Vec<usize>> {
-    let Some(table) = ctx.rr.table(table) else { return HashMap::new() };
+    let Some(table) = ctx.optional_table(table) else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
     for row in table.rows() {
         if let Some(target) = row.key(column) {

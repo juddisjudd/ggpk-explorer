@@ -11,6 +11,9 @@ pub const TREE_CACHE_FILENAME: &str = "bundles2.tree.v2.cache";
 /// Tree cache built with shader-cache entries filtered out (see `AppSettings::hide_shader_cache`).
 pub const TREE_CACHE_NOSHADER_FILENAME: &str = "bundles2.tree.v2.noshader.cache";
 
+/// Filename recording which patch the disk caches were built for.
+pub const CACHE_STAMP_FILENAME: &str = "cache.patch";
+
 pub fn tree_cache_filename(hide_shader_cache: bool) -> &'static str {
     if hide_shader_cache { TREE_CACHE_NOSHADER_FILENAME } else { TREE_CACHE_FILENAME }
 }
@@ -287,6 +290,33 @@ impl AppSettings {
         }
         
         size
+    }
+
+    /// Records which patch the caches now hold, so a later run can tell whether
+    /// they still describe the installed game.
+    pub fn stamp_cache_patch(version: &str) -> std::io::Result<()> {
+        std::fs::write(Self::get_app_data_dir().join(CACHE_STAMP_FILENAME), version)
+    }
+
+    /// Clears the disk caches unless they were already built for `version`, and
+    /// re-stamps them either way. The index, tree and CDN caches key on file
+    /// names alone, and a patch rewrites bundle contents under unchanged names,
+    /// so carrying them across a patch reads back wrong data rather than merely
+    /// stale data. Returns whether anything was cleared.
+    pub fn sync_cache_to_patch(version: &str) -> std::io::Result<bool> {
+        let stamped = std::fs::read_to_string(Self::get_app_data_dir().join(CACHE_STAMP_FILENAME)).ok();
+        let stamped = stamped.as_deref().map(str::trim);
+        if stamped == Some(version) {
+            return Ok(false);
+        }
+        // Caches predating the stamp: the saved patch version is the only other
+        // record of what they were built against, so keep them only when it agrees.
+        let adopt = stamped.is_none() && Self::load().poe2_patch_version == version;
+        if !adopt {
+            Self::clear_cache()?;
+        }
+        Self::stamp_cache_patch(version)?;
+        Ok(!adopt)
     }
 
     pub fn clear_cache() -> std::io::Result<()> {

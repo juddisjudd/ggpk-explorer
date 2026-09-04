@@ -30,6 +30,8 @@ pub struct LoadedTable {
     pub name: String,
     pub def: Table,
     pub reader: DatReader,
+    /// Whether this patch still lays the table out the way the schema says.
+    pub fit: crate::dat::analysis::FitReport,
     rows: Vec<Vec<DatValue>>,
     cols: HashMap<String, usize>,
     by_id: HashMap<String, usize>,
@@ -55,7 +57,8 @@ impl LoadedTable {
                 }
             }
         }
-        Self { name: name.to_string(), def, reader, rows, cols, by_id }
+        let fit = crate::dat::analysis::check_fit(&reader, &def, 40);
+        Self { name: name.to_string(), def, reader, rows, cols, by_id, fit }
     }
 
     pub fn len(&self) -> usize {

@@ -11,6 +11,8 @@ pub struct DataExportWindow {
     modules: Vec<(&'static str, &'static str, bool)>,
     images: bool,
     trade_stats: bool,
+    /// Leave null-valued keys out of the JSON.
+    strip_null: bool,
     /// Put the export in a folder named after the patch.
     versioned: bool,
     /// Patch read from the install, if the client log named one.
@@ -27,6 +29,7 @@ impl Default for DataExportWindow {
                 .collect(),
             images: false,
             trade_stats: false,
+            strip_null: false,
             versioned: true,
             version: None,
         }
@@ -54,6 +57,7 @@ impl DataExportWindow {
             trade_stats: self.trade_stats,
             version: self.versioned.then(|| self.version.clone()).flatten(),
             flat: !self.versioned,
+            strip_null: self.strip_null,
         }
     }
 
@@ -96,7 +100,12 @@ impl DataExportWindow {
                 modal_section(ui, "DESTINATION");
                 match &self.version {
                     Some(version) => {
-                        ui.checkbox(&mut self.versioned, format!("Put it in a folder named {}", version));
+                        let folder = self.options().folder_name(version);
+                        ui.checkbox(&mut self.versioned, format!("Put it in a folder named {}", folder))
+                            .on_hover_text(
+                                "A stripped export lands in its own folder, so it sits beside the \
+                                 full one instead of overwriting it.",
+                            );
                     }
                     None => {
                         ui.add_enabled(false, egui::Checkbox::new(&mut false, "Patch folder"));
@@ -120,6 +129,13 @@ impl DataExportWindow {
                         "Looks each stat's wording up on the official trade site and records the ids \
                          it searches under, so a mod can be turned into a trade filter. \
                          Matches about 400 stats; needs the site to be reachable.",
+                    );
+                ui.checkbox(&mut self.strip_null, "Leave out keys with no value")
+                    .on_hover_text(
+                        "Drops every null from the JSON, so an entry lists only what it has — an \
+                         amulet stops carrying the 28 weapon and armour fields it has no use for. \
+                         Halves base_items.json and takes about 14% off the whole export. Off by \
+                         default, because the published files keep the nulls.",
                     );
 
                 ui.separator();
@@ -198,6 +214,15 @@ mod tests {
         let mut w = window();
         w.modules.iter_mut().for_each(|(name, _, on)| *on = *name == "mods");
         assert_eq!(w.options().only, vec!["mods".to_string()]);
+    }
+
+    #[test]
+    fn a_stripped_export_gets_its_own_patch_folder() {
+        let mut w = window();
+        assert_eq!(w.options().folder_name("4.5.4.11"), "4.5.4.11");
+        w.strip_null = true;
+        assert_eq!(w.options().folder_name("4.5.4.11"), "4.5.4.11-stripped");
+        assert!(w.options().strip_null);
     }
 
     #[test]

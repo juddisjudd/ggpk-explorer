@@ -11,6 +11,7 @@ pub mod source;
 pub mod statics;
 
 pub use crate::dat::stat_handlers;
+use json::J;
 
 
 use crate::dat::relational::RelationalReader;
@@ -32,6 +33,21 @@ pub struct DataExportOptions {
     pub version: Option<String>,
     /// Write straight into the chosen folder, without a version subfolder.
     pub flat: bool,
+    /// Drop null-valued keys from every dump, so an entry lists only what it
+    /// has. Off by default — the published files keep them.
+    pub strip_null: bool,
+}
+
+impl DataExportOptions {
+    /// The folder a run lands in. A stripped export is kept beside the full
+    /// one rather than on top of it — the two are the same patch in two
+    /// shapes, and overwriting one with the other loses data silently.
+    pub fn folder_name(&self, version: &str) -> String {
+        match self.strip_null {
+            true => format!("{}-stripped", version),
+            false => version.to_string(),
+        }
+    }
 }
 
 /// The patch an install is on, read from the client log it writes on every
@@ -94,6 +110,8 @@ pub struct Ctx<'a> {
     csd: std::cell::RefCell<
         std::collections::HashMap<String, Option<std::rc::Rc<crate::dat::csd::CsdFile>>>,
     >,
+    /// Tables a module asked for and had to go without.
+    skipped: std::cell::RefCell<Vec<String>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -112,6 +130,16 @@ impl<'a> Ctx<'a> {
             images: Default::default(),
             ui_images: Default::default(),
             csd: Default::default(),
+            skipped: Default::default(),
+        }
+    }
+
+    /// Writes one dump, applying whatever shaping the run asked for. Every
+    /// module goes through here so the options are honoured in one place.
+    pub fn write(&self, name: &str, value: &J) -> Result<(), String> {
+        match self.options.strip_null {
+            true => json::write(self.out, name, &json::without_nulls(value)),
+            false => json::write(self.out, name, value),
         }
     }
 
@@ -135,9 +163,46 @@ impl<'a> Ctx<'a> {
         sheet
     }
 
-    /// Loads a table or reports which module went without it.
+    /// Loads a table, refusing one whose layout this patch moved out from under
+    /// the schema. Reading it would not fail — it would return values taken from
+    /// the wrong bytes — so the module stops instead of writing fiction.
     pub fn table(&self, name: &str) -> Result<std::rc::Rc<crate::dat::relational::LoadedTable>, String> {
-        self.rr.table(name).ok_or_else(|| format!("table {} is missing from this install", name))
+        let table = self
+            .rr
+            .table(name)
+            .ok_or_else(|| format!("table {} is missing from this install", name))?;
+        if table.fit.is_broken() {
+            return Err(format!(
+                "table {} does not match the schema on this patch: {}. \
+                 Re-fit it with `ggpk-explorer refit --old <previous version>` \
+                 or wait for dat-schema to catch up",
+                name,
+                table.fit.summary()
+            ));
+        }
+        Ok(table)
+    }
+
+    /// A table a module can do without. Absent and unreadable come back the
+    /// same way — as `None` — but an unreadable one is recorded so the run
+    /// says what it left out rather than quietly thinning the dump.
+    pub fn optional_table(&self, name: &str) -> Option<std::rc::Rc<crate::dat::relational::LoadedTable>> {
+        let table = self.rr.table(name)?;
+        if table.fit.is_broken() {
+            let note = format!("{}: {}", name, table.fit.summary());
+            let mut skipped = self.skipped.borrow_mut();
+            if !skipped.contains(&note) {
+                skipped.push(note);
+            }
+            return None;
+        }
+        Some(table)
+    }
+
+    /// Tables left out of this run because their layout no longer matches the
+    /// schema.
+    pub fn skipped_tables(&self) -> Vec<String> {
+        self.skipped.borrow().clone()
     }
 
     /// Stat text for one description file, with everything it `include`s
@@ -234,7 +299,7 @@ pub fn run(
 
     // Each patch gets its own folder so exports do not overwrite each other.
     let out = match (&options.version, options.flat) {
-        (Some(version), false) => out.join(version),
+        (Some(version), false) => out.join(options.folder_name(version)),
         _ => out,
     };
     if let Err(e) = std::fs::create_dir_all(&out) {
@@ -274,11 +339,20 @@ pub fn run(
         }
     }
 
-    if !failures.is_empty() {
-        let log = out.join("data_export_errors.log");
-        let _ = std::fs::write(&log, failures.join("\n"));
+    let skipped = ctx.skipped_tables();
+    for note in &skipped {
+        eprintln!("data export: left out {}", note);
     }
 
+    if !failures.is_empty() || !skipped.is_empty() {
+        let log = out.join("data_export_errors.log");
+        let lines: Vec<String> = failures
+            .iter()
+            .cloned()
+            .chain(skipped.iter().map(|note| format!("left out {}", note)))
+            .collect();
+        let _ = std::fs::write(&log, lines.join("\n"));
+    }
     let _ = tx.send(ExportStatus::Complete {
         count: total - failures.len(),
         errors: failures.len(),

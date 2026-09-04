@@ -42,6 +42,7 @@ pub fn registry() -> Vec<Module> {
         ),
         module("base_items", "Every base item, plus one file per class", items::base_items),
         module("uniques", "Unique items from the stash layout", items::uniques),
+        module("unique_details", "Flavour text, price and origin per unique", items::unique_details),
         module("augments", "Soul cores and runes", items::augments),
         module("mods", "Every modifier with stats, weights and text", mods::mods),
         module("mods_by_base", "What can roll on each base item", mods::mods_by_base),

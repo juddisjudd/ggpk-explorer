@@ -270,6 +270,16 @@ impl ExplorerApp {
                     println!("GgpkReader::open took {:?}", start_open.elapsed());
                     
                     let reader = Arc::new(reader_inner);
+
+                    // A patch rewrites bundle contents under unchanged names, so
+                    // caches built for an earlier one describe this install wrongly.
+                    if let Some(version) = path_clone.parent().and_then(crate::data_export::detect_version) {
+                        match crate::settings::AppSettings::sync_cache_to_patch(&version) {
+                            Ok(true) => println!("Patch {} — cleared caches built for an earlier patch", version),
+                            Ok(false) => {}
+                            Err(e) => println!("Could not clear the caches for patch {}: {}", version, e),
+                        }
+                    }
                     
                     let mut bundle_index = None;
                     let mut raw_index: Option<crate::bundles::index::Index> = None;
@@ -1126,6 +1136,7 @@ impl eframe::App for ExplorerApp {
                             let result = match crate::settings::AppSettings::clear_cache() {
                                 Ok(()) => {
                                     println!("Cleared disk cache after patch change: {} -> {}", old_version, version);
+                                    let _ = crate::settings::AppSettings::stamp_cache_patch(&version);
                                     Ok(format!("Updated PoE 2 patch version to {} (cache cleared{})", version, snapshot_note))
                                 }
                                 Err(e) => {
