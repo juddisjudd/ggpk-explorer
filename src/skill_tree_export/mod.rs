@@ -19,7 +19,7 @@ use crate::dat::psg::PsgFile;
 use crate::dat::schema::Schema;
 use crate::export::ExportStatus;
 use crate::ggpk::reader::GgpkReader;
-use crate::ui::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo};
+use crate::ui::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo, ATLAS_MAIN_TREE_BG_PATH};
 use crate::ui::content_view::{build_skill_graph_db, dds_path_candidates, decompress_bundle, extract_bundle_file_sync};
 use crate::ui::skill_tree_art::{FrameArt, NodeFrameKind};
 use crate::ui::skill_tree_layout::{self, ASCENDANCY_PLATE_SIZE, CLASS_ILLUSTRATION_SIZE, CLASS_START_MOUNT_RADIUS, CLASS_START_RING_RADIUS, MAIN_CIRCLE_SIZE};
@@ -170,7 +170,7 @@ pub struct ExportSummary {
     pub message: String,
 }
 
-const STEPS: usize = 14;
+const STEPS: usize = 15;
 
 fn export_tree(
     source: &TreeExportSource,
@@ -264,6 +264,12 @@ fn export_tree(
     files += write("mastery-effect-active", &mastery_active, sheets::square_width(&mastery_active), &mut sheet_jsons)?;
     files += write("mastery-effect-disabled", &mastery_inactive, sheets::square_width(&mastery_inactive), &mut sheet_jsons)?;
 
+    progress("Atlas backdrops");
+    let backdrops: Vec<(String, String)> =
+        tree.atlas_backdrops.iter().map(|b| (b.sprite.clone(), b.path.clone())).collect();
+    let backdrops = scaled_sprites(&mut store, &backdrops, 0.5);
+    files += write("atlas-background", &backdrops, 4000, &mut sheet_jsons)?;
+
     progress("Class illustrations");
     for class in &tree.class_sheets {
         let sprites = scaled_sprites(&mut store, &class.images, 1.0);
@@ -312,6 +318,7 @@ pub struct TreeBuild {
     /// Mastery `ActiveEffectImage` paths used by this tree.
     mastery_images: Vec<String>,
     class_sheets: Vec<ClassSheet>,
+    atlas_backdrops: Vec<AtlasBackdrop>,
     /// Every texture path above, for one batched fetch.
     texture_paths: Vec<String>,
 }
@@ -332,6 +339,67 @@ struct NodeCalc {
     incoming: Vec<u32>,
     edge_in: Vec<usize>,
     edge_out: Vec<usize>,
+}
+
+/// One of the atlas tree's painted backdrops, placed in world units. The
+/// textures are square, so a single side covers both axes.
+struct AtlasBackdrop {
+    sprite: String,
+    path: String,
+    x: f64,
+    y: f64,
+    size: f64,
+}
+
+/// The atlas backdrops: one behind the main tree and one behind each league
+/// subtree. Each is sized from the nodes hanging off its own root — the
+/// subtrees sit well outside the main tree, so the whole graph's extent is far
+/// too big. Mirrors what `psg_viewer` draws in the app.
+fn atlas_backdrops(psg: &PsgFile, db: &SkillGraphDatabase, calc: &HashMap<u32, NodeCalc>) -> Vec<AtlasBackdrop> {
+    use crate::ui::psg_viewer::{ATLAS_MAIN_TREE_BG_SCALE, ATLAS_SUBTREE_BG_MIN, ATLAS_SUBTREE_BG_SCALE};
+    if psg.graph_type != 1 {
+        return Vec::new();
+    }
+    let mut bounds: HashMap<u32, (f64, f64, f64, f64)> = HashMap::new();
+    for (node, root) in psg.root_membership() {
+        let Some(c) = calc.get(&node) else { continue };
+        let e = bounds.entry(root).or_insert((c.x, c.y, c.x, c.y));
+        e.0 = e.0.min(c.x);
+        e.1 = e.1.min(c.y);
+        e.2 = e.2.max(c.x);
+        e.3 = e.3.max(c.y);
+    }
+
+    let mut out = Vec::new();
+    for &root in &psg.roots {
+        let Some(info) = db.nodes.get(&root) else { continue };
+        let Some(&(x0, y0, x1, y1)) = bounds.get(&root) else { continue };
+        let longest = (x1 - x0).max(y1 - y0);
+        match &info.atlas_subtree_background {
+            // A subtree hangs its backdrop off its own root, nudged by the
+            // offset the DAT gives it.
+            Some((path, ix, iy)) => {
+                let Some(c) = calc.get(&root) else { continue };
+                out.push(AtlasBackdrop {
+                    sprite: format!("atlasBackground:{}", art_name(path)),
+                    path: path.clone(),
+                    x: c.x + *ix as f64,
+                    y: c.y + *iy as f64,
+                    size: (longest * ATLAS_SUBTREE_BG_SCALE as f64).max(ATLAS_SUBTREE_BG_MIN as f64),
+                });
+            }
+            // The main tree's root has no subtree art; its backdrop is the one
+            // path that no DAT row points at, centred on what it covers.
+            None => out.push(AtlasBackdrop {
+                sprite: format!("atlasBackground:{}", art_name(ATLAS_MAIN_TREE_BG_PATH)),
+                path: ATLAS_MAIN_TREE_BG_PATH.to_string(),
+                x: (x0 + x1) / 2.0,
+                y: (y0 + y1) / 2.0,
+                size: longest * ATLAS_MAIN_TREE_BG_SCALE as f64,
+            }),
+        }
+    }
+    out
 }
 
 fn png_path(dds: &str) -> String {
@@ -738,7 +806,12 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
 
     let ctx = NodeContext { db, tables, keystones_in_radius: &keystones_in_radius, choice_parent: &choice_parent };
 
-    let (classes, class_sheets) = classes_json(db, tables);
+    // Classes, their illustrations and ascendancy plates belong to the
+    // character tree; the atlas and league graphs have no classes at all and
+    // would otherwise ship seven unused background sheets and draw a
+    // character portrait over the middle of the tree.
+    let (classes, class_sheets) =
+        if psg.graph_type == 0 { classes_json(db, tables) } else { (J::Arr(Vec::new()), Vec::new()) };
 
     let mut groups = J::obj();
     for (gi, group) in psg.groups.iter().enumerate() {
@@ -871,9 +944,28 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
     for c in &class_sheets {
         texture_paths.extend(c.images.iter().map(|(_, p)| p.clone()));
     }
+
+    let backdrops = atlas_backdrops(psg, db, &calc);
+    texture_paths.extend(backdrops.iter().map(|b| b.path.clone()));
     texture_paths.retain(|p| !p.is_empty());
 
-    let extras = viewer_extras(psg, db, &radii, art_set.map(|a| &a.group_background));
+    let mut extras = viewer_extras(psg, db, &radii, art_set.map(|a| &a.group_background));
+    extras.set(
+        "atlasBackdrops",
+        J::Arr(
+            backdrops
+                .iter()
+                .map(|b| {
+                    let mut o = J::obj();
+                    o.set("sprite", J::str(&b.sprite));
+                    o.set("x", J::num(b.x));
+                    o.set("y", J::num(b.y));
+                    o.set("size", J::num(b.size));
+                    o
+                })
+                .collect(),
+        ),
+    );
     let node_count = order.len();
     TreeBuild {
         name: tables.tree_name.clone(),
@@ -887,6 +979,7 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
         jewel_radius,
         mastery_images,
         class_sheets,
+        atlas_backdrops: backdrops,
         texture_paths,
     }
 }
@@ -1255,12 +1348,13 @@ mod real_data_tests {
         let schema: Schema = serde_json::from_str(&schema_text).unwrap();
         let source = TreeExportSource { reader: Some(reader), index, steam: None, schema };
 
-        let psg_path = "metadata/passiveskillgraph.psg";
-        let psg = crate::dat::psg::parse_psg(&source.fetch(psg_path).expect("psg")).unwrap();
+        let psg_path = std::env::var("TREE_EXPORT_PSG")
+            .unwrap_or_else(|_| "metadata/passiveskillgraph.psg".to_string());
+        let psg = crate::dat::psg::parse_psg(&source.fetch(&psg_path).expect("psg")).unwrap();
         let out_dir = std::env::var("TREE_EXPORT_OUT").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("ggpk_tree_export_test"));
         let (tx, rx) = std::sync::mpsc::channel();
         let t = std::time::Instant::now();
-        run_tree_export(source, psg_path.to_string(), psg, None, TreeExportOptions::default(), out_dir.clone(), tx);
+        run_tree_export(source, psg_path.clone(), psg, None, TreeExportOptions::default(), out_dir.clone(), tx);
         let mut done = false;
         while let Ok(status) = rx.try_recv() {
             match status {

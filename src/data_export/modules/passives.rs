@@ -10,13 +10,14 @@ use std::collections::HashMap;
 /// Ring radii the client lays nodes out on, in tree units.
 const ORBIT_RADII: [i64; 10] = [0, 82, 162, 335, 493, 662, 846, 251, 1080, 1332];
 
-/// Which description file names a tree's stats; a tree not listed here shows
-/// no rendered text.
-fn translation_file(title: &str) -> Option<&'static str> {
-    match title {
-        "AtlasSkillTreeTitle" => Some("atlas_stat_descriptions"),
-        "PassiveSkillTreeTitle" => Some("passive_skill_stat_descriptions"),
-        _ => None,
+/// Which description file names a tree's stats. Keyed off the graph path
+/// rather than the panel title, which GGG renames between patches — that is
+/// how the main tree came to ship with no rendered text at all.
+fn translation_file(graph: &str) -> &'static str {
+    if graph.contains("AtlasSkillGraphs") {
+        "atlas_stat_descriptions"
+    } else {
+        "passive_skill_stat_descriptions"
     }
 }
 
@@ -48,8 +49,8 @@ pub fn passives(ctx: &Ctx) -> Result<(), String> {
         };
 
         let name = ctx.rr.deref(tree, "Name");
-        let title_id = name.as_ref().map(|n| n.row().string("Id")).unwrap_or_default();
-        let translations = translation_file(&title_id).map(|f| ctx.translations(f));
+        let descriptions = translation_file(graph);
+        let translations = ctx.translations(descriptions);
 
         let mut nodes: Vec<(i64, J)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -58,7 +59,7 @@ pub fn passives(ctx: &Ctx) -> Result<(), String> {
                 return;
             }
             if let Some(row) = by_hash.get(&hash).and_then(|&i| skills.row(i)) {
-                nodes.push((hash, passive(ctx, row, translations.as_deref())));
+                nodes.push((hash, passive(ctx, row, Some(&translations))));
             }
         };
 
@@ -90,6 +91,19 @@ pub fn passives(ctx: &Ctx) -> Result<(), String> {
             }
         }
 
+        // A description file that renders nothing for a tree that does have
+        // stats means the wrong one was picked, which is otherwise invisible.
+        let carry_stats = nodes.iter().filter(|(_, node)| has_field(node, "stats")).count();
+        let described = nodes.iter().filter(|(_, node)| has_field(node, "stat_text")).count();
+        if described == 0 && carry_stats > 0 {
+            eprintln!(
+                "passives: {} has {} nodes with stats and none rendered from {}",
+                tree.id(),
+                carry_stats,
+                descriptions
+            );
+        }
+
         let document = Obj::new()
             .set("title", text(name.as_ref().map(|n| n.row().string("Text")).unwrap_or_default()))
             .set("roots", json::arr(psg.roots.iter().map(|r| int(*r as i64))))
@@ -110,6 +124,19 @@ pub fn passives(ctx: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether a rendered node carries a non-empty `stats` or `stat_text`.
+fn has_field(node: &J, name: &str) -> bool {
+    let J::Obj(fields) = node else { return false };
+    fields.iter().any(|(key, value)| {
+        key == name
+            && match value {
+                J::Arr(items) => !items.is_empty(),
+                J::Obj(items) => !items.is_empty(),
+                _ => false,
+            }
+    })
+}
+
 /// One passive node: its flags, stats and the lines those stats render as.
 pub fn passive(ctx: &Ctx, row: Row<'_>, translations: Option<&TranslationLookup>) -> J {
     let stat_ids = ctx.rr.deref_list_ids(row, "Stats");
@@ -128,6 +155,9 @@ pub fn passive(ctx: &Ctx, row: Row<'_>, translations: Option<&TranslationLookup>
         .set("skill_points", int(row.int("SkillPointsGranted")))
         .set("is_keystone", J::Bool(row.bool("IsKeystone")))
         .set("is_notable", J::Bool(row.bool("IsNotable")))
+        // The attribute a node like this grants is picked when it is
+        // allocated, so the data names none; the flag is all there is.
+        .set("is_attribute", J::Bool(row.bool("IsAttribute")))
         .set("is_multiple_choice", J::Bool(row.bool("IsMultipleChoice")))
         .set("is_multiple_choice_option", J::Bool(row.bool("IsMultipleChoiceOption")))
         .set("is_icon_only", J::Bool(row.bool("IsJustIcon")))

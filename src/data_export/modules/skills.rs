@@ -29,10 +29,38 @@ fn four_k(path: &str) -> Option<String> {
     Some(format!("{}/4k/{}", dir, file))
 }
 
+/// The client works an attribute requirement out from the character level the
+/// gem level asks for and the gem's weighting rather than storing one. This is
+/// Path of Building's `calcLib.getGemStatRequirement`, which it labels as the
+/// in-game formula; support gems ask for no attributes at all. PoB also
+/// reports anything under 8 as no requirement, which is left off here because
+/// the client does show those small numbers.
+fn attribute_requirement(level: i64, weight: i64) -> i64 {
+    let scaled = (5.0 + (level as f64 - 3.0) * 1.7) * (weight as f64 / 100.0).powf(0.9);
+    4 + (scaled + 0.5).floor() as i64
+}
+
+/// Gem level to the character level it asks for, per `ItemExperienceTypes`
+/// row. The curve starts at zero, which the client shows as level one.
+fn level_curves(ctx: &Ctx) -> HashMap<usize, Vec<(i64, i64)>> {
+    let Some(table) = ctx.rr.table("ItemExperiencePerLevel") else { return HashMap::new() };
+    let mut out: HashMap<usize, Vec<(i64, i64)>> = HashMap::new();
+    for row in table.rows() {
+        if let Some(kind) = row.key("ItemExperienceType") {
+            out.entry(kind).or_default().push((row.int("ItemCurrentLevel"), row.int("Level")));
+        }
+    }
+    for curve in out.values_mut() {
+        curve.sort_unstable();
+    }
+    out
+}
+
 pub fn skill_gems(ctx: &Ctx) -> Result<(), String> {
     let gems = ctx.table("SkillGems")?;
     let supports = support_gems(ctx);
     let recommended = recommended_supports(ctx);
+    let curves = level_curves(ctx);
 
     let mut root: Vec<(String, J)> = Vec::new();
     for gem in gems.rows() {
@@ -107,6 +135,30 @@ pub fn skill_gems(ctx: &Ctx) -> Result<(), String> {
                 .or_null("tutorial_video", json::opt_text(gem.str("TutorialVideo")))
                 .or_null("ui_image", json::opt_text(gem.str("UI_Image")))
                 .or_null("icon_dds_file", icon.map(text));
+
+            let weights = [
+                ("strength", gem.int("StrengthRequirementPercent")),
+                ("dexterity", gem.int("DexterityRequirementPercent")),
+                ("intelligence", gem.int("IntelligenceRequirementPercent")),
+            ];
+            if let Some(curve) = gem.key("ItemExperienceType").and_then(|k| curves.get(&k)) {
+                let requirements: Vec<(String, J)> = curve
+                    .iter()
+                    .map(|(gem_level, level)| {
+                        let mut row = Obj::new().set("level", int((*level).max(1)));
+                        for (attribute, weight) in weights {
+                            if weight > 0 && gem_type != "support" {
+                                row = row.set(attribute, int(attribute_requirement(*level, weight)));
+                            }
+                        }
+                        (gem_level.to_string(), row.build())
+                    })
+                    .collect();
+                entry = entry
+                    .or_null("experience_type", ctx.rr.deref_id(gem, "ItemExperienceType").map(text))
+                    .set("max_level", int(curve.last().map(|(gem_level, _)| *gem_level).unwrap_or(1)))
+                    .set("requirements", J::Obj(requirements));
+            }
 
             if gem_type == "support" {
                 let lineage = support
@@ -307,6 +359,22 @@ fn types(ctx: &Ctx, row: Row<'_>, column: &str) -> Option<J> {
     (!ids.is_empty()).then(|| json::strings(&ids))
 }
 
+/// Item classes the skill can be used with. The skill names a requirement
+/// group such as `Any Mace`, which in turn names the wieldable classes.
+fn weapon_restrictions(ctx: &Ctx, row: Row<'_>) -> Vec<String> {
+    let Some(requirement) = ctx.rr.deref(row, "WeaponRequirements") else { return Vec::new() };
+    let wieldable = ctx.rr.deref_list(requirement.row(), "WieldableClasses");
+    let mut out: Vec<String> = Vec::new();
+    for class in wieldable {
+        if let Some(id) = ctx.rr.deref_id(class.row(), "ItemClass") {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
 fn active_skill(ctx: &Ctx, row: Row<'_>, totems: &HashMap<i64, f64>) -> J {
     let inputs = ctx.rr.deref_list_ids(row, "Input_Stats");
     let outputs = ctx.rr.deref_list_ids(row, "Output_Stats");
@@ -320,7 +388,7 @@ fn active_skill(ctx: &Ctx, row: Row<'_>, totems: &HashMap<i64, f64>) -> J {
         .set("display_name", text(row.str("DisplayedName")))
         .set("description", text(row.str("Description")))
         .or_null("types", types(ctx, row, "ActiveSkillTypes"))
-        .set("weapon_restrictions", J::Arr(Vec::new()))
+        .set("weapon_restrictions", json::strings(weapon_restrictions(ctx, row)))
         .set("is_skill_totem", J::Bool(multiplier.is_some()))
         .set("is_manually_casted", J::Bool(row.bool("IsManuallyCasted")))
         .set("stat_conversions", J::Obj(conversions));
@@ -429,6 +497,15 @@ fn tooltip_order(shared: J, levels: &mut [J]) -> J {
     shared
 }
 
+/// How the client heads the stat set's block, e.g. `Initial Strike` for the
+/// `InitialStrike` label.
+fn label_text(ctx: &Ctx, set: &crate::dat::relational::Ref) -> Option<String> {
+    ctx.rr
+        .deref(set.row(), "Label")
+        .map(|label| label.row().string("Text"))
+        .filter(|text| !text.is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stat_set(
     ctx: &Ctx,
@@ -454,7 +531,7 @@ fn stat_set(
     // worked out once and repeated — the static pass then hoists it back out.
     let quality = translations
         .as_deref()
-        .map(|t| quality_stats(ctx, t, quality_rows))
+        .map(|t| quality_stats(ctx, t, quality_rows, position))
         .unwrap_or_default();
 
     let mut level_keys: Vec<String> = Vec::new();
@@ -480,6 +557,7 @@ fn stat_set(
     Obj::new()
         .set("id", text(set.row().id()))
         .or_null("label", ctx.rr.deref_id(set.row(), "Label").map(text))
+        .or_null("label_text", label_text(ctx, set).map(text))
         .set("per_level", J::Obj(level_keys.into_iter().zip(level_values).collect()))
         .set("static", shared)
         .or_null("translation_file", file_name.map(text))
@@ -526,7 +604,7 @@ fn stat_set_level(
     primary: Row<'_>,
     primary_level: Option<Row<'_>>,
     translations: Option<&TranslationLookup>,
-    quality: &(Vec<J>, Vec<(String, usize)>),
+    quality: &Quality,
 ) -> J {
     let mut out = Obj::new();
     let multiplier = level.int("BaseMultiplier");
@@ -586,14 +664,17 @@ fn stat_set_level(
             order.push((key, int(line.index as i64)));
         }
         // Quality lines take their place in the tooltip too.
-        for (key, index) in &quality.1 {
+        for (key, index) in &quality.order {
             if !order.iter().any(|(existing, _)| existing == key) {
                 order.push((key.clone(), int(*index as i64)));
             }
         }
         out = out.set("stat_order", J::Obj(order)).set("stat_text", J::Obj(text_by_stats));
-        if !quality.0.is_empty() {
-            out = out.set("quality_stats", J::Arr(quality.0.clone()));
+        if !quality.shown.is_empty() {
+            out = out.set("quality_stats", J::Arr(quality.shown.clone()));
+        }
+        if !quality.alternate.is_empty() {
+            out = out.set("alternate_quality_stats", J::Arr(quality.alternate.clone()));
         }
     }
 
@@ -622,65 +703,107 @@ fn collect_stats(ctx: &Ctx, set: Row<'_>, level: Row<'_>, out: &mut Vec<(String,
     }
 }
 
-/// What quality adds, described with the stat names left in place of numbers
-/// so a consumer can scale them itself.
+/// The quality lines for one stat set. A `GrantedEffectQualityStats` row can
+/// carry two bonuses; the client's gem tooltip draws the first and leaves the
+/// second out, so they are reported apart rather than merged.
+#[derive(Default)]
+struct Quality {
+    shown: Vec<J>,
+    alternate: Vec<J>,
+    order: Vec<(String, usize)>,
+}
+
+/// A bonus that names no stat sets belongs to all of them.
+fn applies_to_set(row: Row<'_>, column: &str, position: usize) -> bool {
+    let sets = row.list_int(column);
+    sets.is_empty() || sets.contains(&(position as i64))
+}
+
+/// What quality adds to the stat set at `position`, described with the stat
+/// names left in place of numbers so a consumer can scale them itself.
 fn quality_stats(
     ctx: &Ctx,
     translations: &TranslationLookup,
     rows: &[usize],
-) -> (Vec<J>, Vec<(String, usize)>) {
+    position: usize,
+) -> Quality {
     let table = ctx.rr.table("GrantedEffectQualityStats");
-    let mut out = Vec::new();
-    let mut order: Vec<(String, usize)> = Vec::new();
+    let mut out = Quality::default();
     for &index in rows {
         let Some(row) = table.as_ref().and_then(|t| t.row(index)) else { continue };
-        let permille = row.list_int("StatsValuesPermille");
-        let stats: Vec<(String, i64)> = ctx
-            .rr
-            .deref_list(row, "Stats")
-            .iter()
-            .enumerate()
-            .filter_map(|(i, stat)| permille.get(i).map(|v| (stat.id(), *v)))
-            .collect();
-        if stats.is_empty() {
-            continue;
-        }
-
-        // Quality values are per mille, so the text depends on how far it is
-        // scaled. The scale that fills in the most slots describes it best.
-        let mut divisors: Vec<i64> = stats.iter().map(|(_, v)| v.abs().min(1000)).filter(|v| *v != 0).collect();
-        divisors.push(25);
-        divisors.sort_unstable();
-        divisors.dedup();
-
-        let ids: Vec<String> = stats.iter().map(|(id, _)| id.clone()).collect();
-        let mut best: Option<(usize, String)> = None;
-        for divisor in divisors {
-            let values: Vec<i32> = stats.iter().map(|(_, v)| (*v / divisor.max(1)) as i32).collect();
-            let lines = translations.translate_detailed(&ids, &values);
-            let slots: usize = lines.iter().map(|l| l.template.matches('{').count()).sum();
-            let rendered =
-                lines.iter().map(|l| l.template.clone()).collect::<Vec<_>>().join("\n");
-            for line in &lines {
-                let key = line.ids.iter().filter(|id| ids.contains(id)).cloned().collect::<Vec<_>>().join("\n");
-                match order.iter_mut().find(|(existing, _)| *existing == key) {
-                    Some(slot) => slot.1 = line.index,
-                    None => order.push((key, line.index)),
+        if applies_to_set(row, "ApplyToStatSets", position) {
+            if let Some((line, order)) = quality_bonus(ctx, translations, row, "Stats", "StatsValuesPermille") {
+                out.shown.push(line);
+                for (key, index) in order {
+                    match out.order.iter_mut().find(|(existing, _)| *existing == key) {
+                        Some(slot) => slot.1 = index,
+                        None => out.order.push((key, index)),
+                    }
                 }
             }
-            if best.as_ref().map(|(count, _)| slots > *count).unwrap_or(true) {
-                best = Some((slots, rendered));
+        }
+        if applies_to_set(row, "AltApplyToStatSets", position) {
+            if let Some((line, _)) = quality_bonus(ctx, translations, row, "AltStats", "AltStatValuesPermille") {
+                out.alternate.push(line);
             }
         }
-
-        out.push(
-            Obj::new()
-                .set("stats", J::Obj(stats.into_iter().map(|(id, v)| (id, int(v))).collect()))
-                .or_null("stat", best.map(|(_, rendered)| text(rendered)))
-                .build(),
-        );
     }
-    (out, order)
+    out
+}
+
+/// One quality bonus rendered, with where each of its lines sits in the
+/// tooltip.
+fn quality_bonus(
+    ctx: &Ctx,
+    translations: &TranslationLookup,
+    row: Row<'_>,
+    stats_column: &str,
+    values_column: &str,
+) -> Option<(J, Vec<(String, usize)>)> {
+    let permille = row.list_int(values_column);
+    let stats: Vec<(String, i64)> = ctx
+        .rr
+        .deref_list(row, stats_column)
+        .iter()
+        .enumerate()
+        .filter_map(|(i, stat)| permille.get(i).map(|v| (stat.id(), *v)))
+        .collect();
+    if stats.is_empty() {
+        return None;
+    }
+
+    // Quality values are per mille, so the text depends on how far it is
+    // scaled. The scale that fills in the most slots describes it best.
+    let mut divisors: Vec<i64> = stats.iter().map(|(_, v)| v.abs().min(1000)).filter(|v| *v != 0).collect();
+    divisors.push(25);
+    divisors.sort_unstable();
+    divisors.dedup();
+
+    let ids: Vec<String> = stats.iter().map(|(id, _)| id.clone()).collect();
+    let mut order: Vec<(String, usize)> = Vec::new();
+    let mut best: Option<(usize, String)> = None;
+    for divisor in divisors {
+        let values: Vec<i32> = stats.iter().map(|(_, v)| (*v / divisor.max(1)) as i32).collect();
+        let lines = translations.translate_detailed(&ids, &values);
+        let slots: usize = lines.iter().map(|l| l.template.matches('{').count()).sum();
+        let rendered = lines.iter().map(|l| l.template.clone()).collect::<Vec<_>>().join("\n");
+        for line in &lines {
+            let key = line.ids.iter().filter(|id| ids.contains(id)).cloned().collect::<Vec<_>>().join("\n");
+            match order.iter_mut().find(|(existing, _)| *existing == key) {
+                Some(slot) => slot.1 = line.index,
+                None => order.push((key, line.index)),
+            }
+        }
+        if best.as_ref().map(|(count, _)| slots > *count).unwrap_or(true) {
+            best = Some((slots, rendered));
+        }
+    }
+
+    let line = Obj::new()
+        .set("stats", J::Obj(stats.into_iter().map(|(id, v)| (id, int(v))).collect()))
+        .or_null("stat", best.map(|(_, rendered)| text(rendered)))
+        .build();
+    Some((line, order))
 }
 
 /// Row indices of `table` grouped by the row `column` points at.
@@ -706,5 +829,25 @@ mod tests {
             Some("Art/2DArt/SkillIcons/4k/AbyssalLivingBomb.dds")
         );
         assert_eq!(four_k(""), None);
+    }
+
+    /// The character level each of the twenty gem levels asks for, on the
+    /// `PoE2GemProgressionRegular` curve every full-length gem uses.
+    const CURVE: [i64; 20] = [0, 3, 6, 10, 14, 18, 22, 26, 31, 36, 41, 46, 52, 58, 64, 66, 72, 78, 84, 90];
+
+    #[test]
+    fn attribute_requirements_match_the_client() {
+        // Boneshatter (100% strength), Frozen Locus and Armour Piercing Rounds
+        // (50/50), and Malice's two halves (25% and 75%), read off the client.
+        let expected: [(i64, [i64; 20]); 4] = [
+            (100, [4, 9, 14, 21, 28, 35, 41, 48, 57, 65, 74, 82, 92, 103, 113, 116, 126, 137, 147, 157]),
+            (75, [4, 8, 12, 17, 22, 28, 33, 38, 45, 51, 58, 64, 72, 80, 88, 91, 98, 106, 114, 122]),
+            (50, [4, 7, 9, 13, 17, 20, 24, 28, 32, 37, 41, 46, 51, 57, 62, 64, 70, 75, 80, 86]),
+            (25, [4, 5, 7, 9, 11, 13, 15, 17, 19, 22, 24, 26, 29, 32, 35, 36, 39, 42, 45, 48]),
+        ];
+        for (weight, wanted) in expected {
+            let got: Vec<i64> = CURVE.iter().map(|level| attribute_requirement(*level, weight)).collect();
+            assert_eq!(got, wanted, "weight {}%", weight);
+        }
     }
 }

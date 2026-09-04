@@ -108,6 +108,13 @@
     ascSel.value = selAsc ? selAsc.id : '';
   }
   fillAsc();
+  // The atlas and league trees have no classes; their pickers would be empty.
+  if (!classes.length) {
+    for (const el of [classSel, ascSel, document.getElementById('showAll')]) {
+      const label = el.closest('label');
+      if (label) label.style.display = 'none';
+    }
+  }
   classSel.onchange = () => { selClass = classes.find(c => String(c.index) === classSel.value); fillAsc(); allocated.clear(); requestDraw(); };
   ascSel.onchange = () => {
     selAsc = selClass.ascendancies.find(a => a.id === ascSel.value) || null; ascNone = !selAsc;
@@ -300,6 +307,12 @@
     const inView = (x, y, m) => x > vx0 - m && x < vx1 + m && y > vy0 - m && y < vy1 + m;
     ctx.setTransform(view.zoom, 0, 0, view.zoom, view.x, view.y);
     ctx.imageSmoothingEnabled = true;
+
+    // atlas backdrops: the main tree's, then one per league subtree
+    for (const b of X.atlasBackdrops || []) {
+      if (!inView(b.x, b.y, b.size)) continue;
+      drawSprite(sprite('atlas-background', b.sprite), b.x, b.y, b.size);
+    }
 
     // centre art
     const sizes = X.sizes || {};

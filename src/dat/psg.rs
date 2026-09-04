@@ -21,6 +21,40 @@ impl PsgFile {
         let src = if self.graph_type == 1 { ATLAS_ORBIT_RADII } else { PASSIVE_ORBIT_RADII };
         std::array::from_fn(|i| src.get(i).copied().unwrap_or(0) as f32)
     }
+
+    /// Which root each node hangs off, by flood fill through the graph's own
+    /// connections. Nothing in the DAT data records this, and the atlas tree
+    /// needs it to know which nodes each backdrop covers.
+    pub fn root_membership(&self) -> std::collections::HashMap<u32, u32> {
+        use std::collections::HashMap;
+        let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
+        for group in &self.groups {
+            for node in &group.nodes {
+                for conn in &node.connections {
+                    adjacency.entry(node.skill_id).or_default().push(conn.node_id);
+                    adjacency.entry(conn.node_id).or_default().push(node.skill_id);
+                }
+            }
+        }
+        let mut root_of: HashMap<u32, u32> = HashMap::new();
+        for &root in &self.roots {
+            if root_of.contains_key(&root) {
+                continue;
+            }
+            let mut stack = vec![root];
+            root_of.insert(root, root);
+            while let Some(cur) = stack.pop() {
+                let Some(neighbours) = adjacency.get(&cur) else { continue };
+                for &n in neighbours {
+                    if let std::collections::hash_map::Entry::Vacant(e) = root_of.entry(n) {
+                        e.insert(root);
+                        stack.push(n);
+                    }
+                }
+            }
+        }
+        root_of
+    }
 }
 
 impl Serialize for PsgFile {

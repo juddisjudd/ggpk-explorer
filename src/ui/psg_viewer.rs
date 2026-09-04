@@ -33,6 +33,15 @@ const ARC_BAND: f32 = 12.0;
 /// Frame textures are authored at one pixel per world unit (the official web
 /// tree draws them that way); icons sit inside at this fraction of the frame.
 const ICON_TO_FRAME: f32 = 0.69;
+/// How far the atlas main-tree backdrop reaches past its nodes. The painted
+/// machinery fills roughly 75% by 87% of the square texture, so a little over
+/// one covers the tree; the texture is square, so the scale is applied to the
+/// longer side and both axes get it.
+pub const ATLAS_MAIN_TREE_BG_SCALE: f32 = 1.15;
+/// The same, for the league subtree backdrops, which carry far more padding.
+pub const ATLAS_SUBTREE_BG_SCALE: f32 = 1.9;
+/// Smallest a subtree backdrop is drawn, for a subtree of one or two nodes.
+pub const ATLAS_SUBTREE_BG_MIN: f32 = 200.0;
 /// Fallback frame sizes (px) when a texture hasn't loaded yet.
 const FRAME_PASSIVE: f32 = 104.0;
 const FRAME_NOTABLE: f32 = 152.0;
@@ -421,14 +430,10 @@ impl<'a> PsgViewer<'a> {
 
             // ── Backdrops ─────────────────────────────────────────
             match self.psg.graph_type {
-                1 => {
-                    if let Some(tex) = self.find_texture(crate::ui::atlas_node_db::ATLAS_MAIN_TREE_BG_PATH) {
-                        if let Some(bbox) = bbox_of(layout.node_pos.values()) {
-                            let size = bbox.size() * 1.15;
-                            draw_image(&painter, &cv, tex, bbox.center(), size, FULL);
-                        }
-                    }
-                }
+                // The atlas backdrops, main tree and subtrees alike, are drawn
+                // together in `draw_atlas_subtrees` — they all need the
+                // per-root flood fill to know which nodes they cover.
+                1 => {}
                 2 => {
                     if let Some(tex) = self.find_texture(BREACH_BACKDROP) {
                         if let Some(bbox) = bbox_of(layout.node_pos.values()) {
@@ -688,7 +693,10 @@ impl<'a> PsgViewer<'a> {
                     if info.is_mastery {
                         continue; // drawn as a cluster pattern before the connectors
                     }
-                    if self.psg.graph_type == 1 && info.atlas_subtree_icon.is_some() {
+                    // Every node in a subtree carries its subtree's emblem, but
+                    // only the entry node wears it — the rest draw their own icon.
+                    let is_subtree_entry = self.psg.roots.contains(&node.skill_id);
+                    if self.psg.graph_type == 1 && is_subtree_entry && info.atlas_subtree_icon.is_some() {
                         if let Some(tex) = info.atlas_subtree_icon.as_deref().and_then(|p| self.find_texture(p)) {
                             let [w, h] = tex.size();
                             draw_image(&painter, &cv, tex, pos, vec2(w as f32, h as f32) * 2.0, tint);
@@ -847,45 +855,33 @@ impl<'a> PsgViewer<'a> {
         if self.psg.roots.is_empty() {
             return;
         }
-        let mut adjacency: HashMap<u32, Vec<u32>> = HashMap::new();
-        for group in &self.psg.groups {
-            for node in &group.nodes {
-                for conn in &node.connections {
-                    adjacency.entry(node.skill_id).or_default().push(conn.node_id);
-                    adjacency.entry(conn.node_id).or_default().push(node.skill_id);
-                }
-            }
-        }
-        let mut root_of: HashMap<u32, u32> = HashMap::new();
-        for &root in &self.psg.roots {
-            if root_of.contains_key(&root) {
-                continue;
-            }
-            let mut stack = vec![root];
-            root_of.insert(root, root);
-            while let Some(cur) = stack.pop() {
-                if let Some(nb) = adjacency.get(&cur) {
-                    for &n in nb {
-                        if let std::collections::hash_map::Entry::Vacant(e) = root_of.entry(n) {
-                            e.insert(root);
-                            stack.push(n);
-                        }
-                    }
-                }
-            }
-        }
+        let root_of = self.psg.root_membership();
         let mut bbox: HashMap<u32, Rect> = HashMap::new();
         for (&node, &root) in &root_of {
             if let Some(&p) = layout.node_pos.get(&node) {
                 bbox.entry(root).and_modify(|r| *r = r.union(Rect::from_min_max(p, p))).or_insert(Rect::from_min_max(p, p));
             }
         }
+        // The main tree's root is the one with no subtree art of its own. Its
+        // backdrop covers only the nodes that hang off it — sizing it to the
+        // whole graph stretches it over the league subtrees sitting outside.
+        for &root in &self.psg.roots {
+            let Some(info) = db.nodes.get(&root) else { continue };
+            if info.atlas_subtree_background.is_some() {
+                continue;
+            }
+            let Some(b) = bbox.get(&root) else { continue };
+            let Some(tex) = self.find_texture(crate::ui::atlas_node_db::ATLAS_MAIN_TREE_BG_PATH) else { continue };
+            let side = b.width().max(b.height()) * ATLAS_MAIN_TREE_BG_SCALE;
+            draw_image(painter, cv, tex, b.center(), Vec2::splat(side), FULL);
+        }
+
         for &root in &self.psg.roots {
             let Some(info) = db.nodes.get(&root) else { continue };
             let Some((bg, ix, iy)) = &info.atlas_subtree_background else { continue };
             let (Some(&pos), Some(b)) = (layout.node_pos.get(&root), bbox.get(&root)) else { continue };
             let Some(tex) = self.find_texture(bg) else { continue };
-            let diameter = (b.width().max(b.height()) * 1.9).max(200.0);
+            let diameter = (b.width().max(b.height()) * ATLAS_SUBTREE_BG_SCALE).max(ATLAS_SUBTREE_BG_MIN);
             draw_image(painter, cv, tex, pos + vec2(*ix, *iy), Vec2::splat(diameter), FULL);
         }
     }
