@@ -14,6 +14,17 @@ pub const TREE_CACHE_NOSHADER_FILENAME: &str = "bundles2.tree.v2.noshader.cache"
 /// Filename recording which patch the disk caches were built for.
 pub const CACHE_STAMP_FILENAME: &str = "cache.patch";
 
+/// Whether caches stamped `stamped` can be trusted to describe `version`.
+/// Caches written before stamping existed carry no stamp at all, and then the
+/// saved patch version is the only other record of what they were built
+/// against, so they are kept only when it agrees.
+fn cache_matches_patch(stamped: Option<&str>, version: &str, saved_version: &str) -> bool {
+    match stamped {
+        Some(stamp) => stamp == version,
+        None => saved_version == version,
+    }
+}
+
 pub fn tree_cache_filename(hide_shader_cache: bool) -> &'static str {
     if hide_shader_cache { TREE_CACHE_NOSHADER_FILENAME } else { TREE_CACHE_FILENAME }
 }
@@ -303,16 +314,39 @@ impl AppSettings {
     /// names alone, and a patch rewrites bundle contents under unchanged names,
     /// so carrying them across a patch reads back wrong data rather than merely
     /// stale data. Returns whether anything was cleared.
+    /// Saves the outgoing patch's index before it is wiped. The index cache is
+    /// the only full record of what the last patch shipped, so a diff against
+    /// the next one is impossible once it is gone.
+    fn snapshot_outgoing(old_version: &str) {
+        if old_version.is_empty() || crate::diff::has_snapshot_for_version(old_version) {
+            return;
+        }
+        let cache = Self::get_app_data_dir().join(INDEX_CACHE_FILENAME);
+        if !cache.exists() {
+            return;
+        }
+        match crate::bundles::index::Index::load_from_cache(&cache) {
+            Ok(mut index) => {
+                index.drop_shader_cache();
+                match crate::diff::take_snapshot(&index, old_version, "auto (pre-patch index cache)") {
+                    Ok(_) => println!("Saved a snapshot of patch {} before clearing the caches", old_version),
+                    Err(e) => println!("Could not snapshot patch {}: {}", old_version, e),
+                }
+            }
+            Err(e) => println!("Could not read the index cache to snapshot patch {}: {}", old_version, e),
+        }
+    }
+
     pub fn sync_cache_to_patch(version: &str) -> std::io::Result<bool> {
         let stamped = std::fs::read_to_string(Self::get_app_data_dir().join(CACHE_STAMP_FILENAME)).ok();
         let stamped = stamped.as_deref().map(str::trim);
         if stamped == Some(version) {
             return Ok(false);
         }
-        // Caches predating the stamp: the saved patch version is the only other
-        // record of what they were built against, so keep them only when it agrees.
-        let adopt = stamped.is_none() && Self::load().poe2_patch_version == version;
+        let settings = Self::load();
+        let adopt = cache_matches_patch(stamped, version, &settings.poe2_patch_version);
         if !adopt {
+            Self::snapshot_outgoing(stamped.unwrap_or(&settings.poe2_patch_version));
             Self::clear_cache()?;
         }
         Self::stamp_cache_patch(version)?;
@@ -340,5 +374,23 @@ impl AppSettings {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_stamp_tests {
+    use super::cache_matches_patch;
+
+    #[test]
+    fn a_stamp_decides_on_its_own() {
+        assert!(cache_matches_patch(Some("4.5.5.1"), "4.5.5.1", "anything"));
+        assert!(!cache_matches_patch(Some("4.5.5.1"), "4.5.5.2", "4.5.5.2"));
+    }
+
+    /// Caches written before stamping existed fall back to the saved version.
+    #[test]
+    fn without_a_stamp_the_saved_version_decides() {
+        assert!(cache_matches_patch(None, "4.5.5.1", "4.5.5.1"));
+        assert!(!cache_matches_patch(None, "4.5.5.2", "4.5.5.1"));
     }
 }
