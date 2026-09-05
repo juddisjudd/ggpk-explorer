@@ -81,6 +81,7 @@ USAGE:
     ggpk-explorer export <PATH> [OPTIONS]  Extract game files, e.g. Art/2DArt
     ggpk-explorer export-data [OPTIONS]    Write RePoE-style semantic JSON dumps
     ggpk-explorer refit [OPTIONS]          Re-derive drifted table layouts from an earlier patch
+    ggpk-explorer lint [OPTIONS]           Check the schema.s references and enums against the game files
 
 EXPORT OPTIONS:
     -o, --out <DIR>        Output folder (default: ./export)
@@ -103,6 +104,10 @@ EXPORT-DATA OPTIONS:
         --strip-null       Leave out keys with no value, shrinking every dump
         --version <VER>    Name the patch instead of reading it from the install
         --poe1             Read a Path of Exile 1 install instead of PoE 2
+
+LINT OPTIONS:
+        --schema <FILE>    Schema to check (default: the cached schema.min.json)
+        --ggpk / --steam   as above
 
 REFIT OPTIONS:
         --old <VERSION>    The patch to carry column names from, read over the CDN (required)
@@ -666,6 +671,108 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
         println!("Nothing was written: no table re-fitted cleanly.");
     } else if written == 0 {
         println!("Re-run with --write to store these layouts as schema overrides.");
+    }
+    Ok(())
+}
+
+/// Parses `lint` arguments: checks the schema's own claims against the game
+/// files and reports the ones the data contradicts.
+pub fn run_lint(args: &[String]) -> Result<(), String> {
+    use crate::data_export::source::GameFiles;
+    use crate::dat::relational::FileSource;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let mut ggpk: Option<String> = None;
+    let mut steam: Option<String> = None;
+    let mut schema_path: Option<String> = None;
+    let mut is_poe2 = true;
+
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let value = |i: &mut usize| -> Result<String, String> {
+            *i += 1;
+            args.get(*i).cloned().ok_or_else(|| format!("{} needs a value", arg))
+        };
+        match arg {
+            "--ggpk" => ggpk = Some(value(&mut i)?),
+            "--steam" => steam = Some(value(&mut i)?),
+            "--schema" => schema_path = Some(value(&mut i)?),
+            "--poe1" => is_poe2 = false,
+            "-h" | "--help" => {
+                println!("{}", USAGE);
+                return Ok(());
+            }
+            other => return Err(format!("Unknown option {}\n\n{}", other, USAGE)),
+        }
+        i += 1;
+    }
+
+    let settings = AppSettings::load();
+    let schema = load_schema(schema_path.or_else(|| settings.schema_local_path.clone()))?;
+    let ggpk = ggpk.or_else(|| if steam.is_some() { None } else { settings.ggpk_path.clone() });
+    let steam = steam.or_else(|| if ggpk.is_some() { None } else { settings.steam_path.clone() });
+    let (reader, steam_loader, index) = open_source(ggpk, steam, None)?;
+    let files = GameFiles::new(reader, Arc::new(index), steam_loader, None);
+
+    // Every base-language table, read once and kept for the row counts that
+    // the reference checks measure against.
+    let mut readers: Vec<(String, crate::dat::reader::DatReader)> = Vec::new();
+    let mut row_counts: HashMap<String, u32> = HashMap::new();
+    for path in files.list_dir("data/balance/") {
+        let lower = path.to_ascii_lowercase();
+        let Some(rest) = lower.strip_prefix("data/balance/") else { continue };
+        if rest.contains('/') || !rest.ends_with(".datc64") {
+            continue;
+        }
+        let Some(bytes) = files.fetch(&lower) else { continue };
+        let Ok(dat) = crate::dat::reader::DatReader::new(bytes, &lower) else { continue };
+        let name = rest.trim_end_matches(".datc64").to_string();
+        row_counts.insert(name.clone(), dat.row_count);
+        readers.push((name, dat));
+    }
+    readers.sort_by(|a, b| a.0.cmp(&b.0));
+    println!("Checking {} tables", readers.len());
+
+    let mut findings = Vec::new();
+    let mut skipped = 0;
+    for (name, dat) in &readers {
+        let Some(def) = schema.find_table(name, is_poe2) else { continue };
+        // A schema that no longer fits the file misreads every column past the
+        // drift, which would bury the real findings in noise.
+        if crate::dat::analysis::check_fit(dat, def, 40).is_broken() {
+            skipped += 1;
+            continue;
+        }
+        findings.extend(crate::dat::analysis::lint_table(dat, def, &schema, &row_counts, is_poe2, 60));
+    }
+    findings.sort_by(|a, b| {
+        (b.violations * 100 / b.sampled.max(1))
+            .cmp(&(a.violations * 100 / a.sampled.max(1)))
+            .then(b.violations.cmp(&a.violations))
+    });
+
+    if skipped > 0 {
+        println!("Skipped {} table(s) whose layout no longer matches the schema (see `refit`)", skipped);
+    }
+    match findings.is_empty() {
+        true => println!("\nNothing to report: every reference and enum index the schema declares holds up."),
+        false => {
+            println!("\n{} finding(s):\n", findings.len());
+            for f in &findings {
+                println!(
+                    "{:>3}% ({}/{})  {}.{}  {}\n      {}",
+                    f.violations * 100 / f.sampled.max(1),
+                    f.violations,
+                    f.sampled,
+                    f.table,
+                    f.column,
+                    f.kind,
+                    f.detail
+                );
+            }
+        }
     }
     Ok(())
 }

@@ -64,8 +64,9 @@ The same binary runs without the GUI:
 | `ggpk-explorer export Art/2DArt -o out --textures png` | Extract a file or folder, converting as it goes. |
 | `ggpk-explorer export-data -o data` | Write the RePoE-style JSON dumps. |
 | `ggpk-explorer refit --old 4.5.4.11 --write` | Rebuild the table layouts a patch broke, using the patch before it. |
+| `ggpk-explorer lint` | Check the schema's foreign keys and enum indices against the game files. |
 
-`export-data --ls <prefix>` lists indexed paths and `--cat <path>` prints one file, which is the quickest way to check a format by hand. Pass `--help` to any subcommand for its full options.
+`lint --schema <file>` checks a candidate schema, which is the way to test a dat-schema change before proposing it. `export-data --ls <prefix>` lists indexed paths and `--cat <path>` prints one file, which is the quickest way to check a format by hand. Pass `--help` to any subcommand for its full options.
 
 ### UI
 - Collapsible sidebar, resizable panels.

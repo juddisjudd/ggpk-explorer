@@ -69,6 +69,13 @@ fn main() -> eframe::Result<()> {
             }
             return Ok(());
         }
+        Some("lint") => {
+            if let Err(e) = cli::run_lint(&args[2..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         Some("refit") => {
             if let Err(e) = cli::run_refit(&args[2..]) {
                 eprintln!("{}", e);

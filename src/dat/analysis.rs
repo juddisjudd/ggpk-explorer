@@ -926,6 +926,134 @@ pub fn value_is_possible(
         _ => true,
     }
 }
+
+/// A schema claim the data contradicts. Every finding here is decidable from
+/// the file alone: a key must land inside the table it names, a bool holds 0 or
+/// 1, an enum index must exist in the enumeration it points at.
+#[derive(Debug, Clone)]
+pub struct LintFinding {
+    pub table: String,
+    pub column: String,
+    pub kind: &'static str,
+    pub detail: String,
+    /// Rows checked, and how many broke the rule.
+    pub sampled: usize,
+    pub violations: usize,
+}
+
+/// Checks one table's declared references, bools and enum indices against the
+/// values the file actually holds. `row_counts` maps a lower-case table name to
+/// its row count, read from the file headers.
+pub fn lint_table(
+    reader: &DatReader,
+    table: &Table,
+    schema: &crate::dat::schema::Schema,
+    row_counts: &std::collections::HashMap<String, u32>,
+    is_poe2: bool,
+    sample: usize,
+) -> Vec<LintFinding> {
+    let mut findings = Vec::new();
+    if reader.row_count == 0 {
+        return findings;
+    }
+    let step = ((reader.row_count as usize) / sample.max(1)).max(1);
+    let rows: Vec<u32> = (0..reader.row_count).step_by(step).take(sample).collect();
+
+    for (index, col) in table.columns.iter().enumerate() {
+        let name = col.name.clone().unwrap_or_else(|| format!("column {}", index));
+        let mut checked = 0usize;
+        let mut bad = 0usize;
+        let mut worst = String::new();
+
+        // The row count of whatever this column claims to point at.
+        let limit = col.references.as_ref().and_then(|r| {
+            let target = r.table.to_ascii_lowercase();
+            row_counts.get(&target).copied().map(|n| (r.table.clone(), n))
+        });
+        let enumeration = (col.r#type == "enumrow")
+            .then(|| col.references.as_ref().map(|r| r.table.clone()))
+            .flatten()
+            .and_then(|n| schema.find_enumeration(&n, is_poe2).map(|e| (n, e.indexing as u64, e.enumerators.len())));
+
+        for &row in &rows {
+            let Ok(values) = reader.read_row(row, table) else { continue };
+            if std::env::var("LINT_DEBUG").as_deref() == Ok(table.name.as_str()) && row == 0 {
+                println!("  [{}] {} : {} = {:?}", index, name, col.r#type, values.get(index));
+            }
+            let Some(value) = values.get(index) else { continue };
+            let mut keys: Vec<u64> = Vec::new();
+            let mut bools: Vec<bool> = Vec::new();
+            collect(value, reader, col, &mut keys, &mut bools);
+
+            if let Some((target, count)) = &limit {
+                for key in &keys {
+                    checked += 1;
+                    if *key >= *count as u64 {
+                        bad += 1;
+                        if worst.is_empty() {
+                            worst = format!("row {} holds key {} but {} has {} rows", row, key, target, count);
+                        }
+                    }
+                }
+            } else if let Some((enum_name, first, size)) = &enumeration {
+                // Enumerations declare where their numbering starts, so the
+                // valid span is first..first + entries, not 0..entries.
+                for key in &keys {
+                    checked += 1;
+                    if *size > 0 && (*key < *first || *key >= *first + *size as u64) {
+                        bad += 1;
+                        if worst.is_empty() {
+                            worst = format!(
+                                "row {} holds {} but enum {} covers {}..{}",
+                                row, key, enum_name, first, *first + *size as u64 - 1
+                            );
+                        }
+                    }
+                }
+            }
+            let _ = bools;
+        }
+
+        if bad > 0 {
+            let kind = if limit.is_some() { "key outside the table it references" } else { "index outside its enumeration" };
+            findings.push(LintFinding {
+                table: table.name.clone(),
+                column: name,
+                kind,
+                detail: worst,
+                sampled: checked,
+                violations: bad,
+            });
+        }
+    }
+    findings
+}
+
+/// Flattens a value into the keys and bools it contains, following arrays.
+fn collect(value: &DatValue, reader: &DatReader, col: &Column, keys: &mut Vec<u64>, bools: &mut Vec<bool>) {
+    match value {
+        DatValue::ForeignRow(k) if *k != usize::MAX => keys.push(*k as u64),
+        DatValue::Int(i) if col.r#type == "enumrow" && *i >= 0 => keys.push(*i as u64),
+        DatValue::Bool(b) => bools.push(*b),
+        DatValue::List(count, offset) => {
+            if *count == 0 || *count > 10_000 {
+                return;
+            }
+            let elem = Column { array: false, interval: false, ..col.clone() };
+            if let Ok(items) = reader.read_list_values(*offset, *count, col) {
+                for item in &items {
+                    collect(item, reader, &elem, keys, bools);
+                }
+            }
+        }
+        DatValue::Interval(a, b) => {
+            let elem = Column { interval: false, ..col.clone() };
+            collect(a, reader, &elem, keys, bools);
+            collect(b, reader, &elem, keys, bools);
+        }
+        _ => {}
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1213,3 +1341,4 @@ mod fit_real_data_tests {
         }
     }
 }
+
