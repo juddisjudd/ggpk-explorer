@@ -72,6 +72,20 @@ pub fn default_monster_stats(ctx: &Ctx) -> Result<(), String> {
                 .set("life", int(row.int(life)))
                 .set("experience", int(row.int("Experience")))
                 .set("physical_damage", json::float(row.float("Damage")))
+                .or_null("ailment_threshold", row.opt_int("AilmentThreshold").map(int))
+                .or_null("poise_threshold", row.opt_int("PoiseThreshold").map(int))
+                .or_null("evasive_evasion", row.opt_int("EvasiveEvasion").map(int))
+                .or_null("minion_damage", row.opt_int("MinionDamage").map(|_| json::float(row.float("MinionDamage"))))
+                .or_null("difficulty", row.opt_int("Difficulty").map(int))
+                .or_null("leech_resistance", row.opt_int("LeechResistance").map(int))
+                .or_null("rare_unique_leech_resistance", row.opt_int("RareUniqueLeechResistance").map(int))
+                .or_null("more_elemental_damage", row.opt_int("MoreElementalDamage").map(int))
+                .or_null("more_chaos_damage", row.opt_int("MoreChaosDamage").map(int))
+                .or_null("more_damage_against_non_unique", row.opt_int("MoreDamageAgainstNonUnique").map(int))
+                .or_null(
+                    "unique_monster_damage_taken_from_minions",
+                    row.opt_int("UniqueMonsterDamageTakenFromMinions").map(int),
+                )
                 .build();
             (row.str("DisplayLevel").to_string(), entry)
         })

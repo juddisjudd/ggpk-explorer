@@ -4,7 +4,7 @@
 //! the client; these are their inputs.
 
 use crate::dat::relational::{FileSource, LoadedTable, Row};
-use crate::data_export::json::{int, text, Obj, J};
+use crate::data_export::json::{self, int, text, Obj, J};
 use crate::data_export::Ctx;
 
 pub fn game_constants(ctx: &Ctx) -> Result<(), String> {
@@ -150,4 +150,89 @@ fn scalar(value: &str) -> J {
             .or_else(|_| v.parse::<f64>().map(J::Num))
             .unwrap_or_else(|_| text(v)),
     }
+}
+
+/// Every stat with the flags the client combines it by: how it aggregates,
+/// whether it is local to the item or weapon hand, whether the client computes
+/// it, and which calculation contexts it belongs to.
+pub fn stats(ctx: &Ctx) -> Result<(), String> {
+    let table = ctx.table("Stats")?;
+    let root = table
+        .rows()
+        .filter(|row| !row.id().is_empty())
+        .map(|row| {
+            let ids = |col: &str| -> Option<J> {
+                let ids = ctx.rr.deref_list_ids(row, col);
+                (!ids.is_empty()).then(|| json::strings(&ids))
+            };
+            let entry = Obj::new()
+                .or_null("semantic", ctx.rr.enum_label(row, "Semantic").map(|s| text(s.to_ascii_lowercase())))
+                .set("is_local", J::Bool(row.bool("IsLocal")))
+                .set("is_weapon_local", J::Bool(row.bool("IsWeaponLocal")))
+                .set("is_virtual", J::Bool(row.bool("IsVirtual")))
+                .set("is_scalable", J::Bool(row.bool("IsScalable")))
+                .set("weapon_hand_check", J::Bool(row.bool("WeaponHandCheck")))
+                .or_null("main_hand_alias", ctx.rr.deref_id(row, "MainHandAlias_Stat").map(text))
+                .or_null("off_hand_alias", ctx.rr.deref_id(row, "OffHandAlias_Stat").map(text))
+                .or_null("context_flags", ids("ContextFlags"))
+                .or_null("dot_flags", ids("DotFlag"))
+                .or_null("category", ctx.rr.deref_id(row, "Category").map(text))
+                .or_null("active_skills", ids("BelongsActiveSkills"))
+                .build();
+            (row.id().to_string(), entry)
+        })
+        .collect::<Vec<_>>();
+    ctx.write("stats", &J::Obj(root))
+}
+
+/// Which player stats each minion stat is fed from, and the minion types it
+/// applies to.
+pub fn minion_stats(ctx: &Ctx) -> Result<(), String> {
+    let table = ctx.table("MinionStats")?;
+    let root = table
+        .rows()
+        .filter_map(|row| {
+            let id = ctx.rr.deref_id(row, "MinionStat")?;
+            let mut types = ctx.rr.deref_list_ids(row, "MinionType");
+            types.extend(ctx.rr.deref_list_ids(row, "MinionType2"));
+            let entry = Obj::new()
+                .set("player_stats", json::strings(ctx.rr.deref_list_ids(row, "PlayerStat")))
+                .set("minion_types", json::strings(types))
+                .set("is_companion_stat", J::Bool(row.bool("CompanionStat")))
+                .build();
+            Some((id, entry))
+        })
+        .collect::<Vec<_>>();
+    ctx.write("minion_stats", &J::Obj(root))
+}
+
+/// How attack skills scale with gem level: the damage multiplier per level for
+/// each scaling type, and the flat physical damage the unarmed curve adds.
+pub fn attack_damage_scaling(ctx: &Ctx) -> Result<(), String> {
+    let types = ctx.table("AttackSkillDamageScalingType")?;
+    let multipliers = ctx.table("AttackSkillDamageScalingValues")?;
+    let flat = ctx.table("FlatPhysicalDamageValues")?;
+    let root = types
+        .rows()
+        .map(|kind| {
+            let per_level = |table: &crate::dat::relational::LoadedTable, key: &str, value: &dyn Fn(Row<'_>) -> J| {
+                let mut out: Vec<(String, J)> = table
+                    .rows()
+                    .filter(|r| r.key(key) == Some(kind.index))
+                    .map(|r| (r.int("GemLevel").to_string(), value(r)))
+                    .collect();
+                out.sort_by_key(|(level, _)| level.parse::<i64>().unwrap_or(0));
+                (!out.is_empty()).then(|| J::Obj(out))
+            };
+            let entry = Obj::new()
+                .or_null("multipliers", per_level(&multipliers, "SkillType", &|r| json::float(r.float("Scaling"))))
+                .or_null(
+                    "flat_physical",
+                    per_level(&flat, "ScalingType", &|r| json::arr([int(r.int("MinPhys")), int(r.int("MaxPhys"))])),
+                )
+                .build();
+            (kind.id().to_string(), entry)
+        })
+        .collect::<Vec<_>>();
+    ctx.write("attack_damage_scaling", &J::Obj(root))
 }

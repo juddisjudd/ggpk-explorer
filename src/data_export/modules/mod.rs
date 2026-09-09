@@ -7,6 +7,7 @@ pub mod calculation;
 pub mod images;
 pub mod items;
 pub mod mods;
+pub mod monsters;
 pub mod passives;
 pub mod skills;
 pub mod stat_translations;
@@ -43,6 +44,11 @@ pub fn registry() -> Vec<Module> {
             calculation::damage_calculation_types,
         ),
         module("character_constants", "Base stats of the character and monster object definitions", calculation::character_constants),
+        module("stats", "Every stat with its aggregation semantic, locality and calculation contexts", calculation::stats),
+        module("minion_stats", "Which player stats feed each minion stat", calculation::minion_stats),
+        module("attack_damage_scaling", "Attack damage multipliers and flat physical damage per gem level", calculation::attack_damage_scaling),
+        module("monsters", "Every monster variety: multipliers, base defences, resistances and mods", monsters::monsters),
+        module("level_scaling", "Monster level per player level, resistance penalty per area, map difficulty", monsters::level_scaling),
         module(
             "stat_translations",
             "Stat text rules, value handlers and the stat index",
