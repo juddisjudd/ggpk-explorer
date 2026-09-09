@@ -3,6 +3,7 @@
 
 pub mod basics;
 pub mod buffs;
+pub mod calculation;
 pub mod images;
 pub mod items;
 pub mod mods;
@@ -35,6 +36,13 @@ pub fn registry() -> Vec<Module> {
         module("item_classes", "Item classes and their categories", basics::item_classes),
         module("keywords", "In-game keyword popups", basics::keywords),
         module("tags", "Every item tag, plus tag_details", basics::tags),
+        module("game_constants", "Tuning constants the client reads by name, as Value / Divisor", calculation::game_constants),
+        module(
+            "damage_calculation_types",
+            "The stat ids each hit context reads for damage, crit, accuracy and stun",
+            calculation::damage_calculation_types,
+        ),
+        module("character_constants", "Base stats of the character and monster object definitions", calculation::character_constants),
         module(
             "stat_translations",
             "Stat text rules, value handlers and the stat index",
