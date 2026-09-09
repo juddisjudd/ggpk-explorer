@@ -46,7 +46,7 @@ webp = "0.3"
 
 [build-dependencies]
 cc = "1.2"
-bindgen = "0.71"
+bindgen = "0.73"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
