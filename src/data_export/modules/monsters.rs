@@ -40,7 +40,7 @@ fn variety(ctx: &Ctx, row: Row<'_>) -> J {
     Obj::new()
         .set("name", text(row.str("Name")))
         .or_null("monster_type", kind.as_ref().map(|t| text(t.id())))
-        .or_null("category", ctx.rr.deref_id(row, "MonsterCategory").map(text))
+        .or_null("category", ctx.rr.deref(row, "MonsterCategory").map(|c| text(c.row().str("Name"))))
         .or_null("tags", ids("Tags"))
         .set("life_multiplier", int(row.int("LifeMultiplier")))
         .set("damage_multiplier", int(row.int("DamageMultiplier")))
