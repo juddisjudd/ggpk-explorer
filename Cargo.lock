@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "ggpk-explorer"
-version = "1.8.3"
+version = "1.8.4"
 dependencies = [
  "anyhow",
  "bincode",
