@@ -107,6 +107,7 @@ EXPORT-DATA OPTIONS:
 
 LINT OPTIONS:
         --schema <FILE>    Schema to check (default: the cached schema.min.json)
+        --suggest          Also rank target tables for references the schema leaves untargeted
         --ggpk / --steam   as above
 
 REFIT OPTIONS:
@@ -687,6 +688,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
     let mut steam: Option<String> = None;
     let mut schema_path: Option<String> = None;
     let mut is_poe2 = true;
+    let mut suggest = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -700,6 +702,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
             "--steam" => steam = Some(value(&mut i)?),
             "--schema" => schema_path = Some(value(&mut i)?),
             "--poe1" => is_poe2 = false,
+            "--suggest" => suggest = true,
             "-h" | "--help" => {
                 println!("{}", USAGE);
                 return Ok(());
@@ -747,6 +750,54 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
         }
         findings.extend(crate::dat::analysis::lint_table(dat, def, &schema, &row_counts, is_poe2, 60));
     }
+    if suggest {
+        use crate::dat::analysis::{foreign_key_stats, has_unresolved_foreign, is_foreign, rank_targets, TableStats};
+        let tables: Vec<TableStats> = readers
+            .iter()
+            .map(|(n, d)| TableStats { path: format!("data/balance/{}.datc64", n), row_count: d.row_count })
+            .collect();
+        let mut lines: Vec<(f32, String)> = Vec::new();
+        for (name, dat) in &readers {
+            let Some(def) = schema.find_table(name, is_poe2) else { continue };
+            if dat.row_count == 0 || !has_unresolved_foreign(def) || crate::dat::analysis::check_fit(dat, def, 40).is_broken() {
+                continue;
+            }
+            let path = format!("data/balance/{}.datc64", name);
+            let stats = foreign_key_stats(dat, def);
+            for (ci, col) in def.columns.iter().enumerate() {
+                if !is_foreign(col) || col.references.is_some() {
+                    continue;
+                }
+                let Some(st) = stats[ci] else { continue };
+                if st.non_null == 0 {
+                    continue;
+                }
+                let ranked = rank_targets(&st, &tables, "data/balance", "datc64", &path, 8, col.name.as_deref());
+                let Some(best) = ranked.first() else { continue };
+                let candidates: Vec<String> =
+                    ranked.iter().map(|c| format!("{} ({} rows, fit {:.2})", c.stem, c.row_count, c.fit)).collect();
+                lines.push((
+                    best.fit,
+                    format!(
+                        "{:>3.0}%  {}.{}  {} values, {} distinct, max {} => {}",
+                        best.fit * 100.0,
+                        def.name,
+                        col.name.clone().unwrap_or_else(|| format!("column {}", ci)),
+                        st.non_null,
+                        st.distinct,
+                        st.max_index,
+                        candidates.join(" | ")
+                    ),
+                ));
+            }
+        }
+        lines.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!("\n{} untargeted foreignrow column(s) hold values; tightest-fitting tables by row count:\n", lines.len());
+        for (_, line) in &lines {
+            println!("{}", line);
+        }
+    }
+
     findings.sort_by(|a, b| {
         (b.violations * 100 / b.sampled.max(1))
             .cmp(&(a.violations * 100 / a.sampled.max(1)))
