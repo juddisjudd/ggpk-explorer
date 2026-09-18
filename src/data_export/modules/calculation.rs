@@ -123,8 +123,19 @@ pub fn character_constants(ctx: &Ctx) -> Result<(), String> {
     let root = Obj::new()
         .set("character", object_stats(ctx, "Metadata/Characters/Character.ot", &["Stats", "Pathfinding"])?)
         .set("monster", object_stats(ctx, "Metadata/Monsters/Monster.ot", &["Stats"])?)
+        .or_null("player_minion_intrinsic", player_minion_intrinsic(ctx))
         .build();
     ctx.write("character_constants", &root)
+}
+
+/// Stats every player minion starts with, including spectres and tamed beasts.
+fn player_minion_intrinsic(ctx: &Ctx) -> Option<J> {
+    let table = ctx.optional_table("PlayerMinionIntrinsicStats")?;
+    let stat = table.pick(&["Stat", "Id"])?;
+    let value = table.pick(&["Value"])?;
+    Some(J::Obj(
+        table.rows().filter_map(|row| Some((ctx.rr.deref_id(row, stat)?, int(row.int(value))))).collect(),
+    ))
 }
 
 /// The `key = value` lines of the named blocks, in file order.
@@ -140,7 +151,7 @@ fn object_stats(ctx: &Ctx, path: &str, blocks: &[&str]) -> Result<J, String> {
     Ok(J::Obj(out))
 }
 
-fn scalar(value: &str) -> J {
+pub fn scalar(value: &str) -> J {
     match value {
         "true" => J::Bool(true),
         "false" => J::Bool(false),
@@ -157,6 +168,11 @@ fn scalar(value: &str) -> J {
 /// it, and which calculation contexts it belongs to.
 pub fn stats(ctx: &Ctx) -> Result<(), String> {
     let table = ctx.table("Stats")?;
+    let cannot_grant_to_minion = table.column_or_after(&["CannotGrantToMinion"], "Category", 1);
+    let column = |names: &[&'static str]| table.pick(names).unwrap_or(names[0]);
+    let semantic = column(&["Semantic", "Semantics"]);
+    let main_hand = column(&["MainHandAlias_Stat", "MainHandAlias_StatsKey"]);
+    let off_hand = column(&["OffHandAlias_Stat", "OffHandAlias_StatsKey"]);
     let root = table
         .rows()
         .filter(|row| !row.id().is_empty())
@@ -166,18 +182,26 @@ pub fn stats(ctx: &Ctx) -> Result<(), String> {
                 (!ids.is_empty()).then(|| json::strings(&ids))
             };
             let entry = Obj::new()
-                .or_null("semantic", ctx.rr.enum_label(row, "Semantic").map(|s| text(s.to_ascii_lowercase())))
+                .or_null("semantic", ctx.rr.enum_label(row, semantic).map(|s| text(s.to_ascii_lowercase())))
                 .set("is_local", J::Bool(row.bool("IsLocal")))
                 .set("is_weapon_local", J::Bool(row.bool("IsWeaponLocal")))
                 .set("is_virtual", J::Bool(row.bool("IsVirtual")))
                 .set("is_scalable", J::Bool(row.bool("IsScalable")))
-                .set("weapon_hand_check", J::Bool(row.bool("WeaponHandCheck")))
-                .or_null("main_hand_alias", ctx.rr.deref_id(row, "MainHandAlias_Stat").map(text))
-                .or_null("off_hand_alias", ctx.rr.deref_id(row, "OffHandAlias_Stat").map(text))
+                .or_null("weapon_hand_check", table.has_col("WeaponHandCheck").then(|| J::Bool(row.bool("WeaponHandCheck"))))
+                .or_null("cannot_grant_to_minion", cannot_grant_to_minion.map(|c| J::Bool(row.bool_at(c))))
+                .or_null("main_hand_alias", ctx.rr.deref_id(row, main_hand).map(text))
+                .or_null("off_hand_alias", ctx.rr.deref_id(row, off_hand).map(text))
                 .or_null("context_flags", ids("ContextFlags"))
                 .or_null("dot_flags", ids("DotFlag"))
                 .or_null("category", ctx.rr.deref_id(row, "Category").map(text))
-                .or_null("active_skills", ids("BelongsActiveSkills"))
+                .or_null("active_skills", match table.has_col("BelongsActiveSkillsKey") {
+                    // PoE 1 names the skills by their string id rather than by row.
+                    true => {
+                        let skills = row.list_str("BelongsActiveSkillsKey");
+                        (!skills.is_empty()).then(|| json::strings(skills))
+                    }
+                    false => ids("BelongsActiveSkills"),
+                })
                 .build();
             (row.id().to_string(), entry)
         })
@@ -225,7 +249,7 @@ pub fn attack_damage_scaling(ctx: &Ctx) -> Result<(), String> {
                 (!out.is_empty()).then(|| J::Obj(out))
             };
             let entry = Obj::new()
-                .or_null("multipliers", per_level(&multipliers, "SkillType", &|r| json::float(r.float("Scaling"))))
+                .or_null("multipliers", per_level(&multipliers, "SkillType", &|r| json::float32(r.float("Scaling"))))
                 .or_null(
                     "flat_physical",
                     per_level(&flat, "ScalingType", &|r| json::arr([int(r.int("MinPhys")), int(r.int("MaxPhys"))])),

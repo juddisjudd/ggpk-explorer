@@ -112,7 +112,7 @@ pub fn parse_csd(data: &[u8], file_path: &str) -> Result<CsdFile, String> {
                  if let Ok(id_count) = count_str.parse::<usize>() {
                      // Check range constraints from C# (count <= 0 or >= 5 continue??)
                      // "if (partsCount is <= 0 or >= 5) continue;"
-                     if id_count > 0 && id_count < 10 { // Relaxed upper bound just in case
+                     if id_count > 0 {
                          for part in id_parts.iter().skip(1).take(id_count) {
                              current_ids.push(part.to_string());
                          }

@@ -2,13 +2,25 @@
 //! pull the art with them, and where they land.
 
 use crate::data_export::DataExportOptions;
+use crate::settings::Game;
 use crate::ui::components::modal_section;
 use eframe::egui;
 
+/// One dump in the list: its name, what it holds, whether it is ticked, and
+/// why this game leaves it out.
+struct ModuleChoice {
+    name: &'static str,
+    summary: &'static str,
+    on: bool,
+    skipped: Option<&'static str>,
+}
+
 pub struct DataExportWindow {
     open: bool,
+    /// Which game the open install is, so dumps the other game owns are shown as such.
+    game: Game,
     /// Selected state per module, in registry order.
-    modules: Vec<(&'static str, &'static str, bool)>,
+    modules: Vec<ModuleChoice>,
     images: bool,
     trade_stats: bool,
     /// Leave null-valued keys out of the JSON.
@@ -23,9 +35,10 @@ impl Default for DataExportWindow {
     fn default() -> Self {
         Self {
             open: false,
+            game: Game::default(),
             modules: crate::data_export::registry()
                 .into_iter()
-                .map(|m| (m.name, m.summary, true))
+                .map(|m| ModuleChoice { name: m.name, summary: m.summary, on: true, skipped: None })
                 .collect(),
             images: false,
             trade_stats: false,
@@ -37,21 +50,33 @@ impl Default for DataExportWindow {
 }
 
 impl DataExportWindow {
-    pub fn open_with(&mut self, version: Option<String>) {
+    pub fn open_with(&mut self, version: Option<String>, game: Game) {
         self.open = true;
         self.version = version;
+        self.game = game;
+        // Every dump this game writes starts ticked: a dump greyed out for the
+        // other game must not stay unticked once it applies again.
+        for (module, choice) in crate::data_export::registry().into_iter().zip(&mut self.modules) {
+            choice.skipped = module.skip_reason(game);
+            choice.on = choice.skipped.is_none();
+        }
+    }
+
+    /// The dumps this game can write.
+    fn available(&self) -> impl Iterator<Item = &ModuleChoice> {
+        self.modules.iter().filter(|m| m.skipped.is_none())
     }
 
     /// The options as chosen. `only` is left empty when everything is ticked,
     /// so the export runs its full set rather than a list that happens to
     /// match.
     pub fn options(&self) -> DataExportOptions {
-        let all = self.modules.iter().all(|(_, _, on)| *on);
+        let all = self.available().all(|m| m.on);
         DataExportOptions {
             only: if all {
                 Vec::new()
             } else {
-                self.modules.iter().filter(|(_, _, on)| *on).map(|(name, _, _)| name.to_string()).collect()
+                self.available().filter(|m| m.on).map(|m| m.name.to_string()).collect()
             },
             images: self.images,
             trade_stats: self.trade_stats,
@@ -62,7 +87,7 @@ impl DataExportWindow {
     }
 
     fn selected(&self) -> usize {
-        self.modules.iter().filter(|(_, _, on)| *on).count()
+        self.available().filter(|m| m.on).count()
     }
 
     /// Draws the dialog; true means the user asked to export.
@@ -95,6 +120,12 @@ impl DataExportWindow {
                     .size(11.5)
                     .color(muted),
                 );
+                let skipped = self.modules.len() - self.available().count();
+                let reading = match skipped {
+                    0 => format!("Reading {}", self.game.label()),
+                    n => format!("Reading {} — {} dumps are the other game's", self.game.label(), n),
+                };
+                ui.label(egui::RichText::new(reading).size(11.5).color(muted));
 
                 ui.separator();
                 modal_section(ui, "DESTINATION");
@@ -143,23 +174,25 @@ impl DataExportWindow {
                     modal_section(ui, "DUMPS");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("None").clicked() {
-                            self.modules.iter_mut().for_each(|(_, _, on)| *on = false);
+                            self.modules.iter_mut().for_each(|m| m.on = false);
                         }
                         if ui.small_button("All").clicked() {
-                            self.modules.iter_mut().for_each(|(_, _, on)| *on = true);
+                            self.modules.iter_mut().for_each(|m| m.on = m.skipped.is_none());
                         }
                     });
                 });
 
                 egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                    for (name, summary, on) in &mut self.modules {
-                        ui.checkbox(on, *name).on_hover_text(*summary);
+                    for module in &mut self.modules {
+                        let enabled = module.skipped.is_none();
+                        ui.add_enabled(enabled, egui::Checkbox::new(&mut module.on, module.name))
+                            .on_hover_text(module.skipped.unwrap_or(module.summary));
                     }
                 });
 
                 ui.add_space(4.0);
                 ui.label(
-                    egui::RichText::new(format!("SELECTED · {} of {}", self.selected(), self.modules.len()))
+                    egui::RichText::new(format!("SELECTED · {} of {}", self.selected(), self.available().count()))
                         .monospace()
                         .size(10.5)
                         .color(muted),
@@ -201,6 +234,21 @@ mod tests {
         DataExportWindow { version: Some("4.5.4.11".into()), ..Default::default() }
     }
 
+    /// Opening the dialog on one game and then the other must not leave the
+    /// first game's dumps unticked, or that export quietly runs a short list.
+    #[test]
+    fn switching_game_restores_the_dumps_that_apply_again() {
+        let mut w = window();
+        w.open_with(Some("3.29.3.3".into()), Game::Poe1);
+        assert!(w.modules.iter().any(|m| m.name == "augments" && m.skipped.is_some() && !m.on));
+        assert!(w.options().only.is_empty(), "a full PoE 1 selection runs every PoE 1 dump");
+
+        w.open_with(Some("4.5.5.2".into()), Game::Poe2);
+        let augments = w.modules.iter().find(|m| m.name == "augments").unwrap();
+        assert!(augments.skipped.is_none() && augments.on, "augments is a PoE 2 dump and comes back ticked");
+        assert!(w.options().only.is_empty(), "a full PoE 2 selection runs every PoE 2 dump");
+    }
+
     #[test]
     fn everything_ticked_asks_for_no_filter() {
         let options = window().options();
@@ -212,7 +260,7 @@ mod tests {
     #[test]
     fn a_subset_is_passed_through_by_name() {
         let mut w = window();
-        w.modules.iter_mut().for_each(|(name, _, on)| *on = *name == "mods");
+        w.modules.iter_mut().for_each(|m| m.on = m.name == "mods");
         assert_eq!(w.options().only, vec!["mods".to_string()]);
     }
 

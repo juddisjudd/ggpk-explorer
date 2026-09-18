@@ -2,7 +2,7 @@
 
 use crate::data_export::json::{self, int, text, Obj, J};
 use crate::data_export::{statics, Ctx};
-use crate::dat::relational::Row;
+use crate::dat::relational::{FileSource, Row};
 use crate::dat::stat_translation::TranslationLookup;
 use std::collections::HashMap;
 
@@ -41,13 +41,14 @@ fn attribute_requirement(level: i64, weight: i64) -> i64 {
 }
 
 /// Gem level to the character level it asks for, per `ItemExperienceTypes`
-/// row. The curve starts at zero, which the client shows as level one.
-fn level_curves(ctx: &Ctx) -> HashMap<usize, Vec<(i64, i64)>> {
+/// row. The curve starts at zero, which the client shows as level one. PoE 1
+/// keeps no character level here, only the gem levels.
+fn level_curves(ctx: &Ctx) -> HashMap<usize, Vec<(i64, Option<i64>)>> {
     let Some(table) = ctx.optional_table("ItemExperiencePerLevel") else { return HashMap::new() };
-    let mut out: HashMap<usize, Vec<(i64, i64)>> = HashMap::new();
+    let mut out: HashMap<usize, Vec<(i64, Option<i64>)>> = HashMap::new();
     for row in table.rows() {
         if let Some(kind) = row.key("ItemExperienceType") {
-            out.entry(kind).or_default().push((row.int("ItemCurrentLevel"), row.int("Level")));
+            out.entry(kind).or_default().push((row.int("ItemCurrentLevel"), row.opt_int("Level")));
         }
     }
     for curve in out.values_mut() {
@@ -58,27 +59,44 @@ fn level_curves(ctx: &Ctx) -> HashMap<usize, Vec<(i64, i64)>> {
 
 pub fn skill_gems(ctx: &Ctx) -> Result<(), String> {
     let gems = ctx.table("SkillGems")?;
+    let effects_column = gems.require(&["GemEffects", "GemVariants"])?;
+    let base_column = gems.require(&["BaseItemType", "BaseItemTypesKey"])?;
     let supports = support_gems(ctx);
     let recommended = recommended_supports(ctx);
     let curves = level_curves(ctx);
+    let player_levels = player_level_requirements(ctx);
+    let has_column = |row: Row<'_>, column: &str| row.table.has_col(column);
 
     let mut root: Vec<(String, J)> = Vec::new();
     for gem in gems.rows() {
-        for effect in ctx.rr.deref_list(gem, "GemEffects") {
+        for effect in ctx.rr.deref_list(gem, effects_column) {
             let effect = effect.row();
             // `[DNT]` marks an effect the developers left in but do not ship.
             if effect.str("Name").contains("[DNT]") {
                 continue;
             }
-            let Some(base) = ctx.rr.deref(gem, "BaseItemType") else { continue };
+            // A PoE 1 Vaal gem lists its skill's transfigured styles too, which no item carries.
+            if !ctx.rr.is_poe2
+                && gem.bool("IsVaalVariant")
+                && ctx.rr.enum_label(effect, "ItemColor").is_some_and(|style| style != "DEFAULT")
+            {
+                continue;
+            }
+            let Some(base) = ctx.rr.deref(gem, base_column) else { continue };
             let base = base.row();
-            let gem_type = GEM_TYPES.get(gem.int("GemType") as usize).copied().unwrap_or("active");
+            let gem_type = match has_column(gem, "GemType") {
+                true => GEM_TYPES.get(gem.int("GemType") as usize).copied().unwrap_or("active"),
+                false if gem.bool("IsSupport") => "support",
+                false => "active",
+            };
 
             let mut granted = Vec::new();
             if let Some(id) = ctx.rr.deref_id(effect, "GrantedEffect") {
                 granted.push(id);
             }
             granted.extend(ctx.rr.deref_list_ids(effect, "AdditionalGrantedEffects"));
+            let secondary = ctx.rr.deref_id(effect, "GrantedEffect2");
+            granted.extend(secondary.clone());
 
             let support = supports.get(&gem.index).copied();
             let base_icon = if gem_type == "support" {
@@ -131,26 +149,45 @@ pub fn skill_gems(ctx: &Ctx) -> Result<(), String> {
                 .or_null("support_text", json::opt_text(effect.str("SupportText")))
                 .or_null("skill_name", json::opt_text(effect.str("Name")))
                 .or_null("crafting_types", (!crafting.is_empty()).then(|| json::strings(&crafting)))
-                .set("crafting_level", int(gem.int("CraftingLevel")))
+                .or_null("crafting_level", has_column(gem, "CraftingLevel").then(|| int(gem.int("CraftingLevel"))))
+                .set("gem_effect_id", text(effect.id()))
                 .or_null("tutorial_video", json::opt_text(gem.str("TutorialVideo")))
                 .or_null("ui_image", json::opt_text(gem.str("UI_Image")))
                 .or_null("icon_dds_file", icon.map(text));
+            let display_order = effect
+                .table
+                .column_or_after(&["GrantedEffectDisplayOrder"], "AdditionalGrantedEffects", 3)
+                .map(|c| effect.list_int_at(c))
+                .filter(|order| !order.is_empty());
+            if let Some(order) = display_order {
+                entry = entry.set("granted_effect_display_order", J::Arr(order.into_iter().map(int).collect()));
+            }
 
             let weights = [
                 ("strength", gem.int("StrengthRequirementPercent")),
                 ("dexterity", gem.int("DexterityRequirementPercent")),
                 ("intelligence", gem.int("IntelligenceRequirementPercent")),
             ];
+            let primary = effect.key("GrantedEffect");
             if let Some(curve) = gem.key("ItemExperienceType").and_then(|k| curves.get(&k)) {
                 let requirements: Vec<(String, J)> = curve
                     .iter()
                     .map(|(gem_level, level)| {
-                        let mut row = Obj::new().set("level", int((*level).max(1)));
-                        for (attribute, weight) in weights {
-                            if weight > 0 && gem_type != "support" {
-                                row = row.set(attribute, int(attribute_requirement(*level, weight)));
+                        let row = match level {
+                            Some(level) => {
+                                let mut row = Obj::new().set("level", int((*level).max(1)));
+                                for (attribute, weight) in weights {
+                                    if weight > 0 && gem_type != "support" {
+                                        row = row.set(attribute, int(attribute_requirement(*level, weight)));
+                                    }
+                                }
+                                row
                             }
-                        }
+                            None => Obj::new().or_null(
+                                "level",
+                                primary.and_then(|p| player_levels.get(&(p, *gem_level))).map(|l| number(*l as f64)),
+                            ),
+                        };
                         (gem_level.to_string(), row.build())
                     })
                     .collect();
@@ -160,17 +197,39 @@ pub fn skill_gems(ctx: &Ctx) -> Result<(), String> {
                     .set("requirements", J::Obj(requirements));
             }
 
-            if gem_type == "support" {
-                let lineage = support
-                    .and_then(|i| ctx.optional_table("SupportGems").and_then(|t| t.row(i).map(|r| r.bool("IsLineage"))))
-                    .unwrap_or(false);
-                entry = entry.set("is_lineage", J::Bool(lineage));
-            } else {
+            if !ctx.rr.is_poe2 {
+                entry = entry
+                    .set("is_vaal_variant", J::Bool(gem.bool("IsVaalVariant")))
+                    .or_null("vaal_variant", ctx.rr.deref_id(gem, "VaalVariant_BaseItemTypesKey").map(text))
+                    .or_null("secondary_granted_effect", secondary.map(text))
+                    .or_null("style", ctx.rr.enum_label(effect, "ItemColor").map(|s| text(s.to_ascii_lowercase())));
+            }
+
+            if gem_type == "support" && ctx.rr.table("SupportGems").is_some() {
+                let table = ctx.optional_table("SupportGems");
+                let row = support.and_then(|i| table.as_ref()?.row(i));
+                let lineage = row.map(|r| r.bool("IsLineage")).unwrap_or(false);
+                let families = row.map(|r| ctx.rr.deref_list(r, "Family")).unwrap_or_default();
+                entry = entry
+                    .set("is_lineage", J::Bool(lineage))
+                    .set("families", json::strings(families.iter().map(|f| f.id())))
+                    .set("family_names", json::strings(families.iter().map(|f| f.row().string("Text"))))
+                    .or_null(
+                        "flavour_text",
+                        row.and_then(|r| ctx.rr.deref(r, "FlavourText"))
+                            .and_then(|f| json::opt_text(f.row().str("Text").replace("\r\n", "\n"))),
+                    );
+            } else if let Some(recommended) = &recommended {
                 let picks = recommended.get(&gem.index).cloned().unwrap_or_default();
                 entry = entry.set("recommended_supports", json::strings(&picks));
             }
 
-            root.push((base.id().to_string(), json::sorted(entry.build())));
+            // PoE 1 transfigured gems share one base item, so each style is keyed by its own effect.
+            let key = match ctx.rr.is_poe2 {
+                true => base.id().to_string(),
+                false => effect.id().to_string(),
+            };
+            root.push((key, json::sorted(entry.build())));
         }
     }
     root.sort_by(|a, b| a.0.cmp(&b.0));
@@ -191,9 +250,32 @@ fn support_gems(ctx: &Ctx) -> HashMap<usize, usize> {
     out
 }
 
-/// Base item ids of the supports the client suggests for each skill gem.
-fn recommended_supports(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
-    let Some(table) = ctx.optional_table("SkillGemSupports") else { return HashMap::new() };
+/// Character level each granted effect level asks for, where the level rows
+/// carry it (PoE 1).
+fn player_level_requirements(ctx: &Ctx) -> HashMap<(usize, i64), f32> {
+    let Some(table) = ctx.optional_table("GrantedEffectsPerLevel") else { return HashMap::new() };
+    if !table.has_col("PlayerLevelReq") {
+        return HashMap::new();
+    }
+    table
+        .rows()
+        .filter_map(|row| Some(((row.key("GrantedEffect")?, row.int("Level")), row.float("PlayerLevelReq"))))
+        .collect()
+}
+
+/// A whole number prints as an integer, anything else as the float it is.
+fn number(value: f64) -> J {
+    match value.fract() == 0.0 {
+        true => int(value as i64),
+        false => J::Num(value),
+    }
+}
+
+/// Base item ids of the supports the client suggests for each skill gem, where
+/// the game has such a table.
+fn recommended_supports(ctx: &Ctx) -> Option<HashMap<usize, Vec<String>>> {
+    ctx.rr.table("SkillGemSupports")?;
+    let table = ctx.optional_table("SkillGemSupports")?;
     let mut out: HashMap<usize, Vec<String>> = HashMap::new();
     for row in table.rows() {
         let Some(gem) = row.key("SkillGem") else { continue };
@@ -208,7 +290,7 @@ fn recommended_supports(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
             .collect();
         out.insert(gem, picks);
     }
-    out
+    Some(out)
 }
 
 pub fn ascendancies(ctx: &Ctx) -> Result<(), String> {
@@ -228,9 +310,9 @@ pub fn ascendancies(ctx: &Ctx) -> Result<(), String> {
                 .set("flavour_text_colour", text(row.str("RGBFlavourTextColour")))
                 .set("string", text(row.str("OGGFile")))
                 .set("passive_tree_image", text(row.str("PassiveTreeImage")))
-                .set("tree_region_vector", int(row.int("TreeRegionVector")))
-                .set("tree_region_angle", int(row.int("TreeRegionAngle")))
-                .set("disabled", J::Bool(row.bool("Disabled")))
+                .or_null("tree_region_vector", row.table.has_col("TreeRegionVector").then(|| int(row.int("TreeRegionVector"))))
+                .or_null("tree_region_angle", row.table.has_col("TreeRegionAngle").then(|| int(row.int("TreeRegionAngle"))))
+                .or_null("disabled", row.table.has_col("Disabled").then(|| J::Bool(row.bool("Disabled"))))
                 .or_null("overrides_ascendancy", ctx.rr.deref_id(row, "BaseAscendancy").map(text))
                 .set("art", super::passives::ui_art(ctx, ctx.rr.deref(row, "UIArt").as_ref()));
 
@@ -275,10 +357,11 @@ fn ascendancy_overrides(ctx: &Ctx) -> HashMap<usize, Vec<usize>> {
 /// sets that describe what it actually does.
 pub fn skills(ctx: &Ctx) -> Result<(), String> {
     let effects = ctx.table("GrantedEffects")?;
-    let levels_by_effect = group_by(ctx, "GrantedEffectsPerLevel", "GrantedEffect");
-    let quality_by_effect = group_by(ctx, "GrantedEffectQualityStats", "GrantedEffect");
-    let levels_by_set = group_by(ctx, "GrantedEffectStatSetsPerLevel", "StatSet");
+    let levels_by_effect = group_by(ctx, "GrantedEffectsPerLevel", &["GrantedEffect"]);
+    let quality_by_effect = group_by(ctx, "GrantedEffectQualityStats", &["GrantedEffect", "GrantedEffectsKey"]);
+    let levels_by_set = group_by(ctx, "GrantedEffectStatSetsPerLevel", &["StatSet"]);
     let totems = skill_totem_multipliers(ctx);
+    let description_files = skill_description_files(ctx);
 
     let mut root: Vec<(String, J)> = Vec::new();
     for effect in effects.rows() {
@@ -297,6 +380,7 @@ pub fn skills(ctx: &Ctx) -> Result<(), String> {
                 Obj::new()
                     .set("letter", text(effect.str("SupportGemLetter")))
                     .set("supports_gems_only", J::Bool(effect.bool("SupportsGemsOnly")))
+                    .set("ignore_minion_types", J::Bool(effect.bool("IgnoreMinionTypes")))
                     .or_null("allowed_types", types(ctx, effect, "AllowedActiveSkillTypes"))
                     .or_null("excluded_types", types(ctx, effect, "ExcludedActiveSkillTypes"))
                     .or_null("added_types", types(ctx, effect, "AddedActiveSkillTypes"))
@@ -308,6 +392,9 @@ pub fn skills(ctx: &Ctx) -> Result<(), String> {
             entry = entry
                 .set("cast_time", int(effect.int("CastTime")))
                 .set("active_skill", active_skill(ctx, active.row(), &totems));
+            if effect.bool("CannotBeSupported") {
+                entry = entry.set("cannot_be_supported", J::Bool(true));
+            }
         }
         entry = entry.set("stats", J::Obj(Vec::new()));
 
@@ -330,9 +417,9 @@ pub fn skills(ctx: &Ctx) -> Result<(), String> {
         // Stat sets: what the skill grants at each gem level.
         let sets: Vec<crate::dat::relational::Ref> = ctx
             .rr
-            .deref(effect, "StatSet")
+            .deref(effect, pick(effect, &["StatSet", "StatSet1"]))
             .into_iter()
-            .chain(ctx.rr.deref_list(effect, "AdditionalStatSets"))
+            .chain(ctx.rr.deref_list(effect, pick(effect, &["AdditionalStatSets", "StatSet2"])))
             .collect();
         if !sets.is_empty() {
             let primary = sets[0].clone();
@@ -341,7 +428,8 @@ pub fn skills(ctx: &Ctx) -> Result<(), String> {
                 .iter()
                 .enumerate()
                 .map(|(i, set)| {
-                    stat_set(ctx, set, &primary, i, skill_id.as_deref(), &levels_by_set, &quality_rows)
+                    let file = pick_translation_file(ctx, skill_id.as_deref(), i, &description_files);
+                    stat_set(ctx, set, &primary, i, file, &levels_by_set, &quality_rows)
                 })
                 .collect();
             entry = entry.set("stat_sets", J::Arr(set_json));
@@ -354,6 +442,11 @@ pub fn skills(ctx: &Ctx) -> Result<(), String> {
     ctx.write("skills", &J::Obj(root))
 }
 
+/// The first of `names` the row's table has; PoE 1 often adds a `Key` suffix.
+fn pick<'n>(row: Row<'_>, names: &[&'n str]) -> &'n str {
+    row.table.pick(names).unwrap_or(names[0])
+}
+
 fn types(ctx: &Ctx, row: Row<'_>, column: &str) -> Option<J> {
     let ids = ctx.rr.deref_list_ids(row, column);
     (!ids.is_empty()).then(|| json::strings(&ids))
@@ -362,6 +455,9 @@ fn types(ctx: &Ctx, row: Row<'_>, column: &str) -> Option<J> {
 /// Item classes the skill can be used with. The skill names a requirement
 /// group such as `Any Mace`, which in turn names the wieldable classes.
 fn weapon_restrictions(ctx: &Ctx, row: Row<'_>) -> Vec<String> {
+    if !row.table.has_col("WeaponRequirements") {
+        return ctx.rr.deref_list_ids(row, "WeaponRestriction_ItemClassesKeys");
+    }
     let Some(requirement) = ctx.rr.deref(row, "WeaponRequirements") else { return Vec::new() };
     let wieldable = ctx.rr.deref_list(requirement.row(), "WieldableClasses");
     let mut out: Vec<String> = Vec::new();
@@ -376,8 +472,8 @@ fn weapon_restrictions(ctx: &Ctx, row: Row<'_>) -> Vec<String> {
 }
 
 fn active_skill(ctx: &Ctx, row: Row<'_>, totems: &HashMap<i64, f64>) -> J {
-    let inputs = ctx.rr.deref_list_ids(row, "Input_Stats");
-    let outputs = ctx.rr.deref_list_ids(row, "Output_Stats");
+    let inputs = ctx.rr.deref_list_ids(row, pick(row, &["Input_Stats", "Input_StatKeys"]));
+    let outputs = ctx.rr.deref_list_ids(row, pick(row, &["Output_Stats", "Output_StatKeys"]));
     let conversions: Vec<(String, J)> =
         inputs.into_iter().zip(outputs).map(|(from, to)| (from, text(to))).collect();
 
@@ -394,6 +490,7 @@ fn active_skill(ctx: &Ctx, row: Row<'_>, totems: &HashMap<i64, f64>) -> J {
         .set("stat_conversions", J::Obj(conversions));
     if let Some(multiplier) = multiplier {
         out = out.set("skill_totem_life_multiplier", J::Num(multiplier));
+        out = out.set("skill_totem_id", int(totem));
     }
     if let Some(minion) = types(ctx, row, "MinionActiveSkillTypes") {
         out = out.set("minion_types", minion);
@@ -428,14 +525,41 @@ fn per_level(ctx: &Ctx, effect: Row<'_>, level: Row<'_>, is_support: bool) -> J 
     if stored > 0 {
         out = out.set("stored_uses", int(stored));
     }
+    for (key, column) in [
+        ("attack_time", "AttackTime"),
+        ("soul_gain_prevention_duration", "SoulGainPreventionDuration"),
+        ("pvp_damage_multiplier", "PvPDamageMultiplier"),
+    ] {
+        let value = level.int(column);
+        if value != 0 {
+            out = out.set(key, int(value));
+        }
+    }
+    // dat-schema calls this `EffectOnPlayer`; supports read it as their reservation multiplier.
+    if let Some(column) = level.table.pick(&["ReservationMultiplier", "EffectOnPlayer"]) {
+        let value = level.int(column);
+        if value != 100 {
+            out = out.set("reservation_multiplier", int(value));
+        }
+    }
+
+    if level.table.has_col("PlayerLevelReq") {
+        out = out.set("required_level", number(level.float("PlayerLevelReq") as f64));
+    }
 
     if is_support {
         out = out.set("cost_multiplier", int(level.int("CostMultiplier")));
     } else {
+        let cost_multiplier = level.int("CostMultiplier");
+        if cost_multiplier != 100 {
+            out = out.set("cost_multiplier", int(cost_multiplier));
+        }
         let amounts = level.list_int("CostAmounts");
+        // PoE 1 names the cost types on each level, PoE 2 once on the effect.
+        let cost_row = if level.table.has_col("CostTypes") { level } else { effect };
         let costs: Vec<(String, J)> = ctx
             .rr
-            .deref_list(effect, "CostTypes")
+            .deref_list(cost_row, "CostTypes")
             .iter()
             .enumerate()
             .filter_map(|(i, kind)| amounts.get(i).map(|amount| (kind.id(), int(*amount))))
@@ -457,9 +581,31 @@ fn per_level(ctx: &Ctx, effect: Row<'_>, level: Row<'_>, is_support: bool) -> J 
         }
     }
 
-    let reservation = level.int("Reservation");
-    out.or_null("reservations", (reservation > 0).then(|| Obj::new().set("spirit", int(reservation)).build()))
-        .build()
+    out.or_null("reservations", reservations(level)).build()
+}
+
+/// PoE 2 reserves spirit; PoE 1 reserves mana or life, flat or as a percentage
+/// stored in hundredths.
+fn reservations(level: Row<'_>) -> Option<J> {
+    if !level.table.has_col("ManaReservationFlat") {
+        let reservation = level.int("Reservation");
+        return (reservation > 0).then(|| Obj::new().set("spirit", int(reservation)).build());
+    }
+    let mut out = Obj::new();
+    let mut any = false;
+    for (key, column, divisor) in [
+        ("mana_flat", "ManaReservationFlat", 1.0),
+        ("mana_percent", "ManaReservationPercent", 100.0),
+        ("life_flat", "LifeReservationFlat", 1.0),
+        ("life_percent", "LifeReservationPercent", 100.0),
+    ] {
+        let value = level.int(column);
+        if value > 0 {
+            out = out.set(key, number(value as f64 / divisor));
+            any = true;
+        }
+    }
+    any.then(|| out.build())
 }
 
 /// Turns the `stat_order` maps collected across levels into one
@@ -512,11 +658,10 @@ fn stat_set(
     set: &crate::dat::relational::Ref,
     primary: &crate::dat::relational::Ref,
     position: usize,
-    skill_id: Option<&str>,
+    (file_name, translations): (Option<String>, Option<std::rc::Rc<TranslationLookup>>),
     levels_by_set: &HashMap<usize, Vec<usize>>,
     quality_rows: &[usize],
 ) -> J {
-    let (file_name, translations) = pick_translation_file(ctx, skill_id, position);
     let per_level_table = ctx.optional_table("GrantedEffectStatSetsPerLevel");
 
     let order = |index: usize| -> i64 {
@@ -553,15 +698,58 @@ fn stat_set(
 
     let shared = statics::extract(&mut level_values).unwrap_or(J::Obj(Vec::new()));
     let shared = tooltip_order(shared, &mut level_values);
+    let effectiveness = |column: &str| set.row().get(column).map(|_| json::float32(set.row().float(column)));
 
     Obj::new()
         .set("id", text(set.row().id()))
         .or_null("label", ctx.rr.deref_id(set.row(), "Label").map(text))
         .or_null("label_text", label_text(ctx, set).map(text))
+        .or_null("base_effectiveness", effectiveness("BaseEffectiveness"))
+        .or_null("incremental_effectiveness", effectiveness("IncrementalEffectiveness"))
+        .or_null("damage_incremental_effectiveness", effectiveness("DamageIncrementalEffectiveness"))
+        .or_null(
+            "use_set_attack_multiplier",
+            set.row().table.column_or_after(&["UseSetAttackMulti"], "IgnoredStats", 1).map(|c| J::Bool(set.row().bool_at(c))),
+        )
         .set("per_level", J::Obj(level_keys.into_iter().zip(level_values).collect()))
         .set("static", shared)
         .or_null("translation_file", file_name.map(text))
         .build()
+}
+
+/// PoE 1 names each active skill's description file in
+/// `skillpopup_stat_filters.txt`; a `copy` line gives a skill another's entry.
+fn skill_description_files(ctx: &Ctx) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    if ctx.rr.is_poe2 {
+        return out;
+    }
+    let Some(bytes) = ctx.files.fetch("Metadata/StatDescriptions/skillpopup_stat_filters.txt") else { return out };
+    let mut copies: Vec<(String, String)> = Vec::new();
+    for line in crate::parsers::utils::decode_text_lossy(&bytes).lines() {
+        let mut words = line.split_whitespace();
+        match (words.next(), words.next(), words.next()) {
+            (Some("copy"), Some(to), Some(from)) => copies.push((to.to_string(), from.to_string())),
+            (Some(skill), Some(path), None) => {
+                if let Some(file) = path.trim_matches('"').strip_prefix("Metadata/StatDescriptions/") {
+                    out.insert(skill.to_string(), file.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    loop {
+        let before = out.len();
+        for (to, from) in &copies {
+            if let Some(file) = out.get(from).cloned() {
+                out.entry(to.clone()).or_insert(file);
+            }
+        }
+        if out.len() == before {
+            break;
+        }
+    }
+    out
 }
 
 /// A skill's own description file if it has one, then the generic one. The
@@ -571,7 +759,16 @@ fn pick_translation_file(
     ctx: &Ctx,
     skill_id: Option<&str>,
     position: usize,
+    poe1_files: &HashMap<String, String>,
 ) -> (Option<String>, Option<std::rc::Rc<TranslationLookup>>) {
+    if !ctx.rr.is_poe2 {
+        let file = match skill_id {
+            None => "gem_stat_descriptions.txt".to_string(),
+            Some(skill) => poe1_files.get(skill).cloned().unwrap_or_else(|| "skill_stat_descriptions.txt".to_string()),
+        };
+        let translations = ctx.translations(&file);
+        return (Some(file), Some(translations));
+    }
     let candidates: Vec<String> = match skill_id {
         None => vec!["gem_stat_descriptions.txt".to_string()],
         Some(skill) => {
@@ -620,40 +817,55 @@ fn stat_set_level(
     if let Some(crit) = crit {
         out = out.set("crit_chance", int(crit));
     }
+    if level.get("ActorLevel").is_some() {
+        out = out.set("actor_level", json::float32(level.float("ActorLevel")));
+    }
+    let effectiveness = level.int("DamageEffectiveness");
+    if effectiveness != 0 {
+        out = out.set("damage_effectiveness", number(100.0 + effectiveness as f64 / 100.0));
+    }
 
-    let mut stats: Vec<(String, i64, &'static str)> = Vec::new();
+    let mut stats: Vec<LevelStat> = Vec::new();
     collect_stats(ctx, set, level, &mut stats);
     // A secondary set inherits the primary's numbers except the ones it names
-    // as ignored.
-    if set.index != primary.index {
+    // as ignored. PoE 1 names none, so nothing says what it would inherit.
+    if set.index != primary.index && set.table.has_col("IgnoredStats") {
         let ignored = ctx.rr.deref_list_ids(set, "IgnoredStats");
-        let mut inherited: Vec<(String, i64, &'static str)> = Vec::new();
+        let mut inherited: Vec<LevelStat> = Vec::new();
         if let Some(primary_level) = primary_level {
             collect_stats(ctx, primary, primary_level, &mut inherited);
         }
-        stats.extend(inherited.into_iter().filter(|(id, _, _)| !ignored.contains(id)));
+        stats.extend(inherited.into_iter().filter(|stat| !ignored.contains(&stat.id)));
     }
 
     // The same stat listed twice adds up, except an implicit which just is.
-    let mut merged: Vec<(String, i64, &'static str)> = Vec::new();
-    for (id, value, kind) in stats {
-        match merged.iter_mut().find(|(existing, _, _)| *existing == id) {
-            Some(slot) if kind != "implicit" => slot.1 += value,
+    let mut merged: Vec<LevelStat> = Vec::new();
+    for stat in stats {
+        match merged.iter_mut().find(|existing| existing.id == stat.id) {
+            Some(slot) if stat.kind != "implicit" => slot.value += stat.value,
             Some(_) => {}
-            None => merged.push((id, value, kind)),
+            None => merged.push(stat),
         }
     }
 
     out = out.set(
         "stats",
-        json::arr(merged.iter().map(|(id, value, kind)| {
-            Obj::new().set("id", text(id)).set("type", text(*kind)).set("value", int(*value)).build()
+        json::arr(merged.iter().map(|stat| {
+            Obj::new()
+                .set("id", text(&stat.id))
+                .set("type", text(stat.kind))
+                .set("value", int(stat.value))
+                .opt("float_value", stat.float_value.map(json::float32))
+                .opt("interpolation", stat.interpolation.map(int))
+                .opt("interpolation_base", stat.interpolation_base.as_ref().map(text))
+                .opt("interpolation_base_value", stat.interpolation_base_value.map(json::float32))
+                .build()
         })),
     );
 
     if let Some(translations) = translations {
         let described: Vec<(String, i64)> =
-            merged.iter().filter(|(_, v, _)| *v != 0).map(|(id, v, _)| (id.clone(), *v)).collect();
+            merged.iter().filter(|stat| stat.value != 0).map(|stat| (stat.id.clone(), stat.value)).collect();
         let ids: Vec<String> = described.iter().map(|(id, _)| id.clone()).collect();
         let values: Vec<i32> = described.iter().map(|(_, v)| *v as i32).collect();
         let mut text_by_stats: Vec<(String, J)> = Vec::new();
@@ -681,25 +893,65 @@ fn stat_set_level(
     out.build()
 }
 
-/// Reads one stat set level into `(id, value, kind)` triples.
-fn collect_stats(ctx: &Ctx, set: Row<'_>, level: Row<'_>, out: &mut Vec<(String, i64, &'static str)>) {
-    let float_values = level.list_int("BaseResolvedValues");
-    for (i, stat) in ctx.rr.deref_list(level, "FloatStats").iter().enumerate() {
-        out.push((stat.id(), float_values.get(i).copied().unwrap_or(0), "float"));
+/// `value` is resolved at the level's own actor level; `float_value` is not.
+struct LevelStat {
+    id: String,
+    value: i64,
+    kind: &'static str,
+    float_value: Option<f32>,
+    interpolation: Option<i64>,
+    interpolation_base: Option<String>,
+    interpolation_base_value: Option<f32>,
+}
+
+impl LevelStat {
+    fn new(id: String, value: i64, kind: &'static str) -> Self {
+        Self {
+            id,
+            value,
+            kind,
+            float_value: None,
+            interpolation: None,
+            interpolation_base: None,
+            interpolation_base_value: None,
+        }
+    }
+}
+
+/// `StatInterpolations` covers the float stats, then the additional stats.
+fn collect_stats(ctx: &Ctx, set: Row<'_>, level: Row<'_>, out: &mut Vec<LevelStat>) {
+    let interpolations = level.list_int("StatInterpolations");
+    let resolved = level.list_int("BaseResolvedValues");
+    let unresolved = level.list_float("FloatStatsValues");
+    let bases = ctx.rr.deref_list(level, "InterpolationBases");
+    let float_stats = ctx.rr.deref_list(level, "FloatStats");
+    for (i, stat) in float_stats.iter().enumerate() {
+        out.push(LevelStat {
+            float_value: unresolved.get(i).copied(),
+            interpolation: interpolations.get(i).copied(),
+            interpolation_base: bases.get(i).map(|b| b.id()),
+            interpolation_base_value: bases.get(i).and_then(|b| {
+                b.table.pick(&["Multiplier", "Value"]).map(|column| b.row().float(column))
+            }),
+            ..LevelStat::new(stat.id(), resolved.get(i).copied().unwrap_or(0), "float")
+        });
     }
     let constant_values = set.list_int("ConstantStatsValues");
     for (i, stat) in ctx.rr.deref_list(set, "ConstantStats").iter().enumerate() {
-        out.push((stat.id(), constant_values.get(i).copied().unwrap_or(0), "constant"));
+        out.push(LevelStat::new(stat.id(), constant_values.get(i).copied().unwrap_or(0), "constant"));
     }
     let additional_values = level.list_int("AdditionalStatsValues");
     for (i, stat) in ctx.rr.deref_list(level, "AdditionalStats").iter().enumerate() {
-        out.push((stat.id(), additional_values.get(i).copied().unwrap_or(0), "additional"));
+        out.push(LevelStat {
+            interpolation: interpolations.get(float_stats.len() + i).copied(),
+            ..LevelStat::new(stat.id(), additional_values.get(i).copied().unwrap_or(0), "additional")
+        });
     }
     for stat in ctx.rr.deref_list(set, "ImplicitStats") {
-        out.push((stat.id(), 1, "implicit"));
+        out.push(LevelStat::new(stat.id(), 1, "implicit"));
     }
     for stat in ctx.rr.deref_list(level, "AdditionalFlags") {
-        out.push((stat.id(), 1, "flag"));
+        out.push(LevelStat::new(stat.id(), 1, "flag"));
     }
 }
 
@@ -732,7 +984,8 @@ fn quality_stats(
     for &index in rows {
         let Some(row) = table.as_ref().and_then(|t| t.row(index)) else { continue };
         if applies_to_set(row, "ApplyToStatSets", position) {
-            if let Some((line, order)) = quality_bonus(ctx, translations, row, "Stats", "StatsValuesPermille") {
+            let stats = pick(row, &["Stats", "StatsKeys"]);
+            if let Some((line, order)) = quality_bonus(ctx, translations, row, stats, "StatsValuesPermille") {
                 out.shown.push(line);
                 for (key, index) in order {
                     match out.order.iter_mut().find(|(existing, _)| *existing == key) {
@@ -806,9 +1059,10 @@ fn quality_bonus(
     Some((line, order))
 }
 
-/// Row indices of `table` grouped by the row `column` points at.
-fn group_by(ctx: &Ctx, table: &str, column: &str) -> HashMap<usize, Vec<usize>> {
+/// Row indices of `table` grouped by the row the first of `columns` it has points at.
+fn group_by(ctx: &Ctx, table: &str, columns: &[&str]) -> HashMap<usize, Vec<usize>> {
     let Some(table) = ctx.optional_table(table) else { return HashMap::new() };
+    let Some(column) = table.pick(columns) else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
     for row in table.rows() {
         if let Some(target) = row.key(column) {

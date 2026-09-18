@@ -2,6 +2,7 @@
 
 use crate::data_export::json::{self, int, text, Obj, J};
 use crate::data_export::Ctx;
+use crate::dat::relational::Row;
 use std::collections::HashMap;
 
 /// Buff category numbers the client shows a label for. Rows carrying a number
@@ -32,7 +33,7 @@ pub fn buffs(ctx: &Ctx) -> Result<(), String> {
     let stats_column = table.require(&["Stats", "StatsKeys"])?;
     let visual_column = table.require(&["BuffVisual", "BuffVisualsKey"])?;
     let templates = ctx.optional_table("BuffTemplates");
-    let by_definition = group_by_key(ctx, "BuffTemplates", "BuffDefinition");
+    let by_definition = group_by_key(ctx, "BuffTemplates", &["BuffDefinition", "BuffDefinitionsKey"]);
     let template_users = template_users(ctx);
     let translations = ctx.translations("stat_descriptions");
 
@@ -87,7 +88,7 @@ pub fn buffs(ctx: &Ctx) -> Result<(), String> {
                         .or_null("aura_radius_metres", (radius != 0).then(|| J::Num(radius as f64 / 10.0)))
                         .or_null("stats", (!paired.is_empty()).then(|| J::Obj(paired)))
                         .or_null("stat_text", (!lines.is_empty()).then(|| json::strings(&lines)))
-                        .or_null("visuals", ctx.rr.deref_id(template, "BuffVisual").map(text))
+                        .or_null("visuals", ctx.rr.deref_id(template, template_visual(template)).map(text))
                         .build(),
                 ));
             }
@@ -115,9 +116,19 @@ pub fn buffs(ctx: &Ctx) -> Result<(), String> {
     ctx.write("buffs", &J::Obj(root))
 }
 
-/// Row indices of `table` grouped by the row `column` points at.
-fn group_by_key(ctx: &Ctx, table: &str, column: &str) -> HashMap<usize, Vec<usize>> {
+/// PoE 1 names a template's columns with a `Key` suffix.
+fn template_visual(template: Row<'_>) -> &'static str {
+    template.table.pick(&["BuffVisual", "BuffVisualsKey"]).unwrap_or("BuffVisual")
+}
+
+fn template_definition(template: Row<'_>) -> &'static str {
+    template.table.pick(&["BuffDefinition", "BuffDefinitionsKey"]).unwrap_or("BuffDefinition")
+}
+
+/// Row indices of `table` grouped by the row the first of `columns` it has points at.
+fn group_by_key(ctx: &Ctx, table: &str, columns: &[&str]) -> HashMap<usize, Vec<usize>> {
     let Some(table) = ctx.optional_table(table) else { return HashMap::new() };
+    let Some(column) = table.pick(columns) else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
     for row in table.rows() {
         if let Some(target) = row.key(column) {
@@ -132,8 +143,9 @@ fn group_by_key(ctx: &Ctx, table: &str, column: &str) -> HashMap<usize, Vec<usiz
 fn template_users(ctx: &Ctx) -> HashMap<usize, Vec<(&'static str, String)>> {
     let mut out: HashMap<usize, Vec<(&'static str, String)>> = HashMap::new();
     // (table, column, whether the column holds a list)
-    let sources: [(&'static str, &str, bool); 3] = [
+    let sources: [(&'static str, &str, bool); 4] = [
         ("Mods", "BuffTemplate", false),
+        ("Mods", "BuffTemplate1", false),
         ("PassiveSkills", "PassiveSkillBuffs", true),
         ("UltimatumModifiers", "BuffTemplates", true),
     ];
@@ -159,8 +171,8 @@ pub fn buff_visuals(ctx: &Ctx) -> Result<(), String> {
     let table = ctx.table("BuffVisuals")?;
     let definitions = ctx.optional_table("BuffDefinitions");
     let templates = ctx.optional_table("BuffTemplates");
-    let by_definition = group_by_key(ctx, "BuffDefinitions", "BuffVisual");
-    let by_template = group_by_key(ctx, "BuffTemplates", "BuffVisual");
+    let by_definition = group_by_key(ctx, "BuffDefinitions", &["BuffVisual", "BuffVisualsKey"]);
+    let by_template = group_by_key(ctx, "BuffTemplates", &["BuffVisual", "BuffVisualsKey"]);
 
     let root = table
         .rows()
@@ -188,7 +200,7 @@ pub fn buff_visuals(ctx: &Ctx) -> Result<(), String> {
                 .iter()
                 .filter_map(|&i| templates.as_ref()?.row(i))
                 .map(|template| {
-                    let buff = ctx.rr.deref(template, "BuffDefinition");
+                    let buff = ctx.rr.deref(template, template_definition(template));
                     visual_source(ctx, template, buff.as_ref().map(|b| b.row()))
                 })
                 .collect();

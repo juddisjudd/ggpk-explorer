@@ -84,6 +84,16 @@ impl LoadedTable {
         names.iter().copied().find(|n| self.cols.contains_key(*n))
     }
 
+    /// Position of a column the community schema may not name yet: `names` when
+    /// it does, otherwise the unnamed column `offset` places after `anchor`.
+    pub fn column_or_after(&self, names: &[&str], anchor: &str, offset: usize) -> Option<usize> {
+        if let Some(name) = self.pick(names) {
+            return self.col(name);
+        }
+        let at = self.col(anchor)? + offset;
+        self.def.columns.get(at).filter(|c| c.name.is_none()).map(|_| at)
+    }
+
     /// Like [`pick`](Self::pick) but says which table came up short.
     pub fn require<'n>(&self, names: &[&'n str]) -> Result<&'n str, String> {
         self.pick(names)
@@ -201,6 +211,36 @@ impl<'t> Row<'t> {
 
     fn list(&self, col: &str) -> Vec<DatValue> {
         let Some(c) = self.table.col(col) else { return Vec::new() };
+        self.list_at(c)
+    }
+
+    /// A bool column by position, for the columns the schema has not named.
+    pub fn bool_at(&self, column: usize) -> bool {
+        matches!(self.cell(column), Some(DatValue::Bool(true)))
+    }
+
+    /// An integer by column position, for the columns the schema has not named.
+    pub fn int_at(&self, column: usize) -> i64 {
+        match self.cell(column) {
+            Some(DatValue::Int(i)) => *i,
+            Some(DatValue::Long(l)) => *l as i64,
+            _ => 0,
+        }
+    }
+
+    /// Integers of an array column by position, for the columns the schema has not named.
+    pub fn list_int_at(&self, column: usize) -> Vec<i64> {
+        self.list_at(column)
+            .iter()
+            .filter_map(|v| match v {
+                DatValue::Int(i) => Some(*i),
+                DatValue::Long(l) => Some(*l as i64),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn list_at(&self, c: usize) -> Vec<DatValue> {
         match self.table.rows[self.index].get(c) {
             Some(DatValue::List(count, offset)) if *count > 0 => self
                 .table
@@ -456,5 +496,31 @@ mod tests {
         // A null key resolves to nothing rather than row 0.
         assert_eq!(rr.deref_id(left.row(1).unwrap(), "Right"), None);
         assert_eq!(left.by_id("beta").map(|r| r.index), Some(1));
+    }
+
+    #[test]
+    fn an_unnamed_column_is_found_beside_a_named_one() {
+        let unnamed = Column { name: None, ..col("x", "foreignrow", Some("Right")) };
+        let schema = Schema {
+            version: 7,
+            created_at: 0,
+            tables: vec![crate::dat::schema::Table {
+                name: "Right".into(),
+                columns: vec![col("Id", "string", None), unnamed],
+                tags: None,
+                valid_for: Some(crate::dat::schema::VALID_FOR_POE2),
+                custom: false,
+            }],
+            enumerations: Vec::new(),
+        };
+        let right = build_dat(&["one"], &[(0, 0)]);
+        let source = move |path: &str| (path == "data/balance/right.datc64").then(|| right.clone());
+        let rr = RelationalReader::new(&source, &schema, true);
+        let table = rr.table("Right").expect("Right loads");
+        assert_eq!(table.column_or_after(&["Missing"], "Id", 1), Some(1));
+        assert_eq!(table.column_or_after(&["Id"], "Nowhere", 1), Some(0));
+        // A named column in that place is not the unnamed one being looked for.
+        assert_eq!(table.column_or_after(&["Missing"], "Id", 0), None);
+        assert_eq!(table.column_or_after(&["Missing"], "Id", 5), None);
     }
 }

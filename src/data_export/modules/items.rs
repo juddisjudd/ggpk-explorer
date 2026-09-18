@@ -42,59 +42,109 @@ pub fn collect_bases(ctx: &Ctx) -> Result<Vec<BaseItem>, String> {
         .filter(|row| !row.id().is_empty())
         .map(|row| BaseItem {
             id: row.id().to_string(),
-            item_class: ctx.rr.deref_id(row, "ItemClass").unwrap_or_default(),
+            item_class: ctx.rr.deref_id(row, item_class_column(row)).unwrap_or_default(),
             tags: tags_of(ctx, row, &mut inherited),
-            domain: domain_of(row),
+            domain: domain_of(ctx, row),
         })
         .collect())
 }
 
-fn domain_of(row: Row<'_>) -> String {
-    let domain = row.int("ModDomain");
-    // 38 (mods_disallowed) means the item takes no mods at all.
-    match super::mods::domain_name(domain) {
-        Some(name) if domain != 38 => name.to_string(),
+/// A base that takes no mods reports `undefined`: PoE 2 marks it
+/// `mods_disallowed`, PoE 1 with a value its domain enum has no name for.
+fn domain_of(ctx: &Ctx, row: Row<'_>) -> String {
+    match super::mods::domain_label_in(ctx, row, "ModDomain") {
+        Some(name) if name != "mods_disallowed" => name,
         _ => "undefined".to_string(),
     }
 }
 
+fn item_class_column(row: Row<'_>) -> &'static str {
+    row.table.pick(&["ItemClass", "ItemClassesKey"]).unwrap_or("ItemClass")
+}
+
 fn tags_of(ctx: &Ctx, row: Row<'_>, inherited: &mut InheritedTags) -> Vec<String> {
-    let mut tags = ctx.rr.deref_list_ids(row, "Tags");
-    tags.extend(inherited.for_path(ctx, row.str("InheritsFrom")));
+    let mut tags = ctx.rr.deref_list_ids(row, row.table.pick(&["Tags", "TagsKeys"]).unwrap_or("Tags"));
+    tags.extend(inherited.for_path(ctx, row.str("InheritsFrom")).tags);
     tags
 }
 
-/// Tags an item picks up from the `.it` file it inherits from, following the
+/// What an item picks up from the `.it` file it inherits from, following the
 /// `extends` chain. Cached per path — thousands of items share a few dozen.
 #[derive(Default)]
 struct InheritedTags {
-    cache: HashMap<String, Vec<String>>,
+    cache: HashMap<String, Inherited>,
+}
+
+#[derive(Clone, Default)]
+struct Inherited {
+    tags: Vec<String>,
+    /// The nearest file in the chain that states one wins.
+    max_quality: Option<i64>,
+    /// Most sockets this item can roll, from the `Sockets` component.
+    socket_limit: Option<i64>,
+}
+
+/// `socket_info` lists `sockets:item level:weight` for each count the item can
+/// roll. A level of 9999 is the game's way of ruling a count out, so the limit
+/// is the largest count a real item level can reach.
+fn socket_limit(info: &str) -> Option<i64> {
+    info.split_whitespace()
+        .filter_map(|entry| {
+            let mut parts = entry.split(':');
+            let count: i64 = parts.next()?.trim().parse().ok()?;
+            let level: i64 = parts.next()?.trim().parse().ok()?;
+            (level < 9999).then_some(count)
+        })
+        .max()
 }
 
 impl InheritedTags {
-    fn for_path(&mut self, ctx: &Ctx, path: &str) -> Vec<String> {
+    fn for_path(&mut self, ctx: &Ctx, path: &str) -> Inherited {
         if path.is_empty() {
-            return Vec::new();
+            return Inherited::default();
         }
         if let Some(hit) = self.cache.get(path) {
             return hit.clone();
         }
-        let mut tags = Vec::new();
+        let mut found = Inherited::default();
+        // A file's `remove_tag` drops what the files it extends add, not its own tags.
+        let mut removed: Vec<String> = Vec::new();
         let mut current = format!("{}.it", path);
         let mut seen = std::collections::HashSet::new();
         while !current.is_empty() && seen.insert(current.to_ascii_lowercase()) {
             let Some(bytes) = crate::dat::relational::FileSource::fetch(ctx.files, &current) else { break };
             let file = crate::parsers::object_dsl::parse(&crate::parsers::utils::decode_text_lossy(&bytes));
             if let Some(base) = file.components.iter().find(|c| c.name == "Base") {
-                tags.extend(base.props.iter().filter(|p| p.key == "tag").map(|p| p.value.clone()));
+                found.tags.extend(
+                    base.props.iter().filter(|p| p.key == "tag" && !removed.contains(&p.value)).map(|p| p.value.clone()),
+                );
+                removed.extend(base.props.iter().filter(|p| p.key == "remove_tag").map(|p| p.value.clone()));
+            }
+            if found.socket_limit.is_none() {
+                found.socket_limit = file
+                    .components
+                    .iter()
+                    .filter(|c| c.name == "Sockets")
+                    .flat_map(|c| &c.props)
+                    .find(|p| p.key == "socket_info")
+                    .and_then(|p| socket_limit(&p.value));
+            }
+            if found.max_quality.is_none() {
+                found.max_quality = file
+                    .components
+                    .iter()
+                    .filter(|c| c.name == "Quality")
+                    .flat_map(|c| &c.props)
+                    .find(|p| p.key == "max_quality")
+                    .and_then(|p| p.value.trim().parse().ok());
             }
             current = match file.extends {
                 Some(next) => crate::parsers::object_dsl::resolve_extends(&next, &current),
                 None => String::new(),
             };
         }
-        self.cache.insert(path.to_string(), tags.clone());
-        tags
+        self.cache.insert(path.to_string(), found.clone());
+        found
     }
 }
 
@@ -106,7 +156,17 @@ pub fn base_items(ctx: &Ctx) -> Result<(), String> {
     let charges = by_base(ctx, "ComponentCharges");
     let weapon = by_base(ctx, "WeaponTypes");
     let currency = by_base(ctx, "CurrencyItems");
-    let requirements = by_base(ctx, "AttributeRequirements");
+    let spirit = by_base(ctx, "ItemSpirit");
+    // Tinctures are a PoE 1 item; PoE 2 has no such table to look for.
+    let tincture = match ctx.rr.is_poe2 {
+        true => HashMap::new(),
+        false => by_base(ctx, "Tinctures"),
+    };
+    let requirement_table = ["AttributeRequirements", "ComponentAttributeRequirements"]
+        .into_iter()
+        .find(|name| ctx.rr.table(name).is_some())
+        .unwrap_or("AttributeRequirements");
+    let requirements = by_base(ctx, requirement_table);
     let skills = inherent_skills(ctx);
     let implicit_text = ctx.table("Mods").map(|mods| super::mods::ModText::new(&mods)).ok();
     let states: HashMap<&str, &str> = RELEASE_STATES.iter().copied().collect();
@@ -120,7 +180,7 @@ pub fn base_items(ctx: &Ctx) -> Result<(), String> {
         if id.is_empty() {
             continue;
         }
-        let item_class = ctx.rr.deref_id(row, "ItemClass").unwrap_or_default();
+        let item_class = ctx.rr.deref_id(row, item_class_column(row)).unwrap_or_default();
         let visual = ctx.rr.deref(row, "ItemVisualIdentity");
         if let Some(visual) = &visual {
             export_art(ctx, visual.row());
@@ -131,20 +191,33 @@ pub fn base_items(ctx: &Ctx) -> Result<(), String> {
             .build();
 
         let drop_level = row.int("DropLevel");
-        let requirements = requirements.get(&row.index).map(|&i| {
-            let r = table_row(ctx, "AttributeRequirements", i);
+        let implicits = ctx.rr.deref_list(row, table.pick(&["Implicit_Mods", "Implicit_ModsKeys"]).unwrap_or("Implicit_Mods"));
+        // A base a player can equip carries its drop level; anything else asks
+        // only for what its implicit needs, which is four fifths of that mod's
+        // own level.
+        let equippable = armour.contains_key(&row.index) || weapon.contains_key(&row.index) || flask.contains_key(&row.index);
+        let implicit_level = implicits.iter().map(|m| m.row().int("Level") * 4 / 5).max().unwrap_or(0);
+        let required_level = match equippable {
+            true => drop_level.max(implicit_level),
+            false => implicit_level,
+        };
+        let requirements = requirements.get(&row.index).map(|&i| table_row(ctx, requirement_table, i)).or_else(|| {
+            (!ctx.rr.is_poe2 && required_level > 1).then_some(None)
+        });
+        let requirements = requirements.map(|r| {
             Obj::new()
                 .set("dexterity", int(r.as_ref().map(|r| r.row().int("ReqDex")).unwrap_or(0)))
                 .set("intelligence", int(r.as_ref().map(|r| r.row().int("ReqInt")).unwrap_or(0)))
-                .set("level", int(drop_level))
+                .set("level", int(match ctx.rr.is_poe2 {
+                    true => drop_level,
+                    false => required_level.max(1),
+                }))
                 .set("strength", int(r.as_ref().map(|r| r.row().int("ReqStr")).unwrap_or(0)))
                 .build()
         });
 
-        let implicits = ctx.rr.deref_list(row, "Implicit_Mods");
-
         let entry = Obj::new()
-            .set("domain", text(domain_of(row)))
+            .set("domain", text(domain_of(ctx, row)))
             .set("drop_level", int(drop_level))
             .set("implicits", json::strings(implicits.iter().map(|m| m.id()).collect::<Vec<_>>()))
             .set(
@@ -169,16 +242,35 @@ pub fn base_items(ctx: &Ctx) -> Result<(), String> {
             .set("name", text(row.str("Name")))
             .set(
                 "properties",
-                properties(ctx, row, &armour, &shield, &flask, &charges, &weapon, &currency),
+                properties(
+                    ctx,
+                    row,
+                    &armour,
+                    &shield,
+                    &flask,
+                    &charges,
+                    &weapon,
+                    &currency,
+                    &spirit,
+                    &tincture,
+                    inherited.for_path(ctx, row.str("InheritsFrom")),
+                ),
             )
             .set("release_state", text(states.get(id.as_str()).copied().unwrap_or("released")))
             .set("tags", json::strings(tags_of(ctx, row, &mut inherited)))
             .set("visual_identity", visual_identity)
             .or_null("requirements", requirements)
-            .or_null("grants_buff", None)
+            .or_null(
+                "grants_buff",
+                flask.get(&row.index).and_then(|&i| table_row(ctx, "Flasks", i)).and_then(|f| flask_buff(ctx, f.row())),
+            )
             .or_null(
                 "skills_granted",
-                skills.get(&row.index).map(|ids| json::strings(ids)),
+                skills.get(&row.index).map(|(ids, _)| json::strings(ids)),
+            )
+            .or_null(
+                "skills_granted_no_reservation",
+                skills.get(&row.index).and_then(|(_, flag)| flag.map(J::Bool)),
             )
             .build();
 
@@ -210,6 +302,9 @@ fn properties(
     charges: &HashMap<usize, usize>,
     weapon: &HashMap<usize, usize>,
     currency: &HashMap<usize, usize>,
+    spirit: &HashMap<usize, usize>,
+    tincture: &HashMap<usize, usize>,
+    inherited: Inherited,
 ) -> J {
     let armour = armour.get(&row.index).and_then(|&i| table_row(ctx, "ArmourTypes", i));
     let shield = shield.get(&row.index).and_then(|&i| table_row(ctx, "ShieldTypes", i));
@@ -217,11 +312,22 @@ fn properties(
     let charges = charges.get(&row.index).and_then(|&i| table_row(ctx, "ComponentCharges", i));
     let weapon = weapon.get(&row.index).and_then(|&i| table_row(ctx, "WeaponTypes", i));
     let currency = currency.get(&row.index).and_then(|&i| table_row(ctx, "CurrencyItems", i));
+    let tincture = tincture.get(&row.index).and_then(|&i| table_row(ctx, "Tinctures", i));
+    let tincture_column = |names: &[&str]| {
+        tincture.as_ref().and_then(|t| t.table.pick(names).map(|column| int(t.row().int(column))))
+    };
+    let spirit = spirit.get(&row.index).and_then(|&i| table_row(ctx, "ItemSpirit", i));
 
-    // A defence only shows when it is non-zero, and always as a range.
+    // A defence only shows when it is non-zero, and always as a range. PoE 1
+    // stores the range itself; PoE 2 a single value.
     let defence = |column: &str| {
-        armour.as_ref().map(|a| a.row().int(column)).filter(|v| *v > 0).map(|v| {
-            Obj::new().set("max", int(v)).set("min", int(v)).build()
+        armour.as_ref().and_then(|a| {
+            let row = a.row();
+            let (min, max) = match row.table.has_col(column) {
+                true => (row.int(column), row.int(column)),
+                false => (row.int(&format!("{}Min", column)), row.int(&format!("{}Max", column))),
+            };
+            (max > 0).then(|| Obj::new().set("max", int(max)).set("min", int(min)).build())
         })
     };
     let positive = |source: &Option<Ref>, column: &str| {
@@ -243,9 +349,7 @@ fn properties(
         .or_null("armour", defence("Armour"))
         .or_null("energy_shield", defence("EnergyShield"))
         .or_null("evasion", defence("Evasion"))
-        // ArmourTypes still has a Ward column, but nothing in PoE 2 reads it
-        // and the values left in it are stale, so it stays unreported.
-        .or_null("ward", None)
+        .or_null("ward", defence("Ward"))
         .or_null("movement_speed", non_zero(&armour, "IncreasedMovementSpeed"))
         .or_null("block", any(&shield, "Block"))
         .or_null("description", string(&currency, "Description"))
@@ -256,7 +360,10 @@ fn properties(
             "full_stack_turns_into",
             currency
                 .as_ref()
-                .and_then(|c| ctx.rr.deref_id(c.row(), "FullStack_BaseItemType"))
+                .and_then(|c| {
+                    let column = c.table.pick(&["FullStack_BaseItemType", "FullStack_BaseItemTypesKey"])?;
+                    ctx.rr.deref_id(c.row(), column)
+                })
                 .map(text),
         )
         .or_null("charges_max", any(&charges, "MaxCharges"))
@@ -265,16 +372,67 @@ fn properties(
         .or_null("life_per_use", positive(&flask, "LifePerUse"))
         .or_null("mana_per_use", positive(&flask, "ManaPerUse"))
         .or_null("attack_time", any(&weapon, "Speed"))
-        .or_null("critical_strike_chance", any(&weapon, "CritChance"))
+        .or_null(
+            "critical_strike_chance",
+            weapon.as_ref().and_then(|w| w.table.pick(&["CritChance", "Critical"])).and_then(|c| any(&weapon, c)),
+        )
         .or_null("physical_damage_max", any(&weapon, "DamageMax"))
         .or_null("physical_damage_min", any(&weapon, "DamageMin"))
         .or_null("range", any(&weapon, "RangeMax"))
-        .or_null("mana_burn_ms", None)
-        .or_null("cooldown_ms", None)
+        .or_null("mana_burn_ms", tincture_column(&["DebuffInterval", "ManaBurn"]))
+        .or_null("cooldown_ms", tincture_column(&["Cooldown", "CoolDown"]))
         .or_null("monster_id", None)
         .or_null("monster_ability_text", None)
         .or_null("monster_category", None)
+        .or_null("reload_time", positive(&weapon, "ReloadTime"))
+        .or_null(
+            "spirit",
+            spirit.as_ref().and_then(|s| s.table.pick(&["SpiritGranted", "Value"]).map(|column| int(s.row().int(column)))),
+        )
+        .or_null("max_quality", inherited.max_quality.map(int))
+        .or_null("socket_limit", inherited.socket_limit.map(int))
         .build()
+}
+
+/// The buff a charm applies while active. Several buffs on one item share the
+/// first one's id and pool their stats, as the client describes them together.
+fn flask_buff(ctx: &Ctx, flask: Row<'_>) -> Option<J> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut stats: Vec<(String, i64)> = Vec::new();
+    // PoE 1 names one buff on the flask row, with its values beside it.
+    if let Some(buff) = ctx.rr.deref(flask, "BuffDefinitionsKey") {
+        ids.push(buff.id());
+        let values = flask.list_int("BuffStatValues");
+        for (stat, value) in ctx.rr.deref_list(buff.row(), "StatsKeys").iter().zip(values) {
+            stats.push((stat.id(), value));
+        }
+        for flag in ctx.rr.deref_list(buff.row(), "GrantedFlags") {
+            stats.push((flag.id(), 1));
+        }
+    }
+    for utility in ctx.rr.deref_list(flask, "UtilityBuff") {
+        let utility = utility.row();
+        let Some(buff) = ctx.rr.deref(utility, "BuffDefinition") else { continue };
+        ids.push(buff.id());
+        let values = utility.list_int("StatValues");
+        for (stat, value) in ctx.rr.deref_list(buff.row(), "GrantedStats").iter().zip(values) {
+            stats.push((stat.id(), value));
+        }
+        for flag in ctx.rr.deref_list(buff.row(), "GrantedFlags") {
+            stats.push((flag.id(), 1));
+        }
+    }
+    let id = ids.first()?;
+    let stat_ids: Vec<String> = stats.iter().map(|(id, _)| id.clone()).collect();
+    let ranges: Vec<(i32, i32)> = stats.iter().map(|(_, v)| (*v as i32, *v as i32)).collect();
+    let lines = ctx.translations("stat_descriptions").translate_ranges(&stat_ids, &ranges);
+    Some(
+        Obj::new()
+            .set("id", text(id))
+            .set("stats", J::Obj(stats.into_iter().map(|(id, v)| (id, int(v))).collect()))
+            .set("stat_text", json::strings(lines.iter().map(|l| super::mods::display_text(l))))
+            .build(),
+    )
 }
 
 fn table_row(ctx: &Ctx, table: &str, index: usize) -> Option<Ref> {
@@ -294,7 +452,7 @@ fn export_art(ctx: &Ctx, visual: Row<'_>) {
 /// are resolved back to the row.
 fn by_base(ctx: &Ctx, name: &str) -> HashMap<usize, usize> {
     let Some(table) = ctx.optional_table(name) else { return HashMap::new() };
-    let Some(column) = table.pick(&["BaseItemType", "BaseItemTypesKey"]) else { return HashMap::new() };
+    let Some(column) = table.pick(&["BaseItemType", "BaseItemTypesKey", "BaseItem"]) else { return HashMap::new() };
     let bases = ctx.optional_table("BaseItemTypes");
     let mut out = HashMap::new();
     for row in table.rows() {
@@ -310,8 +468,10 @@ fn by_base(ctx: &Ctx, name: &str) -> HashMap<usize, usize> {
 }
 
 /// Skills an item grants just by being equipped, named by their gem's base item.
-fn inherent_skills(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
+/// The flag says the granted skills reserve nothing; dat-schema names that column `IsWeapon`.
+fn inherent_skills(ctx: &Ctx) -> HashMap<usize, (Vec<String>, Option<bool>)> {
     let Some(table) = ctx.optional_table("ItemInherentSkills") else { return HashMap::new() };
+    let no_reservation = table.pick(&["NoReservation", "IsWeapon"]);
     let mut out = HashMap::new();
     for row in table.rows() {
         let Some(base) = row.key("BaseItemType") else { continue };
@@ -322,7 +482,7 @@ fn inherent_skills(ctx: &Ctx) -> HashMap<usize, Vec<String>> {
             .filter_map(|gem| ctx.rr.deref_id(gem.row(), "BaseItemType"))
             .collect();
         if !granted.is_empty() {
-            out.insert(base, granted);
+            out.insert(base, (granted, no_reservation.map(|c| row.bool(c))));
         }
     }
     out
@@ -528,6 +688,8 @@ fn mages_legacies(ctx: &Ctx) -> Option<J> {
 pub fn augments(ctx: &Ctx) -> Result<(), String> {
     let cores = ctx.table("SoulCores")?;
     let stats = ctx.table("SoulCoreStats")?;
+    let values_column = stats.require(&["StatsValues", "StatValue"])?;
+    let bonded_values_column = stats.require(&["BondedStatsValues", "BondedValues"])?;
     let translations = ctx.translations("stat_descriptions");
 
     let mut by_core: HashMap<usize, Vec<Row<'_>>> = HashMap::new();
@@ -556,7 +718,7 @@ pub fn augments(ctx: &Ctx) -> Result<(), String> {
             let Some(category) = ctx.rr.deref(*stat_row, "StatCategory") else { continue };
             let category_row = category.row();
             let target = match category_row.opt_str("Display") {
-                Some(display) => text(display),
+                Some(display) => json::strings([display]),
                 None => json::strings(
                     ctx.rr
                         .deref_list(category_row, "TargetItemClasses")
@@ -565,10 +727,12 @@ pub fn augments(ctx: &Ctx) -> Result<(), String> {
                         .collect::<Vec<_>>(),
                 ),
             };
-            let mut entry = Obj::new().set("target", target);
+            let mut entry = Obj::new()
+                .set("target", target)
+                .set("target_item_classes", json::strings(ctx.rr.deref_list_ids(category_row, "TargetItemClasses")));
             for (list, values, stats_key, text_key) in [
-                ("Stats", "StatsValues", "stats", "stat_text"),
-                ("BondedStats", "BondedStatsValues", "bonded_stats", "bonded_stat_text"),
+                ("Stats", values_column, "stats", "stat_text"),
+                ("BondedStats", bonded_values_column, "bonded_stats", "bonded_stat_text"),
             ] {
                 let refs = ctx.rr.deref_list(*stat_row, list);
                 if refs.is_empty() {
@@ -582,10 +746,12 @@ pub fn augments(ctx: &Ctx) -> Result<(), String> {
                     stats_key,
                     J::Arr(
                         refs.iter()
-                            .map(|s| {
+                            .enumerate()
+                            .map(|(i, s)| {
                                 Obj::new()
                                     .set("id", text(s.id()))
                                     .set("local", J::Bool(s.row().bool("IsLocal")))
+                                    .opt("value", numbers.get(i).map(|v| int(*v)))
                                     .build()
                             })
                             .collect(),
@@ -605,6 +771,13 @@ pub fn augments(ctx: &Ctx) -> Result<(), String> {
             .opt("required_level", Some(core.int("RequiredLevel")).filter(|v| *v != 0).map(int))
             .opt("type_id", kind.as_ref().and_then(|k| json::opt_text(k.row().id())))
             .opt("type_name", kind.as_ref().and_then(|k| json::opt_text(k.row().str("Name"))))
+            .opt("limit_id", ctx.rr.deref_id(core, "Limit").map(text))
+            .opt("limit_count", ctx.rr.deref(core, "Limit").map(|l| int(l.row().int("Limit"))))
+            .set("is_socket_bound", J::Bool(core.bool("IsSocketBound")))
+            .set("can_socket_in_martial_artist_slots", J::Bool(core.bool("CanSocketInMartialArtistSlots")))
+            .set("can_socket_in_unique_items", J::Bool(core.bool("CanSocketInUniqueItems")))
+            .set("can_socket_in_jewellery", J::Bool(core.bool("CanSocketInJewellery")))
+            .set("can_socket_in_corrupted_sanctified", J::Bool(core.bool("CanSocketInCorruptedSanctified")))
             .build();
         root.push((base, json::sorted(entry)));
     }
@@ -629,5 +802,13 @@ mod tests {
         assert_eq!(flavour_key("FourUniqueRing33__e"), "FourUniqueRing33");
         // A letter that is part of the name is not a variant suffix.
         assert_eq!(flavour_key("FourUniqueBreach4b"), "FourUniqueBreach4b");
+    }
+
+    #[test]
+    fn a_socket_count_no_item_level_reaches_is_not_the_limit() {
+        // A body armour reaches six; a helmet's last two counts are ruled out.
+        assert_eq!(socket_limit("1:1:50 2:1:120 3:2:100 4:25:30 5:35:5 6:50:1"), Some(6));
+        assert_eq!(socket_limit("1:1:100 2:1:90 3:2:80 4:25:30 5:9999:20 6:9999:5"), Some(4));
+        assert_eq!(socket_limit(""), None);
     }
 }

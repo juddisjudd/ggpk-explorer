@@ -50,6 +50,7 @@ pub fn cost_types(ctx: &Ctx) -> Result<(), String> {
             let entry = Obj::new()
                 .set("format_text", text(row.str("FormatText")))
                 .or_null("stat", ctx.rr.deref_id(row, stat).map(text))
+                .or_null("divisor", table.pick(&["Divisor"]).map(|c| int(row.int(c))))
                 .build();
             (row.id().to_string(), entry)
         })
@@ -108,9 +109,10 @@ pub fn flavour(ctx: &Ctx) -> Result<(), String> {
 
 pub fn gem_tags(ctx: &Ctx) -> Result<(), String> {
     let table = ctx.table("GemTags")?;
+    let name = table.require(&["Name", "Tag"])?;
     let root = table
         .rows()
-        .map(|row| (row.id().to_string(), json::opt_text(row.str("Name")).unwrap_or(J::Null)))
+        .map(|row| (row.id().to_string(), json::opt_text(row.str(name)).unwrap_or(J::Null)))
         .collect::<Vec<_>>();
     ctx.write("gem_tags", &J::Obj(root))
 }

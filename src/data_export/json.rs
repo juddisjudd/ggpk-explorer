@@ -86,6 +86,12 @@ pub fn float(v: f32) -> J {
     J::Num(v as f64)
 }
 
+/// A float at the precision the game stores it: the shortest decimal that
+/// reads back as the same `f32`, so `0.05` prints as `0.05`.
+pub fn float32(v: f32) -> J {
+    J::Num(v.to_string().parse().unwrap_or(v as f64))
+}
+
 pub fn arr(items: impl IntoIterator<Item = J>) -> J {
     J::Arr(items.into_iter().collect())
 }
@@ -231,6 +237,14 @@ mod tests {
     }
 
     #[test]
+    fn game_floats_print_as_stored() {
+        assert_eq!(compact(&float(0.05)), "0.05000000074505806");
+        assert_eq!(compact(&float32(0.05)), "0.05");
+        assert_eq!(compact(&float32(0.13)), "0.13");
+        assert_eq!(compact(&float32(3.452)), "3.452");
+    }
+
+    #[test]
     fn stripping_nulls_leaves_arrays_and_their_positions_alone() {
         let value = Obj::new()
             .set("name", text("Gold Amulet"))
@@ -250,6 +264,7 @@ mod tests {
     #[test]
     fn integral_floats_keep_a_decimal_point() {
         assert_eq!(compact(&float(5.0)), "5.0");
+        assert_eq!(compact(&float32(1.0)), "1.0");
         assert_eq!(compact(&int(5)), "5");
         assert_eq!(compact(&J::Arr(Vec::new())), "[]");
     }

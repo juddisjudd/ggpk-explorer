@@ -110,6 +110,19 @@ impl Schema {
         fallback
     }
 
+    /// Whether the schema knows this table but gives it to the other game
+    /// only, which is why the install does not have it.
+    pub fn belongs_to_other_game(&self, name: &str, is_poe2: bool) -> bool {
+        let mut known = false;
+        for t in self.tables.iter().filter(|t| t.name.eq_ignore_ascii_case(name)) {
+            if valid_for_game(t.valid_for, is_poe2) {
+                return false;
+            }
+            known = true;
+        }
+        known
+    }
+
     pub fn find_enumeration(&self, name: &str, is_poe2: bool) -> Option<&Enumeration> {
         let mut fallback = None;
         for e in self.enumerations.iter().filter(|e| e.name.eq_ignore_ascii_case(name)) {
@@ -170,6 +183,17 @@ mod tests {
         assert_eq!(schema.find_table("t", true).unwrap().valid_for, Some(2));
         let only_poe1 = Schema { version: 7, created_at: 0, tables: vec![mk(1)], enumerations: vec![] };
         assert_eq!(only_poe1.find_table("T", true).unwrap().valid_for, Some(1));
+    }
+
+    #[test]
+    fn a_table_the_other_game_owns_is_not_a_gap() {
+        let mk = |valid_for: u32| Table { name: "T".into(), columns: vec![], tags: None, valid_for: Some(valid_for), custom: false };
+        let poe2_only = Schema { version: 7, created_at: 0, tables: vec![mk(2)], enumerations: vec![] };
+        assert!(poe2_only.belongs_to_other_game("t", false));
+        assert!(!poe2_only.belongs_to_other_game("T", true));
+        assert!(!poe2_only.belongs_to_other_game("Absent", false));
+        let both = Schema { version: 7, created_at: 0, tables: vec![mk(3)], enumerations: vec![] };
+        assert!(!both.belongs_to_other_game("T", false));
     }
 
     #[test]

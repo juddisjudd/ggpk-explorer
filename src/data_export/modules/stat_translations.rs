@@ -8,9 +8,6 @@ use crate::data_export::json::{self, int, text, Obj, J};
 use crate::data_export::Ctx;
 use std::collections::HashMap;
 
-/// Where the description files live, in the casing RePoE reports them under.
-const DIR: &str = "Data/StatDescriptions/";
-
 /// The languages RePoE lists on every entry. Only English is filled in; the
 /// rest are declared so consumers see the same keys.
 const OTHER_LANGUAGES: [&str; 9] = [
@@ -29,9 +26,11 @@ pub fn stat_translations(ctx: &Ctx) -> Result<(), String> {
     let mut lookup = StatsByFile::default();
     let trade = ctx.options.trade_stats.then(fetch_trade_stats).unwrap_or_default();
 
+    // The folder in the casing RePoE reports it under; the index stores paths lower-cased.
+    let (dir, ext) = ctx.description_files();
     let mut written = 0;
-    for path in ctx.files.list_dir(DIR) {
-        if !path.to_ascii_lowercase().ends_with(".csd") {
+    for path in ctx.files.list_dir(dir) {
+        if !path.to_ascii_lowercase().ends_with(ext) {
             continue;
         }
         let Some(bytes) = crate::dat::relational::FileSource::fetch(ctx.files, &path) else { continue };
@@ -42,21 +41,24 @@ pub fn stat_translations(ctx: &Ctx) -> Result<(), String> {
                 continue;
             }
         };
-        // The index stores paths lower-cased; RePoE reports the real casing.
-        let relative = path[DIR.len().min(path.len())..].to_string();
-        let source = format!("{}{}", DIR, relative);
+        // PoE 1 keeps `skillpopup_stat_filters.txt` beside the descriptions; it maps skills to files.
+        if file.entries.is_empty() && file.includes.is_empty() {
+            continue;
+        }
+        let relative = path[dir.len().min(path.len())..].to_string();
+        let source = format!("{}{}", dir, relative);
 
         let entries: Vec<J> = keep(&file.entries)
             .into_iter()
             .map(|entry| convert_entry(entry, &source, &mut lookup, &trade))
             .collect();
-        let name = format!("stat_translations/{}", relative.trim_end_matches(".csd"));
+        let name = format!("stat_translations/{}", relative.trim_end_matches(ext));
         ctx.write(&name, &J::Arr(entries))?;
         written += 1;
     }
 
     if written == 0 {
-        return Err(format!("no .csd files found under {}", DIR));
+        return Err(format!("no {} files found under {}", ext, dir));
     }
 
     ctx.write("stat_value_handlers", &value_handlers(ctx))?;

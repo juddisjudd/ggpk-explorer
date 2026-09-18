@@ -90,27 +90,90 @@ fn translation_file(domain: i64) -> &'static str {
     }
 }
 
+/// PoE 1 numbers its domains differently, so its description file is chosen by
+/// the enum name instead.
+fn poe1_translation_file(domain: &str) -> &'static str {
+    match domain {
+        "monster" | "necropolis_monster" => "monster_stat_descriptions",
+        "chest" => "chest_stat_descriptions",
+        "area" | "map_device" | "delve_area" | "crucible_map" => "map_stat_descriptions",
+        "sanctum_relic" | "sanctum_special" => "sanctum_relic_stat_descriptions",
+        "atlas" => "atlas_stat_descriptions",
+        "leaguestone" => "leaguestone_stat_descriptions",
+        "heist_npc" => "heist_equipment_stat_descriptions",
+        "expedition_relic" => "expedition_relic_stat_descriptions",
+        "sentinel" => "sentinel_stat_descriptions",
+        "tincture" => "tincture_stat_descriptions",
+        "graft" => "graft_stat_descriptions",
+        _ => "stat_descriptions",
+    }
+}
+
 fn name_of(table: &[(i64, &'static str)], value: i64) -> Option<&'static str> {
     table.iter().find(|(v, _)| *v == value).map(|(_, name)| *name)
 }
 
-/// Name of a mod domain, shared with `base_items`.
-pub fn domain_name(value: i64) -> Option<&'static str> {
-    name_of(&DOMAINS, value)
+/// Name of a mod's domain. PoE 2 uses the published spellings above; PoE 1
+/// reads its own `ModDomains` enum, whose numbers differ.
+pub fn domain_label(ctx: &Ctx, row: Row<'_>) -> Option<String> {
+    domain_label_in(ctx, row, "Domain")
+}
+
+/// The same for a domain stored under another column, such as a base item's `ModDomain`.
+pub fn domain_label_in(ctx: &Ctx, row: Row<'_>, column: &str) -> Option<String> {
+    match ctx.rr.is_poe2 {
+        true => name_of(&DOMAINS, row.int(column)).map(str::to_string),
+        false => ctx.rr.enum_label(row, column).map(|l| l.to_ascii_lowercase()),
+    }
+}
+
+fn generation_label(ctx: &Ctx, row: Row<'_>) -> Option<String> {
+    match ctx.rr.is_poe2 {
+        true => name_of(&GENERATION_TYPES, row.int("GenerationType")).map(str::to_string),
+        false => ctx.rr.enum_label(row, "GenerationType").map(|l| l.to_ascii_lowercase()),
+    }
+}
+
+fn mod_type_name(ctx: &Ctx, row: Row<'_>) -> String {
+    let column = row.table.pick(&["ModType", "ModTypeKey"]).unwrap_or("ModType");
+    ctx.rr.deref(row, column).map(|m| m.row().string("Name")).unwrap_or_default()
+}
+
+/// A column that PoE 1 names with a `Keys` suffix.
+fn column<'n>(row: Row<'_>, names: &[&'n str]) -> &'n str {
+    row.table.pick(names).unwrap_or(names[0])
+}
+
+/// Where one mod stat's id and value live: PoE 2 stores the value as an
+/// interval, PoE 1 as separate min and max columns.
+enum StatColumns {
+    Interval { key: String, value: String },
+    Range { key: String, min: String, max: String },
 }
 
 /// Renders a mod's stat lines. Held apart from `mods` because `base_items`
 /// reports the same text for the implicits it names.
 pub struct ModText {
-    stat_columns: Vec<(String, String)>,
+    stat_columns: Vec<StatColumns>,
 }
 
 impl ModText {
     pub fn new(table: &LoadedTable) -> Self {
         Self {
             stat_columns: (1..=MAX_STATS)
-                .filter(|i| table.has_col(&format!("Stat{}", i)))
-                .map(|i| (format!("Stat{}", i), format!("Stat{}Value", i)))
+                .filter_map(|i| {
+                    if table.has_col(&format!("Stat{}", i)) {
+                        Some(StatColumns::Interval { key: format!("Stat{}", i), value: format!("Stat{}Value", i) })
+                    } else if table.has_col(&format!("StatsKey{}", i)) {
+                        Some(StatColumns::Range {
+                            key: format!("StatsKey{}", i),
+                            min: format!("Stat{}Min", i),
+                            max: format!("Stat{}Max", i),
+                        })
+                    } else {
+                        None
+                    }
+                })
                 .collect(),
         }
     }
@@ -120,17 +183,41 @@ impl ModText {
     }
 
     fn describe(ctx: &Ctx, row: Row<'_>, stats: &[Stat]) -> Vec<String> {
+        // PoE 2 keeps RePoE's text, which also shows the stats a mod's aura buff applies.
+        let aura_stats = match ctx.rr.is_poe2 {
+            true => Vec::new(),
+            false => buff_template_stats(ctx, row),
+        };
         // A stat pinned to zero grants nothing, so it contributes no line.
-        let described: Vec<&Stat> = stats.iter().filter(|s| s.min != 0 || s.max != 0).collect();
+        let described: Vec<&Stat> =
+            stats.iter().filter(|s| (s.min != 0 || s.max != 0) && !aura_stats.contains(&s.id)).collect();
         let ids: Vec<String> = described.iter().map(|s| s.id.clone()).collect();
         let ranges: Vec<(i32, i32)> = described.iter().map(|s| (s.min as i32, s.max as i32)).collect();
-        ctx.translations(translation_file(row.int("Domain"))).translate_ranges(&ids, &ranges)
+        let file = match ctx.rr.is_poe2 {
+            true => translation_file(row.int("Domain")),
+            false => poe1_translation_file(&domain_label(ctx, row).unwrap_or_default()),
+        };
+        ctx.translations(file).translate_ranges(&ids, &ranges)
     }
 
     /// The lines one mod shows, as the client draws them.
     pub fn lines(&self, ctx: &Ctx, row: Row<'_>) -> Vec<String> {
         Self::describe(ctx, row, &self.stats(ctx, row))
     }
+}
+
+/// Stats a mod applies through its buff templates. The client draws them
+/// through the mod's `local_display_*` stat instead.
+fn buff_template_stats(ctx: &Ctx, row: Row<'_>) -> Vec<String> {
+    ["BuffTemplate1", "BuffTemplate", "BuffTemplate2"]
+        .into_iter()
+        .filter(|c| row.table.has_col(c))
+        .filter_map(|c| ctx.rr.deref(row, c))
+        .flat_map(|template| {
+            let column = template.table.pick(&["StatsKey", "Stats"]).unwrap_or("Stats");
+            ctx.rr.deref_list_ids(template.row(), column)
+        })
+        .collect()
 }
 
 /// Stat text keeps the client's link markup: `[Resistances|Fire Resistance]`
@@ -154,6 +241,8 @@ pub fn mods(ctx: &Ctx) -> Result<(), String> {
     let renderer = ModText::new(&table);
 
     let prices = gold_prices(ctx);
+    let skills = granted_skills(ctx);
+    let unscalable = table.pick(&["IsUnscalable", "IsEssenceOnlyModifier"]).unwrap_or("IsEssenceOnlyModifier");
 
     let mut root: Vec<(String, J)> = Vec::new();
     let mut seen = HashSet::new();
@@ -162,26 +251,32 @@ pub fn mods(ctx: &Ctx) -> Result<(), String> {
         if id.is_empty() || !seen.insert(id.clone()) {
             continue; // first definition wins, as RePoE reports duplicates
         }
-        let domain = row.int("Domain");
         let stats = renderer.stats(ctx, row);
         let lines = ModText::describe(ctx, row, &stats);
 
         let entry = Obj::new()
-            .set("adds_tags", json::strings(ctx.rr.deref_list_ids(row, "Tags")))
-            .set("domain", text(name_of(&DOMAINS, domain).unwrap_or("<unknown>")))
-            .set("generation_type", text(name_of(&GENERATION_TYPES, row.int("GenerationType")).unwrap_or("<unknown>")))
-            .set("generation_weights", weights(ctx, row, "GenerationWeight_Tags", "GenerationWeight_Values"))
+            .set("adds_tags", json::strings(ctx.rr.deref_list_ids(row, column(row, &["Tags", "TagsKeys"]))))
+            .set("domain", text(domain_label(ctx, row).as_deref().unwrap_or("<unknown>")))
+            .set("generation_type", text(generation_label(ctx, row).as_deref().unwrap_or("<unknown>")))
+            .set(
+                "generation_weights",
+                weights(ctx, row, column(row, &["GenerationWeight_Tags", "GenerationWeight_TagsKeys"]), "GenerationWeight_Values"),
+            )
             .set("grants_effects", granted_effects(ctx, row))
             .set("groups", json::strings(ctx.rr.deref_list_ids(row, "Families")))
-            .set("implicit_tags", json::strings(ctx.rr.deref_list_ids(row, "ImplicitTags")))
+            .set("implicit_tags", json::strings(ctx.rr.deref_list_ids(row, column(row, &["ImplicitTags", "ImplicitTagsKeys"]))))
             .set("is_essence_only", J::Bool(row.bool("IsEssenceOnlyModifier")))
+            // The same column: it marks mods that cannot be scaled, few of which are essence mods.
+            .set("is_unscalable", J::Bool(row.bool(unscalable)))
+            .or_null("radius_jewel_type", table.pick(&["RadiusJewelType"]).map(|c| int(row.int(c))))
             .set("name", text(row.str("Name")))
             .set("required_level", int(row.int("Level")))
-            .set("spawn_weights", weights(ctx, row, "SpawnWeight_Tags", "SpawnWeight_Values"))
+            .set("spawn_weights", weights(ctx, row, column(row, &["SpawnWeight_Tags", "SpawnWeight_TagsKeys"]), "SpawnWeight_Values"))
             .set("stats", J::Arr(stats.iter().map(Stat::to_json).collect()))
             .or_null("text", (!lines.is_empty()).then(|| text(lines.join("\n"))))
-            .set("type", text(ctx.rr.deref(row, "ModType").map(|m| m.row().string("Name")).unwrap_or_default()))
+            .set("type", text(mod_type_name(ctx, row)))
             .or_null("gold_value", prices.get(&row.index).map(|v| int(*v)))
+            .or_null("granted_skills", skills.get(&row.index).map(|s| J::Arr(s.clone())))
             .build();
         root.push((id, entry));
     }
@@ -201,13 +296,18 @@ impl Stat {
     }
 }
 
-fn read_stats(ctx: &Ctx, row: Row<'_>, columns: &[(String, String)]) -> Vec<Stat> {
+fn read_stats(ctx: &Ctx, row: Row<'_>, columns: &[StatColumns]) -> Vec<Stat> {
     columns
         .iter()
-        .filter_map(|(key, value)| {
-            let id = ctx.rr.deref_id(row, key)?;
-            let (min, max) = row.interval(value).unwrap_or((0, 0));
-            Some(Stat { id, min, max })
+        .filter_map(|columns| match columns {
+            StatColumns::Interval { key, value } => {
+                let id = ctx.rr.deref_id(row, key)?;
+                let (min, max) = row.interval(value).unwrap_or((0, 0));
+                Some(Stat { id, min, max })
+            }
+            StatColumns::Range { key, min, max } => {
+                Some(Stat { id: ctx.rr.deref_id(row, key)?, min: row.int(min), max: row.int(max) })
+            }
         })
         .collect()
 }
@@ -224,7 +324,8 @@ fn weights(ctx: &Ctx, row: Row<'_>, tags: &str, values: &str) -> J {
 }
 
 fn granted_effects(ctx: &Ctx, row: Row<'_>) -> J {
-    let entries = ctx.rr.deref_list(row, "GrantedEffectsPerLevel").into_iter().filter_map(|per_level| {
+    let column = column(row, &["GrantedEffectsPerLevel", "GrantedEffectsPerLevelKeys"]);
+    let entries = ctx.rr.deref_list(row, column).into_iter().filter_map(|per_level| {
         let level_row = per_level.row();
         let effect = ctx.rr.deref_id(level_row, "GrantedEffect")?;
         Some(
@@ -235,6 +336,30 @@ fn granted_effects(ctx: &Ctx, row: Row<'_>) -> J {
         )
     });
     J::Arr(entries.collect())
+}
+
+/// `ModGrantedSkills` keyed by mod row: the gem whose skill the mod grants, and
+/// the effect and name the client's `Grants Skill` line is built from.
+fn granted_skills(ctx: &Ctx) -> HashMap<usize, Vec<J>> {
+    let Some(table) = ctx.optional_table("ModGrantedSkills") else { return HashMap::new() };
+    let Some(gem_column) = table.pick(&["Skill", "SkillGem"]) else { return HashMap::new() };
+    let mut out: HashMap<usize, Vec<J>> = HashMap::new();
+    for row in table.rows() {
+        let (Some(mod_row), Some(gem)) = (row.key("Mod"), ctx.rr.deref(row, gem_column)) else { continue };
+        let effect = ctx.rr.deref_list(gem.row(), "GemEffects").into_iter().next();
+        let granted = effect.as_ref().and_then(|e| ctx.rr.deref(e.row(), "GrantedEffect"));
+        let name = granted
+            .as_ref()
+            .and_then(|g| ctx.rr.deref(g.row(), "ActiveSkill"))
+            .and_then(|a| json::opt_text(a.row().str("DisplayedName")));
+        let entry = Obj::new()
+            .or_null("skill_gem", ctx.rr.deref_id(gem.row(), "BaseItemType").map(text))
+            .or_null("granted_effect", granted.map(|g| text(g.id())))
+            .or_null("display_name", name)
+            .build();
+        out.entry(mod_row).or_default().push(entry);
+    }
+    out
 }
 
 /// `GoldModPrices` keyed by the mod row it prices.
@@ -252,6 +377,52 @@ fn gold_prices(ctx: &Ctx) -> HashMap<usize, i64> {
 /// `mods_by_base.json`: for every base item, the mods that can roll on it,
 /// grouped by item class, then by the base's tag set, then generation type and
 /// mod group.
+/// `enchantments.json`: every mod the client generates as an enchantment,
+/// grouped by family, with the active skills its stats belong to. Heist and
+/// Harvest enchantments are ordinary unique mods that no table marks, so they
+/// stay in `mods.json` only.
+pub fn enchantments(ctx: &Ctx) -> Result<(), String> {
+    let table = ctx.table("Mods")?;
+    let stats_table = ctx.table("Stats")?;
+    let renderer = ModText::new(&table);
+    let skills_by_stat: HashMap<String, Vec<String>> = stats_table
+        .rows()
+        .filter_map(|row| {
+            let skills = row.list_str("BelongsActiveSkillsKey");
+            (!skills.is_empty()).then(|| (row.id().to_string(), skills))
+        })
+        .collect();
+
+    let mut families: Vec<(String, Vec<J>)> = Vec::new();
+    for row in table.rows() {
+        let Some(generation) = generation_label(ctx, row).filter(|g| g.contains("enchantment")) else { continue };
+        let stats = renderer.stats(ctx, row);
+        let lines = ModText::describe(ctx, row, &stats);
+        let mut skills: Vec<String> = Vec::new();
+        for skill in stats.iter().filter_map(|s| skills_by_stat.get(&s.id)).flatten() {
+            if !skills.contains(skill) {
+                skills.push(skill.clone());
+            }
+        }
+        let entry = Obj::new()
+            .set("id", text(row.id()))
+            .set("level", int(row.int("Level")))
+            .set("generation_type", text(&generation))
+            .set("domain", text(domain_label(ctx, row).as_deref().unwrap_or("<unknown>")))
+            .set("stats", J::Arr(stats.iter().map(Stat::to_json).collect()))
+            .or_null("text", (!lines.is_empty()).then(|| text(lines.join("\n"))))
+            .set("spawn_weights", weights(ctx, row, column(row, &["SpawnWeight_Tags", "SpawnWeight_TagsKeys"]), "SpawnWeight_Values"))
+            .set("skills", json::strings(&skills))
+            .build();
+        let family = ctx.rr.deref_list_ids(row, "Families").into_iter().next().unwrap_or_default();
+        match families.iter_mut().find(|(f, _)| *f == family) {
+            Some(slot) => slot.1.push(entry),
+            None => families.push((family, vec![entry])),
+        }
+    }
+    ctx.write("enchantments", &J::Obj(families.into_iter().map(|(family, entries)| (family, J::Arr(entries))).collect()))
+}
+
 pub fn mods_by_base(ctx: &Ctx) -> Result<(), String> {
     let bases = super::items::collect_bases(ctx)?;
     let classes = ctx.table("ItemClasses")?;
@@ -392,20 +563,18 @@ fn mods_by_domain(ctx: &Ctx, table: &LoadedTable) -> HashMap<String, Vec<ModEntr
         let weights = row.list_int("SpawnWeight_Values");
         let spawn_weights = ctx
             .rr
-            .deref_list(row, "SpawnWeight_Tags")
+            .deref_list(row, column(row, &["SpawnWeight_Tags", "SpawnWeight_TagsKeys"]))
             .into_iter()
             .enumerate()
             .map(|(i, tag)| (tag.id(), weights.get(i).copied().unwrap_or(0)))
             .collect();
-        let domain = name_of(&DOMAINS, row.int("Domain")).unwrap_or("undefined").to_string();
+        let domain = domain_label(ctx, row).unwrap_or_else(|| "undefined".to_string());
         out.entry(domain).or_default().push(ModEntry {
             id,
             level: row.int("Level"),
-            generation_type: name_of(&GENERATION_TYPES, row.int("GenerationType"))
-                .unwrap_or("<unknown>")
-                .to_string(),
-            mod_type: ctx.rr.deref(row, "ModType").map(|m| m.row().string("Name")).unwrap_or_default(),
-            adds_tags: ctx.rr.deref_list_ids(row, "Tags"),
+            generation_type: generation_label(ctx, row).unwrap_or_else(|| "<unknown>".to_string()),
+            mod_type: mod_type_name(ctx, row),
+            adds_tags: ctx.rr.deref_list_ids(row, column(row, &["Tags", "TagsKeys"])),
             spawn_weights,
         });
     }

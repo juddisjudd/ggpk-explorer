@@ -11,6 +11,14 @@ pub fn world_areas(ctx: &Ctx) -> Result<(), String> {
     let packs = ctx.optional_table("MonsterPacks");
     let packs_by_area = packs_by_area(ctx);
     let entries_by_pack = entries_by_pack(ctx);
+    let description = areas.column_or_after(&["Description"], "QuestFlags", 2);
+    let column = |names: &[&'static str]| areas.pick(names).unwrap_or(names[0]);
+    let topologies_column = column(&["Topologies", "TopologiesKeys"]);
+    let mods_column = column(&["AreaMods", "ModsKeys"]);
+    let connections_column = column(&["Connections", "Connections_WorldAreasKeys"]);
+    let environment_column = column(&["Environment", "EnvironmentsKey"]);
+    let parent_column = column(&["ParentTown", "ParentTown_WorldAreasKey"]);
+    let terrain_column = column(&["TerrainPlugins", "TerrainPlugin"]);
 
     let root = areas
         .rows()
@@ -24,7 +32,7 @@ pub fn world_areas(ctx: &Ctx) -> Result<(), String> {
 
             let topologies: Vec<J> = ctx
                 .rr
-                .deref_list(area, "Topologies")
+                .deref_list(area, topologies_column)
                 .iter()
                 .map(|t| {
                     let t = t.row();
@@ -39,10 +47,10 @@ pub fn world_areas(ctx: &Ctx) -> Result<(), String> {
             let entry = Obj::new()
                 .set("act", int(area.int("Act")))
                 .set("area_level", int(area.int("AreaLevel")))
-                .set("area_mods", json::strings(ctx.rr.deref_list_ids(area, "AreaMods")))
+                .set("area_mods", json::strings(ctx.rr.deref_list_ids(area, mods_column)))
                 .set("bosses", json::strings(ctx.rr.deref_list_ids(area, "Bosses_MonsterVarietiesKeys")))
-                .set("connections", json::strings(ctx.rr.deref_list_ids(area, "Connections")))
-                .or_null("environment", ctx.rr.deref_id(area, "Environment").map(text))
+                .set("connections", json::strings(ctx.rr.deref_list_ids(area, connections_column)))
+                .or_null("environment", ctx.rr.deref_id(area, environment_column).map(text))
                 .set("has_waypoint", J::Bool(area.bool("HasWaypoint")))
                 .set("id", text(area.id()))
                 .set("is_town", J::Bool(area.bool("IsTown")))
@@ -50,10 +58,21 @@ pub fn world_areas(ctx: &Ctx) -> Result<(), String> {
                 .set("name", text(area.str("Name")))
                 .set("tags", json::strings(ctx.rr.deref_list_ids(area, "Tags")))
                 .or_null("topologies", (!topologies.is_empty()).then(|| J::Arr(topologies)))
-                .or_null("area_type_tags", None)
-                .or_null("parent_town", ctx.rr.deref_id(area, "ParentTown").map(text))
+                .or_null(
+                    "area_type_tags",
+                    (!ctx.rr.is_poe2).then(|| json::strings(ctx.rr.deref_list_ids(area, "AreaTypeTags"))),
+                )
+                .or_null("parent_town", ctx.rr.deref_id(area, parent_column).map(text))
                 .or_null("packs", (!pack_json.is_empty()).then(|| J::Arr(pack_json)))
-                .or_null("terrain_plugins", ctx.rr.deref_id(area, "TerrainPlugins").map(text))
+                .or_null("terrain_plugins", ctx.rr.deref_id(area, terrain_column).map(text))
+                .or_null("is_hideout", areas.pick(&["IsHideout"]).map(|c| J::Bool(area.bool(c))))
+                .or_null(
+                    "description",
+                    description.and_then(|c| match area.cell(c) {
+                        Some(crate::dat::reader::DatValue::String(s)) => json::opt_text(s),
+                        _ => None,
+                    }),
+                )
                 .build();
             (area.id().to_string(), entry)
         })
@@ -94,12 +113,13 @@ fn pack_json(ctx: &Ctx, pack: Row<'_>, entries: &HashMap<usize, Vec<usize>>) -> 
         .collect();
 
     let spawn_chance = pack.int("BossMonsterSpawnChance");
+    let column = |names: &[&'static str]| pack.table.pick(names).unwrap_or(names[0]);
     Obj::new()
         .or_null("additional_monsters", (!additional.is_empty()).then(|| J::Obj(additional)))
         .set("boss_chance", int(spawn_chance))
-        .set("boss_count", int(pack.int("BossCount")))
+        .set("boss_count", int(pack.int(column(&["BossCount", "BossMonsterCount"]))))
         .set("boss_monster_spawn_chance", int(spawn_chance))
-        .set("boss_monsters", json::strings(ctx.rr.deref_list_ids(pack, "BossMonsters")))
+        .set("boss_monsters", json::strings(ctx.rr.deref_list_ids(pack, column(&["BossMonsters", "BossMonster_MonsterVarietiesKeys"]))))
         .set("id", text(pack.id()))
         .set("max_count", int(pack.int("MaxCount")))
         .set("min_count", int(pack.int("MinCount")))
@@ -144,8 +164,9 @@ fn unnamed_columns(row: Row<'_>) -> J {
 fn packs_by_area(ctx: &Ctx) -> HashMap<usize, Vec<usize>> {
     let Some(table) = ctx.optional_table("MonsterPacks") else { return HashMap::new() };
     let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
+    let column = table.pick(&["WorldAreas", "WorldAreasKeys"]).unwrap_or("WorldAreas");
     for row in table.rows() {
-        for area in row.list_keys("WorldAreas") {
+        for area in row.list_keys(column) {
             out.entry(area).or_default().push(row.index);
         }
     }
@@ -161,4 +182,34 @@ fn entries_by_pack(ctx: &Ctx) -> HashMap<usize, Vec<usize>> {
         }
     }
     out
+}
+
+/// `endgame_maps.json`: each Atlas map by its world area, with the monster
+/// packs native to it and the text its map pin shows.
+pub fn endgame_maps(ctx: &Ctx) -> Result<(), String> {
+    let table = ctx.table("EndgameMaps")?;
+    let area = table.require(&["WorldArea", "Id"])?;
+    let packs = table.pick(&["MonsterPacks", "NativePacks"]);
+    let content_set = table.pick(&["MapContentSet", "ContentSetKey"]);
+    let root = table
+        .rows()
+        .filter_map(|row| {
+            let area = ctx.rr.deref_id(row, area)?;
+            let entry = Obj::new()
+                .or_null("flavour_text", json::opt_text(row.str("FlavourText")))
+                .set("native_packs", json::strings(packs.map(|c| ctx.rr.deref_list_ids(row, c)).unwrap_or_default()))
+                .set("map_content", json::strings(ctx.rr.deref_list_ids(row, "MapContent")))
+                .or_null("map_content_set", content_set.and_then(|c| ctx.rr.deref_id(row, c)).map(text))
+                .or_null(
+                    "objective_description",
+                    ctx.rr.deref(row, "ObjectiveDescription").and_then(|s| json::opt_text(s.row().str("Text"))),
+                )
+                .or_null("special_map_text", json::opt_text(row.str("SpecialMapText")))
+                .or_null("special_map_flavour_text", json::opt_text(row.str("SpecialMapFlavourText")))
+                .or_null("special_map_help_text", json::opt_text(row.str("SpecialMapHelpText")))
+                .build();
+            Some((area, entry))
+        })
+        .collect();
+    ctx.write("endgame_maps", &J::Obj(root))
 }

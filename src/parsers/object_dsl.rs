@@ -8,7 +8,10 @@ use serde::Serialize;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ObjectFile {
     pub version: Option<u32>,
+    /// The last `extends` line.
     pub extends: Option<String>,
+    /// Every `extends` line, in file order; a monster type can inherit from several.
+    pub parents: Vec<String>,
     pub is_abstract: bool,
     pub includes: Vec<String>,
     /// Top-level statements that are not blocks (`movement_speed 330`, `ParticleEffect "blade" "x.pet"`).
@@ -81,6 +84,13 @@ impl Lexer {
                         }
                         self.pos += 1;
                     }
+                }
+                '/' if self.chars.get(self.pos + 1) == Some(&'*') => {
+                    self.pos += 2;
+                    while self.pos < self.chars.len() && !(self.chars[self.pos] == '*' && self.chars.get(self.pos + 1) == Some(&'/')) {
+                        self.pos += 1;
+                    }
+                    self.pos = (self.pos + 2).min(self.chars.len());
                 }
                 '{' => {
                     self.pos += 1;
@@ -307,6 +317,7 @@ fn parse_block(lex: &mut Lexer, file: &mut ObjectFile, top: bool) -> Block {
                 }
                 (Tok::Word(w), [Tok::Str(s)]) if w == "extends" || w == "parent" => {
                     file.extends = Some(s.clone());
+                    file.parents.push(s.clone());
                     continue;
                 }
                 (Tok::Word(w), []) if w == "abstract" => {
@@ -370,6 +381,19 @@ mod tests {
         assert_eq!(client.children.len(), 2);
         assert_eq!(client.children[0].props[0].key, "skin");
         assert_eq!(client.children[0].props[0].value, "Art/Models/X.sm");
+    }
+
+    #[test]
+    fn keeps_every_parent_and_skips_block_comments() {
+        let doc = parse(
+            "version 3\nextends \"Metadata/Monsters/Monster\"\nextends \"Metadata/Monsters/BossBaseStandAlone\"\n\nStateMachine\n{\n\t/*\n\tboss_life_bar - controls { the bar }\n\t0: hidden */\n\tdefine_shared_state = \"light;\"\n}\n\nStats\n{\n\tset_use_boss_incremental_stats = 1\n}\n",
+        );
+        assert_eq!(doc.extends.as_deref(), Some("Metadata/Monsters/BossBaseStandAlone"));
+        assert_eq!(doc.parents, vec!["Metadata/Monsters/Monster", "Metadata/Monsters/BossBaseStandAlone"]);
+        assert_eq!(doc.components.len(), 2);
+        assert_eq!(doc.components[0].props[0].key, "define_shared_state");
+        assert_eq!(doc.components[1].name, "Stats");
+        assert_eq!(doc.components[1].props[0].key, "set_use_boss_incremental_stats");
     }
 
     #[test]
