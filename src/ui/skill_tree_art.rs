@@ -55,18 +55,10 @@ pub struct SkillTreeArtSet {
     pub glow: String,
 }
 
-/// The community schema bundles both PoE1 and PoE2 definitions for tables
-/// shared by both games (distinguished by `validFor`), PoE1 listed first —
-/// this app is PoE2-only, so always prefer `validFor == 2` when present.
-/// See the matching helper in `atlas_node_db.rs` for the full story.
-fn find_table<'a>(schema: &'a Schema, name: &str) -> Result<&'a Table, String> {
-    let matches: Vec<&Table> = schema.tables.iter().filter(|t| t.name.eq_ignore_ascii_case(name)).collect();
-    matches
-        .iter()
-        .find(|t| t.valid_for == Some(2))
-        .or_else(|| matches.first())
-        .copied()
-        .ok_or_else(|| format!("Schema table '{}' not found", name))
+/// The community schema bundles both games' definitions for the tables they
+/// share, told apart by `validFor`.
+fn find_table<'a>(schema: &'a Schema, name: &str, is_poe2: bool) -> Result<&'a Table, String> {
+    schema.find_table(name, is_poe2).ok_or_else(|| format!("Schema table '{}' not found", name))
 }
 
 fn col_index(table: &Table, name: &str) -> Option<usize> {
@@ -84,8 +76,8 @@ fn as_string(val: &DatValue) -> String {
 /// cleanly with the app's normal `DatReader`/schema path, unlike
 /// `PassiveSkillTreeUIArt` below) into a row-index-ordered `Vec`, since
 /// `PassiveSkillTreeUIArt`'s foreignrow fields reference it by row index.
-pub fn parse_node_frame_art(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<FrameArt>, String> {
-    let table = find_table(schema, "PassiveSkillTreeNodeFrameArt")?;
+pub fn parse_node_frame_art(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<FrameArt>, String> {
+    let table = find_table(schema, "PassiveSkillTreeNodeFrameArt", is_poe2)?;
     let reader = DatReader::new(bytes, "passiveskilltreenodeframeart.datc64").map_err(|e| e.to_string())?;
     let id_col = col_index(table, "Id");
     let normal_col = col_index(table, "Normal");
@@ -112,8 +104,8 @@ pub fn parse_node_frame_art(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<Frame
 
 /// Parses `PassiveSkillTreeConnectionArt.datc64` (also schema-driven, also
 /// reads cleanly) into a row-index-ordered `Vec`, for the same reason.
-pub fn parse_connection_art(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<ConnectionArt>, String> {
-    let table = find_table(schema, "PassiveSkillTreeConnectionArt")?;
+pub fn parse_connection_art(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<ConnectionArt>, String> {
+    let table = find_table(schema, "PassiveSkillTreeConnectionArt", is_poe2)?;
     let reader = DatReader::new(bytes, "passiveskilltreeconnectionart.datc64").map_err(|e| e.to_string())?;
     let normal_col = col_index(table, "Normal");
     let intermediate_col = col_index(table, "Intermediate");
@@ -208,6 +200,99 @@ fn read_foreignrow_field(data: &[u8], pos: usize) -> Option<usize> {
 /// = 32 + 1 + 24 + 112 + 8 = 177 bytes/row, matching the file's actual row length exactly.
 /// Returns the art sets keyed by `Id` plus the row-ordered list of ids, so
 /// foreignrows into this table (`Ascendancy.UIArt`) can be resolved.
+/// `PassiveSkillTreeGroupBackgroundArt` in row order, which PoE 1's UI art
+/// rows point into. PoE 2 keeps the same paths on the UI art row itself.
+pub fn parse_group_background_art(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<GroupBackground>, String> {
+    let table = find_table(schema, "PassiveSkillTreeGroupBackgroundArt", is_poe2)?;
+    let reader = DatReader::new(bytes, "passiveskilltreegroupbackgroundart.datc64").map_err(|e| e.to_string())?;
+    let get = |name: &str| col_index(table, name);
+    let (small, medium, large) = (get("Small"), get("Medium"), get("Large"));
+    let (small_blank, medium_blank, large_blank) = (get("SmallBlank"), get("MediumBlank"), get("LargeBlank"));
+    let mut out = Vec::with_capacity(reader.row_count as usize);
+    for i in 0..reader.row_count {
+        let row = reader.read_row(i, table).map_err(|e| e.to_string())?;
+        let text = |col: Option<usize>| col.and_then(|c| row.get(c)).map(as_string).unwrap_or_default();
+        out.push(GroupBackground {
+            small: text(small),
+            medium: text(medium),
+            large: text(large),
+            small_blank: text(small_blank),
+            medium_blank: text(medium_blank),
+            large_blank: text(large_blank),
+        });
+    }
+    Ok(out)
+}
+
+/// PoE 1 leaves the character and atlas trees out of
+/// `PassiveSkillTreeConnectionArt` (which holds only the Abyss tree), so their
+/// connector art is taken by the names its own sheet descriptor gives them.
+const POE1_CONNECTION_ART: [(&str, &str); 2] = [
+    ("Character", "Art/2DArt/UIImages/InGame/PassiveSkillScreenCurves"),
+    ("Atlas", "Art/2DArt/UIImages/InGame/AtlasRegions/AtlasTrees/AtlasAscendancyCurves"),
+];
+
+/// PoE 1's UI art row names its frames and points at a background art row.
+pub fn parse_ui_art_poe1(
+    bytes: Vec<u8>,
+    schema: &Schema,
+    node_frames: &[FrameArt],
+    backgrounds: &[GroupBackground],
+) -> Result<(HashMap<String, SkillTreeArtSet>, Vec<String>), String> {
+    let table = find_table(schema, "PassiveSkillTreeUIArt", false)?;
+    let reader = DatReader::new(bytes, "passiveskilltreeuiart.datc64").map_err(|e| e.to_string())?;
+    let id_col = col_index(table, "Id").ok_or("PassiveSkillTreeUIArt missing Id")?;
+    let bg_col = col_index(table, "BackgroundArt");
+    let frame_cols = [
+        (NodeFrameKind::Passive, col_index(table, "PassiveFrame")),
+        (NodeFrameKind::Notable, col_index(table, "NotableFrame")),
+        (NodeFrameKind::Keystone, col_index(table, "KeystoneFrame")),
+    ];
+    let mut out = HashMap::new();
+    let mut ids = Vec::with_capacity(reader.row_count as usize);
+    for i in 0..reader.row_count {
+        let row = reader.read_row(i, table).map_err(|e| e.to_string())?;
+        let id = row.get(id_col).map(as_string).unwrap_or_default();
+        ids.push(id.clone());
+        if id.is_empty() {
+            continue;
+        }
+        let mut frames = HashMap::new();
+        for (kind, col) in &frame_cols {
+            if let Some(frame) = col.and_then(|c| row.get(c)).and_then(as_row).and_then(|r| node_frames.get(r)).cloned() {
+                frames.insert(*kind, frame);
+            }
+        }
+        let group_background = bg_col
+            .and_then(|c| row.get(c))
+            .and_then(as_row)
+            .and_then(|r| backgrounds.get(r))
+            .cloned()
+            .unwrap_or_default();
+        let connection = POE1_CONNECTION_ART
+            .iter()
+            .find(|(tree, _)| *tree == id)
+            .map(|(_, prefix)| ConnectionArt {
+                normal: format!("{}Normal", prefix),
+                intermediate: format!("{}Intermediate", prefix),
+                intermediate2: format!("{}Intermediate", prefix),
+                active: format!("{}Active", prefix),
+                ..ConnectionArt::default()
+            })
+            .unwrap_or_default();
+        out.insert(id, SkillTreeArtSet { group_background, frames, connection, glow: String::new() });
+    }
+    Ok((out, ids))
+}
+
+fn as_row(val: &DatValue) -> Option<usize> {
+    match val {
+        DatValue::ForeignRow(i) if *i != usize::MAX => Some(*i),
+        DatValue::Int(i) if *i >= 0 => Some(*i as usize),
+        _ => None,
+    }
+}
+
 pub fn parse_ui_art(
     bytes: Vec<u8>,
     node_frames: &[FrameArt],
@@ -347,11 +432,13 @@ mod tests {
         let node_frames = parse_node_frame_art(
             std::fs::read(dir.join("data/balance/passiveskilltreenodeframeart.datc64")).unwrap(),
             &schema,
+            true,
         )
         .unwrap();
         let connections = parse_connection_art(
             std::fs::read(dir.join("data/balance/passiveskilltreeconnectionart.datc64")).unwrap(),
             &schema,
+            true,
         )
         .unwrap();
         let (ui_art, _ids) = parse_ui_art(

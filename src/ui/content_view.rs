@@ -223,6 +223,17 @@ use crate::ui::app::FileSelection;
 
 
 impl ContentView {
+    /// Drops everything read from the install being replaced: another GGPK
+    /// holds other files under the same path hashes, and its passive trees are
+    /// described by their own tables and art. The schema, the CDN loader and
+    /// the volume outlive the source.
+    pub fn reset_for_new_source(&mut self) {
+        let dat_viewer = std::mem::take(&mut self.dat_viewer);
+        let cdn_loader = self.cdn_loader.take();
+        let audio_volume = self.audio_volume;
+        *self = Self { dat_viewer, cdn_loader, audio_volume, ..Self::default() };
+    }
+
     pub fn set_cdn_loader(&mut self, loader: crate::bundles::cdn::CdnBundleLoader) {
         self.cdn_loader = Some(loader);
     }
@@ -2396,7 +2407,7 @@ impl ContentView {
             return;
         };
         let Some(out_dir) = rfd::FileDialog::new().set_title("Export skill tree to folder").pick_folder() else { return };
-        let source = crate::skill_tree_export::TreeExportSource { reader, index: index.clone(), steam: self.steam_loader.clone(), schema };
+        let source = crate::skill_tree_export::TreeExportSource::new(reader, index.clone(), self.steam_loader.clone(), schema);
         let db = self.skill_graph_db.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.tree_export_rx = Some((hash, rx));
@@ -2472,10 +2483,12 @@ impl ContentView {
 
         let index = index.clone();
         let steam_loader = self.steam_loader.clone();
+        let atlas = self.skill_graph_db.as_ref().and_then(|db| db.ui_atlas.clone());
+        let game = crate::settings::Game::from_is_poe2(self.skill_graph_db.as_ref().map(|db| db.is_poe2).unwrap_or(true));
         let (tx, rx) = std::sync::mpsc::channel();
         self.psg_texture_rx = Some(rx);
         std::thread::spawn(move || {
-            let batch = fetch_and_decode_dds_batch(reader.as_deref(), &index, steam_loader.as_ref(), missing);
+            let batch = fetch_and_decode_dds_batch(reader.as_deref(), &index, steam_loader.as_ref(), atlas.as_deref(), game, missing);
             let _ = tx.send(batch);
         });
     }
@@ -3236,36 +3249,60 @@ pub(crate) fn build_skill_graph_db(
             .ok_or_else(|| format!("Failed to read file: {}", path))
     };
     let fetch_optional = |path: &str| -> Option<Vec<u8>> { fetch(path).ok() };
-    let passiveskills_bytes = fetch("data/balance/passiveskills.datc64")?;
-    let stats_bytes = fetch("data/balance/stats.datc64")?;
+    // PoE 2 keeps its tables under `data/balance/` and its descriptions as
+    // `.csd`; PoE 1 keeps both one level up.
+    let is_poe2 = crate::data_export::game_from_index(index).map(|g| g.is_poe2()).unwrap_or(true);
+    let table = |name: &str| match is_poe2 {
+        true => format!("data/balance/{}.datc64", name),
+        false => format!("data/{}.datc64", name),
+    };
+    let passiveskills_bytes = fetch(&table("passiveskills"))?;
+    let stats_bytes = fetch(&table("stats"))?;
 
     // Covers all three known graph types: character/ascendancy, atlas, and
     // Brequel (Chayula league tree). Later files redefine earlier entries,
     // so the generic `stat_descriptions.csd` goes before the passive-tree
     // files; the atlas files come first so they never shadow passive text.
-    let csd_paths = [
-        "data/statdescriptions/atlas_stat_descriptions.csd",
-        "data/statdescriptions/atlas_variant_stat_descriptions.csd",
-        "data/statdescriptions/stat_descriptions.csd",
-        "data/statdescriptions/passive_skill_stat_descriptions.csd",
-        "data/statdescriptions/passive_skill_variant_stat_descriptions.csd",
-    ];
+    let csd_paths: Vec<String> = match is_poe2 {
+        true => ["atlas_stat_descriptions", "atlas_variant_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions", "passive_skill_variant_stat_descriptions"]
+            .iter()
+            .map(|n| format!("data/statdescriptions/{}.csd", n))
+            .collect(),
+        // A node states what it grants you; the aura file rewords the same
+        // stats as what nearby enemies or allies get, and belongs to buffs.
+        false => ["atlas_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions"]
+            .iter()
+            .map(|n| format!("metadata/statdescriptions/{}.txt", n))
+            .collect(),
+    };
     let mut stat_csd_sources = Vec::new();
     for path in csd_paths {
-        let bytes = fetch(path)?;
-        stat_csd_sources.push(crate::ui::atlas_node_db::StatCsdSource {
-            path: path.to_string(),
-            bytes,
-        });
+        // A tree file one game does not ship simply adds nothing.
+        let Some(bytes) = fetch_optional(&path) else { continue };
+        stat_csd_sources.push(crate::ui::atlas_node_db::StatCsdSource { path, bytes });
+    }
+    if stat_csd_sources.is_empty() {
+        return Err("no passive tree stat descriptions found".to_string());
     }
 
     let extra = crate::ui::atlas_node_db::ExtraTables {
-        ascendancy: fetch_optional("data/balance/ascendancy.datc64"),
-        atlas_subtrees: fetch_optional("data/balance/atlaspassiveskillsubtrees.datc64"),
-        characters: fetch_optional("data/balance/characters.datc64"),
-        decorators: fetch_optional("data/balance/passivetreedecorators.datc64"),
-        mastery_groups: fetch_optional("data/balance/passiveskillmasterygroups.datc64"),
-        mastery_art: fetch_optional("data/balance/passiveskilltreemasteryart.datc64"),
+        ascendancy: fetch_optional(&table("ascendancy")),
+        descendancy: fetch_optional(&table("descendancy")),
+        mastery_effects: fetch_optional(&table("passiveskillmasteryeffects")),
+        reminder_text: fetch_optional(&table("remindertext")),
+        aura_descriptions: fetch_optional("metadata/statdescriptions/passive_skill_aura_stat_descriptions.txt").map(|bytes| {
+            crate::ui::atlas_node_db::StatCsdSource {
+                path: "metadata/statdescriptions/passive_skill_aura_stat_descriptions.txt".to_string(),
+                bytes,
+            }
+        }),
+        buff_templates: fetch_optional(&table("bufftemplates")),
+        buff_definitions: fetch_optional(&table("buffdefinitions")),
+        atlas_subtrees: fetch_optional(&table("atlaspassiveskillsubtrees")),
+        characters: fetch_optional(&table("characters")),
+        decorators: fetch_optional(&table("passivetreedecorators")),
+        mastery_groups: fetch_optional(&table("passiveskillmasterygroups")),
+        mastery_art: fetch_optional(&table("passiveskilltreemasteryart")),
     };
 
     let mut db = crate::ui::atlas_node_db::build(
@@ -3274,17 +3311,37 @@ pub(crate) fn build_skill_graph_db(
         &stat_csd_sources,
         extra,
         schema,
+        is_poe2,
     )?;
 
-    let node_frame_bytes = fetch("data/balance/passiveskilltreenodeframeart.datc64")?;
-    let connection_bytes = fetch("data/balance/passiveskilltreeconnectionart.datc64")?;
-    let ui_art_bytes = fetch("data/balance/passiveskilltreeuiart.datc64")?;
-    let node_frames = crate::ui::skill_tree_art::parse_node_frame_art(node_frame_bytes, schema)?;
-    let connections = crate::ui::skill_tree_art::parse_connection_art(connection_bytes, schema)?;
-    let (art_sets, ui_art_ids) = crate::ui::skill_tree_art::parse_ui_art(ui_art_bytes, &node_frames, &connections)?;
+    let node_frames = match fetch_optional(&table("passiveskilltreenodeframeart")) {
+        Some(bytes) => crate::ui::skill_tree_art::parse_node_frame_art(bytes, schema, is_poe2)?,
+        None => Vec::new(),
+    };
+    let ui_art_bytes = fetch(&table("passiveskilltreeuiart"))?;
+    // PoE 1 points its UI art at a background-art row and names no connector art.
+    let (art_sets, ui_art_ids) = match is_poe2 {
+        true => {
+            let connection_bytes = fetch(&table("passiveskilltreeconnectionart"))?;
+            let connections = crate::ui::skill_tree_art::parse_connection_art(connection_bytes, schema, is_poe2)?;
+            crate::ui::skill_tree_art::parse_ui_art(ui_art_bytes, &node_frames, &connections)?
+        }
+        false => {
+            let backgrounds = match fetch_optional(&table("passiveskilltreegroupbackgroundart")) {
+                Some(bytes) => crate::ui::skill_tree_art::parse_group_background_art(bytes, schema, is_poe2)?,
+                None => Vec::new(),
+            };
+            crate::ui::skill_tree_art::parse_ui_art_poe1(ui_art_bytes, schema, &node_frames, &backgrounds)?
+        }
+    };
     db.art_sets = art_sets;
     db.ui_art_ids = ui_art_ids;
     db.node_frames = node_frames;
+    // PoE 1 names its interface art inside sheets rather than shipping files.
+    db.ui_atlas = fetch_optional(crate::ui::ui_atlas::ATLAS_PATH)
+        .map(|bytes| crate::ui::ui_atlas::UiAtlas::parse(&crate::parsers::utils::decode_text_lossy(&bytes)))
+        .filter(|atlas| !atlas.is_empty())
+        .map(std::sync::Arc::new);
 
     Ok(db)
 }
@@ -3316,13 +3373,25 @@ fn decode_dds_rgba(bytes: &[u8]) -> Option<image::RgbaImage> {
     image::load_from_memory(bytes).ok().map(|img| img.to_rgba8())
 }
 
+/// A sheet is decoded at full size, since the rectangles that index into it
+/// are in its own pixels.
+fn decode_dds_full(bytes: &[u8]) -> Option<image::RgbaImage> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    if let Ok(dds) = ddsfile::Dds::read(&mut cursor) {
+        if let Ok(image) = image_dds::image_from_dds(&dds, 0) {
+            return Some(image);
+        }
+    }
+    image::load_from_memory(bytes).ok().map(|img| img.to_rgba8())
+}
+
 /// Decoded skill-tree art is cached on disk as PNG, keyed by the file's index
 /// entry (path, size, bundle) so it is refreshed when the game updates.
-fn tree_art_cache_path(path: &str, info: &crate::bundles::index::FileInfo) -> std::path::PathBuf {
+fn tree_art_cache_path(game: crate::settings::Game, path: &str, info: &crate::bundles::index::FileInfo) -> std::path::PathBuf {
     let key = crate::bundles::index::murmur_hash64a(
         format!("{}|{}|{}", path.to_ascii_lowercase(), info.file_size, info.bundle_index).as_bytes(),
     );
-    crate::settings::AppSettings::get_app_data_dir()
+    crate::settings::AppSettings::cache_dir(game)
         .join("cache")
         .join("tree_art")
         .join(format!("{:016x}.png", key))
@@ -3377,21 +3446,35 @@ fn fetch_and_decode_dds_batch(
     reader: Option<&GgpkReader>,
     index: &crate::bundles::index::Index,
     steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+    atlas: Option<&crate::ui::ui_atlas::UiAtlas>,
+    game: crate::settings::Game,
     paths: Vec<String>,
 ) -> Vec<(String, Option<egui::ColorImage>)> {
-    let cache_dir = crate::settings::AppSettings::get_app_data_dir().join("cache").join("tree_art");
+    // Decoded art is cached per game, so clearing one game's cache leaves the
+    // other's alone.
+    let cache_dir = crate::settings::AppSettings::cache_dir(game).join("cache").join("tree_art");
     let _ = std::fs::create_dir_all(&cache_dir);
 
-    // Group by bundle so each bundle is decompressed once per batch.
-    let mut jobs: Vec<(String, Option<&crate::bundles::index::FileInfo>)> =
-        paths.into_iter().map(|p| { let info = resolve_texture_path(index, &p); (p, info) }).collect();
-    jobs.sort_by_key(|(_, info)| info.map(|i| (i.bundle_index, i.file_offset)).unwrap_or((u32::MAX, 0)));
+    // Group by bundle so each bundle is decompressed once per batch. A path
+    // PoE 1 keeps inside a sheet is read as that sheet and cut out of it.
+    let mut jobs: Vec<(String, Option<&crate::bundles::index::FileInfo>, Option<crate::ui::ui_atlas::AtlasEntry>)> = paths
+        .into_iter()
+        .map(|p| match resolve_texture_path(index, &p) {
+            Some(info) => (p, Some(info), None),
+            None => match atlas.and_then(|a| a.lookup(&p)) {
+                Some(entry) => (p, resolve_texture_path(index, &entry.sheet), Some(entry.clone())),
+                None => (p, None, None),
+            },
+        })
+        .collect();
+    jobs.sort_by_key(|(_, info, _)| info.map(|i| (i.bundle_index, i.file_offset)).unwrap_or((u32::MAX, 0)));
 
     let mut current_bundle: Option<(u32, Vec<u8>)> = None;
+    let mut current_sheet: Option<(String, Option<image::RgbaImage>)> = None;
     jobs.into_iter()
-        .map(|(path, info)| {
+        .map(|(path, info, entry)| {
             let Some(info) = info else { return (path, None) };
-            let cache_file = tree_art_cache_path(&path, info);
+            let cache_file = tree_art_cache_path(game, &path, info);
             if let Ok(img) = image::open(&cache_file) {
                 return (path, Some(rgba_to_color_image(&img.to_rgba8())));
             }
@@ -3409,7 +3492,20 @@ fn fetch_and_decode_dds_batch(
                     (end <= data.len()).then(|| data[start..end].to_vec())
                 })
             };
-            let img = bytes.and_then(|b| decode_dds_rgba(&b));
+            let img = match &entry {
+                // Sheet coordinates are full-resolution, so the sheet is
+                // decoded at its own size and kept for its other images.
+                Some(entry) => {
+                    if current_sheet.as_ref().map(|(p, _)| *p != entry.sheet).unwrap_or(true) {
+                        current_sheet = Some((entry.sheet.clone(), bytes.as_deref().and_then(decode_dds_full)));
+                    }
+                    current_sheet
+                        .as_ref()
+                        .and_then(|(_, sheet)| sheet.as_ref())
+                        .and_then(|sheet| crate::ui::ui_atlas::crop(sheet, entry))
+                }
+                None => bytes.and_then(|b| decode_dds_rgba(&b)),
+            };
             if let Some(img) = &img {
                 let _ = img.save(&cache_file);
             }
@@ -3496,7 +3592,7 @@ mod skill_graph_pipeline_tests {
             if family.is_empty() {
                 continue; // not every tree references every family (e.g. atlas has no jewel sockets)
             }
-            let decoded = fetch_and_decode_dds_batch(Some(&reader), &index, None, family.clone());
+            let decoded = fetch_and_decode_dds_batch(Some(&reader), &index, None, None, crate::settings::Game::Poe2, family.clone());
             let ok_count = decoded.iter().filter(|(_, img)| img.is_some()).count();
             assert!(
                 ok_count * 2 >= family.len(),

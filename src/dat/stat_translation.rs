@@ -80,6 +80,20 @@ impl TranslationLookup {
     /// Like [`translate_grouped`](Self::translate_grouped) but reporting which
     /// stats each line consumed and where its description sits in the file, so
     /// a caller can key lines by stat and order them the way a tooltip does.
+    /// The lines a node shows and the reminders printed under them, which the
+    /// tree lists separately from the lines themselves.
+    pub fn translate_with_reminders(&self, stat_ids: &[String], values: &[i32]) -> (Vec<String>, Vec<String>) {
+        let ranges: Vec<(i32, i32)> = values.iter().map(|&v| (v, v)).collect();
+        let lines = self.resolve(stat_ids, &ranges, Order::File);
+        let mut reminders: Vec<String> = Vec::new();
+        for id in lines.iter().flat_map(|line| line.reminders.iter()) {
+            if !reminders.contains(id) {
+                reminders.push(id.clone());
+            }
+        }
+        (lines.into_iter().map(|line| line.text).filter(|t| !t.is_empty()).collect(), reminders)
+    }
+
     pub fn translate_detailed(&self, stat_ids: &[String], values: &[i32]) -> Vec<Line> {
         let ranges: Vec<(i32, i32)> = values.iter().map(|&v| (v, v)).collect();
         self.resolve(stat_ids, &ranges, Order::File)
@@ -136,6 +150,7 @@ impl TranslationLookup {
                         ids: entry.ids.clone(),
                         text: sub.map(|s| render(s, &vals)).unwrap_or_default(),
                         template: sub.map(|s| template(s, &entry.ids)).unwrap_or_default(),
+                        reminders: sub.map(reminder_names).unwrap_or_default(),
                         index: idx,
                     },
                 ));
@@ -160,6 +175,17 @@ pub struct Line {
     pub template: String,
     /// Position of the description in the file, for tooltip ordering.
     pub index: usize,
+    /// `ReminderText` ids the description asks to be printed under it.
+    pub reminders: Vec<String>,
+}
+
+/// The reminders one description names, in the order it names them.
+fn reminder_names(sub: &CsdSubEntry) -> Vec<String> {
+    sub.parameters
+        .iter()
+        .filter(|p| p.name.eq_ignore_ascii_case("reminderstring"))
+        .filter_map(|p| p.text.clone())
+        .collect()
 }
 
 /// Which order rendered lines come out in.

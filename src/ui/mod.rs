@@ -13,6 +13,7 @@ pub mod chrome;
 pub mod psg_viewer;
 pub mod atlas_node_db;
 pub mod skill_tree_art;
+pub mod ui_atlas;
 pub mod skill_tree_layout;
 pub mod sidebar;
 pub mod status_bar;

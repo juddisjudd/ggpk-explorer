@@ -47,6 +47,13 @@ pub struct SkillGraphNodeInfo {
     /// `PassiveSkills.Id`.
     pub id: String,
     pub is_multiple_choice_option: bool,
+    /// `Descendancy` row: PoE 1's alternate ascendancies (the Wildwood and
+    /// bloodline trees), which are not `Ascendancy` rows.
+    pub descendancy: Option<usize>,
+    /// `IsProxyPassive`: a node that only marks where a cluster jewel hangs.
+    pub is_proxy: bool,
+    /// `ReminderStrings`: the parenthesised notes under a node's own lines.
+    pub reminder_lines: Vec<String>,
     /// `IsAnointmentOnly`: Delirium-anoint-only notables ("blighted" in the web export).
     pub is_anointment_only: bool,
     pub is_free: bool,
@@ -118,6 +125,8 @@ pub struct CharacterInfo {
     /// Unnamed float pair before `SkillTreeBackground`: where the class
     /// illustration sits relative to the tree centre.
     pub image_offset: (f32, f32),
+    /// `SkillTreeBackground`: the roundel behind the class's starting node.
+    pub start_background: String,
 }
 
 /// `PassiveTreeDecorators` row: art anchored to a node (atlas blockers).
@@ -156,6 +165,14 @@ pub struct SkillGraphDatabase {
     /// `PassiveSkillMasteryGroups` row -> `PassiveSkillTreeMasteryArt.ActiveEffectImage`,
     /// the big faded glyph the client draws for a cluster's "mastery" row.
     pub mastery_effect_images: HashMap<usize, String>,
+    pub descendancies: Vec<DescendancyInfo>,
+    /// `PassiveSkillMasteryGroups` row -> its icons and the effects it offers.
+    pub mastery_groups: HashMap<usize, MasteryGroup>,
+    /// Which game the install is, so callers read the right column names.
+    pub is_poe2: bool,
+    /// Where PoE 1's interface art sits inside its sheets, when the install
+    /// has the descriptor. Filled by the caller, like `art_sets`.
+    pub ui_atlas: Option<std::sync::Arc<crate::ui::ui_atlas::UiAtlas>>,
 }
 
 impl SkillGraphDatabase {
@@ -216,14 +233,8 @@ pub const ATLAS_MAIN_TREE_BG_PATH: &str =
 /// early/common fields (so those still read correctly) but is simply
 /// missing PoE2-only columns added later (like `PassiveSkills.AtlasSubTree`)
 /// — this app is PoE2-only, so always prefer `validFor == 2` when present.
-fn find_table<'a>(schema: &'a Schema, name: &str) -> Result<&'a Table, String> {
-    let matches: Vec<&Table> = schema.tables.iter().filter(|t| t.name.eq_ignore_ascii_case(name)).collect();
-    matches
-        .iter()
-        .find(|t| t.valid_for == Some(2))
-        .or_else(|| matches.first())
-        .copied()
-        .ok_or_else(|| format!("Schema table '{}' not found", name))
+fn find_table<'a>(schema: &'a Schema, name: &str, is_poe2: bool) -> Result<&'a Table, String> {
+    schema.find_table(name, is_poe2).ok_or_else(|| format!("Schema table '{}' not found", name))
 }
 
 fn col_index(table: &Table, name: &str) -> Option<usize> {
@@ -296,8 +307,8 @@ fn as_float(val: &DatValue) -> f32 {
     }
 }
 
-fn parse_characters(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<CharacterInfo>, String> {
-    let table = find_table(schema, "Characters")?;
+fn parse_characters(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<CharacterInfo>, String> {
+    let table = find_table(schema, "Characters", is_poe2)?;
     let reader = DatReader::new(bytes, "characters.datc64").map_err(|e| e.to_string())?;
     let id_col = col_index(table, "Id").ok_or("Characters missing Id")?;
     let name_col = col_index(table, "Name");
@@ -306,6 +317,7 @@ fn parse_characters(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<CharacterInfo
     let str_col = col_index(table, "BaseStrength");
     let dex_col = col_index(table, "BaseDexterity");
     let int_col = col_index(table, "BaseIntelligence");
+    let start_bg_col = col_index(table, "SkillTreeBackground");
     let off_x_col = unnamed_col_near(table, "SkillTreeBackground", -2, "f32");
     let off_y_col = unnamed_col_near(table, "SkillTreeBackground", -1, "f32");
     let mut out = Vec::with_capacity(reader.row_count as usize);
@@ -325,14 +337,15 @@ fn parse_characters(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<CharacterInfo
             base_dexterity: int(dex_col),
             base_intelligence: int(int_col),
             image_offset: (float(off_x_col), float(off_y_col)),
+            start_background: start_bg_col.and_then(|c| row.get(c)).and_then(as_string).unwrap_or_default(),
             id,
         });
     }
     Ok(out)
 }
 
-fn parse_ascendancies(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<AscendancyInfo>, String> {
-    let table = find_table(schema, "Ascendancy")?;
+fn parse_ascendancies(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<AscendancyInfo>, String> {
+    let table = find_table(schema, "Ascendancy", is_poe2)?;
     let reader = DatReader::new(bytes, "ascendancy.datc64").map_err(|e| e.to_string())?;
     let id_col = col_index(table, "Id").ok_or("Ascendancy missing Id")?;
     let get = |name: &str| col_index(table, name);
@@ -370,8 +383,220 @@ fn parse_ascendancies(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<AscendancyI
 /// `PassiveTreeDecorators`: the schema names only the art columns; the
 /// unnamed ones are (node id, x, y, rotation, tree, scale) — verified against
 /// the atlas blockers, which sit at 0/90° and scale 0.5 next to their node.
-fn parse_decorators(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<Decorator>, String> {
-    let table = find_table(schema, "PassiveTreeDecorators")?;
+/// One string column of a table, by row, for the small lookup tables.
+fn strings_of(
+    bytes: Vec<u8>,
+    name: &str,
+    schema: &Schema,
+    table_name: &str,
+    columns: (&str, &str),
+    is_poe2: bool,
+) -> Result<Vec<(String, String)>, String> {
+    let table = find_table(schema, table_name, is_poe2)?;
+    let reader = DatReader::new(bytes, name).map_err(|e| e.to_string())?;
+    let key = col_index(table, columns.0).ok_or_else(|| format!("{} missing {}", table_name, columns.0))?;
+    let col = col_index(table, columns.1).ok_or_else(|| format!("{} missing {}", table_name, columns.1))?;
+    Ok((0..reader.row_count)
+        .map(|i| match reader.read_row(i, table) {
+            Ok(row) => {
+                let text = |c: usize| row.get(c).and_then(as_string).unwrap_or_default();
+                (text(key), text(col))
+            }
+            Err(_) => (String::new(), String::new()),
+        })
+        .collect())
+}
+
+/// The lines each buff template applies, by template row.
+fn parse_buff_template_lines(
+    templates: Vec<u8>,
+    definitions: Vec<u8>,
+    schema: &Schema,
+    is_poe2: bool,
+    stat_ids: &[String],
+    lookup: &TranslationLookup,
+) -> Result<HashMap<usize, Vec<String>>, String> {
+    let def_table = find_table(schema, "BuffDefinitions", is_poe2)?;
+    let def_reader = DatReader::new(definitions, "buffdefinitions.datc64").map_err(|e| e.to_string())?;
+    let def_stats = col_index(def_table, "StatsKeys").or_else(|| col_index(def_table, "Stats"));
+    let def_flags = col_index(def_table, "GrantedFlags");
+    let stats_of = |row: &[DatValue], col: Option<usize>| -> Vec<String> {
+        match col.and_then(|c| row.get(c).map(|v| (c, v))) {
+            Some((c, DatValue::List(count, offset))) if *count > 0 => def_reader
+                .read_list_values(*offset, *count, &def_table.columns[c])
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|v| match v {
+                    DatValue::ForeignRow(idx) if *idx != usize::MAX => stat_ids.get(*idx).cloned(),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    let definitions: Vec<(Vec<String>, Vec<String>)> = (0..def_reader.row_count)
+        .map(|i| match def_reader.read_row(i, def_table) {
+            Ok(row) => (stats_of(&row, def_stats), stats_of(&row, def_flags)),
+            Err(_) => (Vec::new(), Vec::new()),
+        })
+        .collect();
+
+    let table = find_table(schema, "BuffTemplates", is_poe2)?;
+    let reader = DatReader::new(templates, "bufftemplates.datc64").map_err(|e| e.to_string())?;
+    let buff_col = col_index(table, "BuffDefinitionsKey").or_else(|| col_index(table, "BuffDefinition"));
+    let values_col = col_index(table, "Buff_StatValues");
+    let mut out = HashMap::new();
+    for i in 0..reader.row_count {
+        let Ok(row) = reader.read_row(i, table) else { continue };
+        let Some((stats, flags)) = buff_col
+            .and_then(|c| row.get(c))
+            .and_then(as_foreign_row)
+            .and_then(|d| definitions.get(d))
+            .cloned()
+        else {
+            continue;
+        };
+        let mut values: Vec<i32> = match values_col.and_then(|c| row.get(c).map(|v| (c, v))) {
+            Some((c, DatValue::List(count, offset))) if *count > 0 => reader
+                .read_list_values(*offset, *count, &table.columns[c])
+                .unwrap_or_default()
+                .iter()
+                .map(as_int)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut covered: Vec<String> = stats.into_iter().take(values.len()).collect();
+        values.truncate(covered.len());
+        for flag in flags {
+            covered.push(flag);
+            values.push(1);
+        }
+        if covered.is_empty() {
+            continue;
+        }
+        let lines: Vec<String> =
+            lookup.translate_grouped(&covered, &values).into_iter().filter(|l| !l.is_empty()).collect();
+        if !lines.is_empty() {
+            out.insert(i as usize, lines);
+        }
+    }
+    Ok(out)
+}
+
+/// `Descendancy`: the id, name and panel text of each alternate ascendancy.
+fn parse_descendancies(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<DescendancyInfo>, String> {
+    let table = find_table(schema, "Descendancy", is_poe2)?;
+    let reader = DatReader::new(bytes, "descendancy.datc64").map_err(|e| e.to_string())?;
+    let get = |name: &str| col_index(table, name);
+    let (id, name, flavour, colour, rect) =
+        (get("Id"), get("Name"), get("FlavourText"), get("RGBFlavourTextColour"), get("CoordinateRect"));
+    let mut out = Vec::with_capacity(reader.row_count as usize);
+    for i in 0..reader.row_count {
+        let row = reader.read_row(i, table).map_err(|e| e.to_string())?;
+        let text = |col: Option<usize>| col.and_then(|c| row.get(c)).and_then(as_string).unwrap_or_default();
+        out.push(DescendancyInfo {
+            id: text(id),
+            name: text(name),
+            flavour_text: text(flavour),
+            flavour_text_colour: text(colour),
+            coordinate_rect: text(rect),
+        });
+    }
+    Ok(out)
+}
+
+/// `PassiveSkillMasteryGroups` with the effects each one offers, rendered.
+fn parse_mastery_groups(
+    groups: Vec<u8>,
+    effects: Vec<u8>,
+    schema: &Schema,
+    is_poe2: bool,
+    stat_ids: &[String],
+    lookup: &TranslationLookup,
+    reminder_by_id: &HashMap<&str, &str>,
+) -> Result<HashMap<usize, MasteryGroup>, String> {
+    let effect_table = find_table(schema, "PassiveSkillMasteryEffects", is_poe2)?;
+    let effect_reader = DatReader::new(effects, "passiveskillmasteryeffects.datc64").map_err(|e| e.to_string())?;
+    let hash_col = col_index(effect_table, "HASH16").or_else(|| col_index(effect_table, "HASH32"));
+    let stats_col = col_index(effect_table, "Stats");
+    let value_cols: Vec<Option<usize>> = (1..=4).map(|n| col_index(effect_table, &format!("Stat{}Value", n))).collect();
+    let effects: Vec<MasteryEffect> = (0..effect_reader.row_count)
+        .map(|i| {
+            let Ok(row) = effect_reader.read_row(i, effect_table) else { return MasteryEffect::default() };
+            let ids: Vec<String> = match stats_col.and_then(|c| row.get(c).map(|v| (c, v))) {
+                Some((c, DatValue::List(count, offset))) if *count > 0 => effect_reader
+                    .read_list_values(*offset, *count, &effect_table.columns[c])
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|v| match v {
+                        DatValue::ForeignRow(idx) if *idx != usize::MAX => stat_ids.get(*idx).cloned(),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let values: Vec<i32> = value_cols.iter().filter_map(|c| c.and_then(|i| row.get(i)).map(as_int)).collect();
+            let (ids, values): (Vec<String>, Vec<i32>) = ids
+                .into_iter()
+                .enumerate()
+                .filter_map(|(n, id)| {
+                    let v = values.get(n).copied().unwrap_or(0);
+                    (v != 0).then_some((id, v))
+                })
+                .unzip();
+            let (texts, reminders) = match ids.is_empty() {
+                true => (Vec::new(), Vec::new()),
+                false => lookup.translate_with_reminders(&ids, &values),
+            };
+            MasteryEffect {
+                hash: hash_col.and_then(|c| row.get(c)).map(as_int).unwrap_or(0) as i64,
+                stat_lines: texts.iter().filter(|t| !t.is_empty()).cloned().collect(),
+                reminder_lines: reminders
+                    .iter()
+                    .filter_map(|id| reminder_by_id.get(id.as_str()).filter(|t| !t.is_empty()))
+                    .flat_map(|text| text.lines().map(str::to_string))
+                    .collect(),
+            }
+        })
+        .collect();
+
+    let group_table = find_table(schema, "PassiveSkillMasteryGroups", is_poe2)?;
+    let group_reader = DatReader::new(groups, "passiveskillmasterygroups.datc64").map_err(|e| e.to_string())?;
+    let (active, inactive, effect_image) = (
+        col_index(group_table, "ActiveIcon"),
+        col_index(group_table, "InactiveIcon"),
+        col_index(group_table, "ActiveEffectImage"),
+    );
+    let effects_col = col_index(group_table, "MasteryEffects");
+    let mut out = HashMap::new();
+    for i in 0..group_reader.row_count {
+        let Ok(row) = group_reader.read_row(i, group_table) else { continue };
+        let text = |col: Option<usize>| col.and_then(|c| row.get(c)).and_then(as_string).unwrap_or_default();
+        let chosen: Vec<MasteryEffect> = match effects_col.and_then(|c| row.get(c).map(|v| (c, v))) {
+            Some((c, DatValue::List(count, offset))) if *count > 0 => group_reader
+                .read_list_values(*offset, *count, &group_table.columns[c])
+                .unwrap_or_default()
+                .iter()
+                .filter_map(as_row_index)
+                .filter_map(|r| effects.get(r).cloned())
+                .collect(),
+            _ => Vec::new(),
+        };
+        out.insert(
+            i as usize,
+            MasteryGroup {
+                active_icon: text(active),
+                inactive_icon: text(inactive),
+                active_effect_image: text(effect_image),
+                effects: chosen,
+            },
+        );
+    }
+    Ok(out)
+}
+
+fn parse_decorators(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<Decorator>, String> {
+    let table = find_table(schema, "PassiveTreeDecorators", is_poe2)?;
     let reader = DatReader::new(bytes, "passivetreedecorators.datc64").map_err(|e| e.to_string())?;
     let bg_col = col_index(table, "BackgroundArt");
     let blocked_col = col_index(table, "BlockedArt");
@@ -399,8 +624,42 @@ fn parse_decorators(bytes: Vec<u8>, schema: &Schema) -> Result<Vec<Decorator>, S
     Ok(out)
 }
 
+/// One of PoE 1's alternate ascendancies, as its tree export names them.
+#[derive(Debug, Clone, Default)]
+pub struct DescendancyInfo {
+    pub id: String,
+    pub name: String,
+    pub flavour_text: String,
+    pub flavour_text_colour: String,
+    pub coordinate_rect: String,
+}
+
+/// One choice a mastery node offers: the client's own id for it and the lines
+/// it grants.
+#[derive(Debug, Clone, Default)]
+pub struct MasteryEffect {
+    pub hash: i64,
+    pub stat_lines: Vec<String>,
+    pub reminder_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MasteryGroup {
+    pub active_icon: String,
+    pub inactive_icon: String,
+    pub active_effect_image: String,
+    pub effects: Vec<MasteryEffect>,
+}
+
 pub struct ExtraTables {
     pub ascendancy: Option<Vec<u8>>,
+    pub descendancy: Option<Vec<u8>>,
+    pub mastery_effects: Option<Vec<u8>>,
+    pub reminder_text: Option<Vec<u8>>,
+    /// PoE 1 words an aura's stats as what nearby enemies or allies get.
+    pub aura_descriptions: Option<StatCsdSource>,
+    pub buff_templates: Option<Vec<u8>>,
+    pub buff_definitions: Option<Vec<u8>>,
     pub atlas_subtrees: Option<Vec<u8>>,
     pub characters: Option<Vec<u8>>,
     pub decorators: Option<Vec<u8>>,
@@ -408,14 +667,14 @@ pub struct ExtraTables {
     pub mastery_art: Option<Vec<u8>>,
 }
 
-fn parse_mastery_effect_images(groups: Vec<u8>, art: Vec<u8>, schema: &Schema) -> Result<HashMap<usize, String>, String> {
-    let art_table = find_table(schema, "PassiveSkillTreeMasteryArt")?;
+fn parse_mastery_effect_images(groups: Vec<u8>, art: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<HashMap<usize, String>, String> {
+    let art_table = find_table(schema, "PassiveSkillTreeMasteryArt", is_poe2)?;
     let art_reader = DatReader::new(art, "passiveskilltreemasteryart.datc64").map_err(|e| e.to_string())?;
     let image_col = col_index(art_table, "ActiveEffectImage").ok_or("PassiveSkillTreeMasteryArt missing ActiveEffectImage")?;
     let images: Vec<Option<String>> = (0..art_reader.row_count)
         .map(|i| art_reader.read_row(i, art_table).ok().and_then(|r| r.get(image_col).and_then(as_string)))
         .collect();
-    let groups_table = find_table(schema, "PassiveSkillMasteryGroups")?;
+    let groups_table = find_table(schema, "PassiveSkillMasteryGroups", is_poe2)?;
     let groups_reader = DatReader::new(groups, "passiveskillmasterygroups.datc64").map_err(|e| e.to_string())?;
     let art_col = col_index(groups_table, "Art").ok_or("PassiveSkillMasteryGroups missing Art")?;
     let mut out = HashMap::new();
@@ -434,13 +693,28 @@ pub fn build(
     stat_csd_sources: &[StatCsdSource],
     extra: ExtraTables,
     schema: &Schema,
+    is_poe2: bool,
 ) -> Result<SkillGraphDatabase, String> {
-    let ExtraTables { ascendancy: ascendancy_bytes, atlas_subtrees: atlas_subtrees_bytes, characters: characters_bytes, decorators: decorators_bytes, mastery_groups, mastery_art } = extra;
+    let ExtraTables {
+        ascendancy: ascendancy_bytes,
+        descendancy: descendancy_bytes,
+        mastery_effects: mastery_effects_bytes,
+        reminder_text: reminder_text_bytes,
+        aura_descriptions,
+        buff_templates: buff_template_bytes,
+        buff_definitions: buff_definition_bytes,
+        atlas_subtrees: atlas_subtrees_bytes,
+        characters: characters_bytes,
+        decorators: decorators_bytes,
+        mastery_groups,
+        mastery_art,
+    } = extra;
+    let mastery_group_bytes = mastery_groups.clone();
     let mastery_effect_images = match (mastery_groups, mastery_art) {
-        (Some(groups), Some(art)) => parse_mastery_effect_images(groups, art, schema).unwrap_or_default(),
+        (Some(groups), Some(art)) => parse_mastery_effect_images(groups, art, schema, is_poe2).unwrap_or_default(),
         _ => HashMap::new(),
     };
-    let stats_table = find_table(schema, "Stats")?;
+    let stats_table = find_table(schema, "Stats", is_poe2)?;
     let stats_reader = DatReader::new(stats_bytes, "stats.datc64").map_err(|e| e.to_string())?;
     let stats_id_col = col_index(stats_table, "Id").ok_or("Stats table missing Id column")?;
 
@@ -462,21 +736,25 @@ pub fn build(
     // by the renderer from the node's own `.psg` group (see doc comment on
     // `SkillGraphNodeInfo::ascendancy_illustration`), not from any field here.
     let ascendancies = match ascendancy_bytes {
-        Some(bytes) => parse_ascendancies(bytes, schema)?,
+        Some(bytes) => parse_ascendancies(bytes, schema, is_poe2)?,
         None => Vec::new(),
     };
     let characters = match characters_bytes {
-        Some(bytes) => parse_characters(bytes, schema)?,
+        Some(bytes) => parse_characters(bytes, schema, is_poe2)?,
         None => Vec::new(),
     };
     let decorators = match decorators_bytes {
-        Some(bytes) => parse_decorators(bytes, schema).unwrap_or_default(),
+        Some(bytes) => parse_decorators(bytes, schema, is_poe2).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let descendancies = match descendancy_bytes {
+        Some(bytes) => parse_descendancies(bytes, schema, is_poe2).unwrap_or_default(),
         None => Vec::new(),
     };
 
     // AtlasPassiveSkillSubTrees row index -> (UI_Background, IllustrationX, IllustrationY), UI_Image.
     let atlas_subtrees: Vec<AtlasSubtreeArt> = if let Some(bytes) = atlas_subtrees_bytes {
-        let table = find_table(schema, "AtlasPassiveSkillSubTrees")?;
+        let table = find_table(schema, "AtlasPassiveSkillSubTrees", is_poe2)?;
         let reader = DatReader::new(bytes, "atlaspassiveskillsubtrees.datc64").map_err(|e| e.to_string())?;
         let bg_col = col_index(table, "UI_Background");
         let icon_col = col_index(table, "UI_Image");
@@ -497,7 +775,37 @@ pub fn build(
         Vec::new()
     };
 
-    let ps_table = find_table(schema, "PassiveSkills")?;
+    let reminders = reminder_text_bytes
+        .and_then(|bytes| strings_of(bytes, "reminders.datc64", schema, "ReminderText", ("Id", "Text"), is_poe2).ok())
+        .unwrap_or_default();
+    // A description can ask for a reminder of its own, naming a `ReminderText`.
+    let reminder_by_id: HashMap<&str, &str> =
+        reminders.iter().map(|(id, text)| (id.as_str(), text.as_str())).collect();
+
+    let mastery_group_table = mastery_group_bytes
+        .zip(mastery_effects_bytes)
+        .and_then(|(groups, effects)| {
+            parse_mastery_groups(groups, effects, schema, is_poe2, &stat_ids, &lookup, &reminder_by_id).ok()
+        })
+        .unwrap_or_default();
+    // A node can also grant a buff, whose own stats the tree prints beside its
+    // own — worded as what the buff does to whoever it reaches.
+    let aura_lookup = match aura_descriptions.and_then(|s| csd::parse_csd(&s.bytes, &s.path).ok()) {
+        Some(aura) => {
+            let mut chain: Vec<&CsdFile> = csd_files.iter().collect();
+            chain.push(&aura);
+            TranslationLookup::build(&chain)
+        }
+        None => TranslationLookup::build(&csd_refs),
+    };
+    let buff_lines = buff_template_bytes
+        .zip(buff_definition_bytes)
+        .and_then(|(templates, definitions)| {
+            parse_buff_template_lines(templates, definitions, schema, is_poe2, &stat_ids, &aura_lookup).ok()
+        })
+        .unwrap_or_default();
+
+    let ps_table = find_table(schema, "PassiveSkills", is_poe2)?;
     let ps_reader = DatReader::new(passiveskills_bytes, "passiveskills.datc64").map_err(|e| e.to_string())?;
 
     let graph_id_col = col_index(ps_table, "PassiveSkillGraphId")
@@ -511,7 +819,11 @@ pub fn build(
     let is_just_icon_col = col_index(ps_table, "IsJustIcon");
     let is_ascendancy_start_col = col_index(ps_table, "IsAscendancyStartingNode");
     let is_multiple_choice_col = col_index(ps_table, "IsMultipleChoice");
-    let ascendancy_key_col = col_index(ps_table, "Ascendancy");
+    let ascendancy_key_col = col_index(ps_table, "Ascendancy").or_else(|| col_index(ps_table, "AscendancyKey"));
+    let descendancy_col = col_index(ps_table, "DescendancyKey").or_else(|| col_index(ps_table, "Descendancy"));
+    let is_proxy_col = col_index(ps_table, "IsProxyPassive");
+    let reminder_col = col_index(ps_table, "ReminderStrings");
+    let buffs_col = col_index(ps_table, "PassiveSkillBuffs");
     let atlas_subtree_col = col_index(ps_table, "AtlasSubTree");
     let is_attribute_col = col_index(ps_table, "IsAttribute");
     let node_frame_art_col = col_index(ps_table, "NodeFrameArt");
@@ -602,8 +914,25 @@ pub fn build(
             })
             .unzip();
 
-        let stat_texts = if stat_id_list.is_empty() { Vec::new() } else { lookup.translate_grouped(&stat_id_list, &stat_values) };
+        let (mut stat_texts, described_reminders) = match stat_id_list.is_empty() {
+            true => (Vec::new(), Vec::new()),
+            false => lookup.translate_with_reminders(&stat_id_list, &stat_values),
+        };
+        // What a node's own buff applies reads as part of what the node grants.
+        for template in read_row_refs(buffs_col) {
+            stat_texts.extend(buff_lines.get(&template).cloned().unwrap_or_default());
+        }
         let stat_lines: Vec<String> = stat_texts.iter().flat_map(|t| t.lines().map(|l| l.to_string())).collect();
+        // The reminders a description asks for come before the node's own, and
+        // each line of one is listed on its own.
+        let mut reminder_lines: Vec<String> = Vec::new();
+        let described = described_reminders.iter().filter_map(|id| reminder_by_id.get(id.as_str()).map(|t| t.to_string()));
+        let listed = read_row_refs(reminder_col).into_iter().filter_map(|r| reminders.get(r).map(|(_, text)| text.clone()));
+        for line in described.chain(listed).flat_map(|t| t.lines().map(str::to_string).collect::<Vec<_>>()) {
+            if !line.is_empty() && !reminder_lines.contains(&line) {
+                reminder_lines.push(line);
+            }
+        }
 
         let is_ascendancy_start = is_ascendancy_start_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false);
         let ascendancy = ascendancy_key_col.and_then(|c| row.get(c)).and_then(as_foreign_row);
@@ -629,12 +958,16 @@ pub fn build(
 
         let info = SkillGraphNodeInfo {
             name,
+            descendancy: descendancy_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
+            is_proxy: flag(is_proxy_col),
+            reminder_lines,
             icon: icon_col.and_then(|c| row.get(c)).and_then(as_string),
             is_keystone: is_keystone_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             is_notable: is_notable_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             is_jewel_socket: is_jewel_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             // Notables can belong to a mastery group too; the mastery node itself is the icon-only one.
-            is_mastery: flag(is_just_icon_col) && is_mastery_col.and_then(|c| row.get(c)).and_then(as_foreign_row).is_some(),
+            is_mastery: flag(is_just_icon_col)
+                && (!is_poe2 || is_mastery_col.and_then(|c| row.get(c)).and_then(as_foreign_row).is_some()),
             is_ascendancy_start,
             is_multiple_choice: is_multiple_choice_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false),
             flavour_text: flavour_col.and_then(|c| row.get(c)).and_then(as_string),
@@ -676,5 +1009,9 @@ pub fn build(
         decorators,
         row_graph_ids,
         mastery_effect_images,
+        descendancies,
+        mastery_groups: mastery_group_table,
+        is_poe2,
+        ui_atlas: None,
     })
 }

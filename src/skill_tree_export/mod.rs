@@ -47,6 +47,21 @@ const ARC_SIZES_NORMAL: [u32; 9] = [44, 84, 170, 249, 334, 421, 127, 546, 666];
 /// Rows of the straight connector strip inside a half-scale connector block.
 const LINE_STRIP: (u32, u32) = (16, 17);
 
+/// The zoom levels PoE 1's tree export publishes, and the one our sheets are
+/// packed at (the largest its own export ships).
+const SHEET_ZOOMS: [&str; 4] = ["0.1246", "0.2109", "0.2972", "0.3835"];
+const NATIVE_ZOOM: &str = "0.5";
+
+/// The radius the client clears at the centre of PoE 1's tree, which lives in
+/// the client rather than in any data file.
+const PSS_CENTRE_INNER_RADIUS: i64 = 130;
+
+/// What a finished PoE 1 character has to spend: 99 points from levels and 24
+/// from quests, and two ascendancy points per labyrinth. The client counts
+/// these; no table states either total.
+const TOTAL_PASSIVE_POINTS: i64 = 123;
+const ASCENDANCY_POINTS: i64 = 8;
+
 const MAIN_CIRCLE_ACTIVE_FULL: &str = "Art/2DArt/UIImages/InGame/PassiveTree/PassiveTreeMainCircleActive2";
 const BACKGROUND_TILE: &str = "Art/2DArt/UIImages/Common/Background2";
 const PLUS_FRAME_CAN_ALLOCATE: &str = "Art/2DArt/UIImages/InGame/PassiveSkillScreenPlusFrameCanAllocate";
@@ -98,9 +113,21 @@ pub struct TreeExportSource {
     pub index: Arc<Index>,
     pub steam: Option<SteamBundleLoader>,
     pub schema: Schema,
+    /// PoE 1's interface art lives in sheets; this says where each image sits.
+    pub atlas: Option<crate::ui::ui_atlas::UiAtlas>,
 }
 
 impl TreeExportSource {
+    /// Reads the sheet descriptor up front, where the install has one.
+    pub fn new(reader: Option<Arc<GgpkReader>>, index: Arc<Index>, steam: Option<SteamBundleLoader>, schema: Schema) -> Self {
+        let mut source = Self { reader, index, steam, schema, atlas: None };
+        source.atlas = source
+            .fetch(crate::ui::ui_atlas::ATLAS_PATH)
+            .map(|bytes| crate::ui::ui_atlas::UiAtlas::parse(&crate::parsers::utils::decode_text_lossy(&bytes)))
+            .filter(|atlas| !atlas.is_empty());
+        source
+    }
+
     /// Index entry for a path, by hash (the index keys files by the hash of
     /// the lower-cased path).
     pub(crate) fn lookup(&self, path: &str) -> Option<&FileInfo> {
@@ -197,34 +224,64 @@ fn export_tree(
     progress("Building data.json");
     let tree = build_tree(psg, &db, &tables);
     std::fs::create_dir_all(out_dir).map_err(|e| format!("Cannot create {}: {}", out_dir.display(), e))?;
-    let data_json = json::to_string_pretty(&tree.data);
-    std::fs::write(out_dir.join("data.json"), &data_json).map_err(|e| e.to_string())?;
+    // PoE 1 states its sprite sheets inside data.json, so that file is written
+    // once the sheets exist; PoE 2 keeps them beside it and can write now.
+    let mut data_json = json::to_string_pretty(&tree.data);
+    if !psg.is_poe1() {
+        std::fs::write(out_dir.join("data.json"), &data_json).map_err(|e| e.to_string())?;
+    }
     let mut files = 1;
 
     let assets_dir = out_dir.join("assets");
     std::fs::create_dir_all(&assets_dir).map_err(|e| e.to_string())?;
     let mut sheet_jsons: Vec<(String, J)> = Vec::new();
+    let mut sprite_jsons: Vec<(String, String, J)> = Vec::new();
     let mut store = TextureStore::new(source);
-    let write = |name: &str, sprites: &[(String, RgbaImage)], max_width: u32, sheet_jsons: &mut Vec<(String, J)>| -> Result<usize, String> {
+    let zoomed = psg.is_poe1();
+    let write = |name: &str,
+                 sprites: &[(String, RgbaImage)],
+                 max_width: u32,
+                 sheet_jsons: &mut Vec<(String, J)>,
+                 sprite_jsons: &mut Vec<(String, String, J)>|
+     -> Result<usize, String> {
         if sprites.is_empty() {
             return Ok(0);
         }
         let json = sheets::write_sheet(&assets_dir, name, sprites, max_width, options.quality)?;
-        sheet_jsons.push((name.to_string(), json));
-        Ok(2)
+        sheet_jsons.push((name.to_string(), json.packer));
+        for (sheet, entry) in json.sprites {
+            sprite_jsons.push((sheet, NATIVE_ZOOM.to_string(), entry));
+        }
+        let mut files = 2;
+        // PoE 1's own export ships each sheet at the zoom levels its reader
+        // draws at; the art we pack at is its largest.
+        for (i, zoom) in SHEET_ZOOMS.iter().enumerate() {
+            let scale = zoom.parse::<f32>().unwrap_or(0.5) / NATIVE_ZOOM.parse::<f32>().unwrap_or(0.5);
+            if !zoomed {
+                break;
+            }
+            let scaled: Vec<(String, RgbaImage)> =
+                sprites.iter().map(|(key, img)| (key.clone(), sheets::scale(img, scale))).collect();
+            let width = ((max_width as f32 * scale).round() as u32).max(1);
+            for (sheet, entry) in sheets::write_zoom(&assets_dir, &format!("{}-{}", name, i), &scaled, width, options.quality)? {
+                sprite_jsons.push((sheet, zoom.to_string(), entry));
+            }
+            files += 1;
+        }
+        Ok(files)
     };
 
     progress("Fetching textures");
     store.prefetch(&tree.texture_paths);
 
     progress("Skill icons");
-    let (active, inactive) = icon_sprites(&mut store, &tree.icons);
-    files += write("skills", &active, 1024, &mut sheet_jsons)?;
-    files += write("skills-disabled", &inactive, 1024, &mut sheet_jsons)?;
+    let (active, inactive) = icon_sprites(&mut store, &tree.icons, psg.is_poe1());
+    files += write("skills", &active, 1024, &mut sheet_jsons, &mut sprite_jsons)?;
+    files += write("skills-disabled", &inactive, 1024, &mut sheet_jsons, &mut sprite_jsons)?;
 
     progress("Node frames");
     let frames = frame_sprites(&mut store, &tree.frames);
-    files += write("frame", &frames, sheets::square_width(&frames), &mut sheet_jsons)?;
+    files += write("frame", &frames, sheets::square_width(&frames), &mut sheet_jsons, &mut sprite_jsons)?;
 
     progress("Connectors");
     if let Some((image, frames)) = line_sheet(&mut store, &tree.connectors) {
@@ -233,19 +290,34 @@ fn export_tree(
         std::fs::write(assets_dir.join("line.webp"), sheets::encode_webp(&packed.image, options.quality)).map_err(|e| e.to_string())?;
         std::fs::write(assets_dir.join("line.json"), json::to_string_pretty(&json)).map_err(|e| e.to_string())?;
         sheet_jsons.push(("line".to_string(), json));
+        for (sheet, entry) in sheets::sprite_json_split(&packed, "line.webp", "line") {
+            sprite_jsons.push((sheet, NATIVE_ZOOM.to_string(), entry));
+        }
         files += 2;
+        if zoomed {
+            for (i, zoom) in SHEET_ZOOMS.iter().enumerate() {
+                let scale = zoom.parse::<f32>().unwrap_or(0.5) / NATIVE_ZOOM.parse::<f32>().unwrap_or(0.5);
+                let scaled = sheets::scale_packed(&packed, scale);
+                let name = format!("line-{}.webp", i);
+                std::fs::write(assets_dir.join(&name), sheets::encode_webp(&scaled.image, options.quality)).map_err(|e| e.to_string())?;
+                for (sheet, entry) in sheets::sprite_json_split(&scaled, &name, "line") {
+                    sprite_jsons.push((sheet, zoom.to_string(), entry));
+                }
+                files += 1;
+            }
+        }
     }
 
     progress("Centre ring");
     let group_bg = scaled_sprites(&mut store, &tree.group_backgrounds, 0.5);
-    files += write("group-background", &group_bg, 4000, &mut sheet_jsons)?;
+    files += write("group-background", &group_bg, 4000, &mut sheet_jsons, &mut sprite_jsons)?;
 
     progress("Background tile");
     let mut background = Vec::new();
     if let Some(img) = store.get(BACKGROUND_TILE) {
         background.push(("background:Background2".to_string(), sheets::resize(img, 128, 128)));
     }
-    files += write("background", &background, 128, &mut sheet_jsons)?;
+    files += write("background", &background, 128, &mut sheet_jsons, &mut sprite_jsons)?;
 
     progress("Jewel sockets");
     let jewel: Vec<(String, String)> = JEWEL_SOCKET_ART
@@ -253,27 +325,65 @@ fn export_tree(
         .map(|(name, file)| (format!("jewel:{}", name), format!("Art/2DArt/UIImages/InGame/{}", file)))
         .collect();
     let jewel = scaled_sprites(&mut store, &jewel, 0.5);
-    files += write("jewel", &jewel, sheets::square_width(&jewel), &mut sheet_jsons)?;
+    files += write("jewel", &jewel, sheets::square_width(&jewel), &mut sheet_jsons, &mut sprite_jsons)?;
 
     progress("Jewel radii");
     let radius = scaled_sprites(&mut store, &tree.jewel_radius, 0.5);
-    files += write("jewel-radius", &radius, sheets::square_width(&radius), &mut sheet_jsons)?;
+    files += write("jewel-radius", &radius, sheets::square_width(&radius), &mut sheet_jsons, &mut sprite_jsons)?;
 
     progress("Mastery patterns");
-    let (mastery_active, mastery_inactive) = mastery_sprites(&mut store, &tree.mastery_images);
-    files += write("mastery-effect-active", &mastery_active, sheets::square_width(&mastery_active), &mut sheet_jsons)?;
-    files += write("mastery-effect-disabled", &mastery_inactive, sheets::square_width(&mastery_inactive), &mut sheet_jsons)?;
+    let (mastery_active, mastery_inactive) = mastery_sprites(&mut store, &tree.mastery_images, psg.is_poe1());
+    files += write("mastery-effect-active", &mastery_active, sheets::square_width(&mastery_active), &mut sheet_jsons, &mut sprite_jsons)?;
+    files += write("mastery-effect-disabled", &mastery_inactive, sheets::square_width(&mastery_inactive), &mut sheet_jsons, &mut sprite_jsons)?;
 
     progress("Atlas backdrops");
     let backdrops: Vec<(String, String)> =
         tree.atlas_backdrops.iter().map(|b| (b.sprite.clone(), b.path.clone())).collect();
     let backdrops = scaled_sprites(&mut store, &backdrops, 0.5);
-    files += write("atlas-background", &backdrops, 4000, &mut sheet_jsons)?;
+    files += write("atlas-background", &backdrops, 4000, &mut sheet_jsons, &mut sprite_jsons)?;
 
     progress("Class illustrations");
     for class in &tree.class_sheets {
         let sprites = scaled_sprites(&mut store, &class.images, 1.0);
-        files += write(&class.sheet, &sprites, 4500, &mut sheet_jsons)?;
+        files += write(&class.sheet, &sprites, 4500, &mut sheet_jsons, &mut sprite_jsons)?;
+    }
+
+    // PoE 1's readers take the sheets from data.json itself.
+    if psg.is_poe1() {
+        let mut data = tree.data.clone();
+        let mut order: Vec<&str> = Vec::new();
+        for (name, _, _) in &sprite_jsons {
+            if !order.contains(&name.as_str()) {
+                order.push(name);
+            }
+        }
+        // The client tints the unallocated mastery icons for a connected
+        // group; the art behind both names is the one set the game ships.
+        if order.contains(&"masteryInactive") && !order.contains(&"masteryConnected") {
+            order.push("masteryConnected");
+        }
+        let mut sprites = J::obj();
+        for name in order {
+            let mut by_zoom = J::obj();
+            let source = match name {
+                "masteryConnected" => "masteryInactive",
+                other => other,
+            };
+            for zoom in SHEET_ZOOMS.iter().copied().chain(std::iter::once(NATIVE_ZOOM)) {
+                if let Some((_, _, json)) = sprite_jsons.iter().find(|(s, z, _)| s == source && z == zoom) {
+                    by_zoom.set(zoom, json.clone());
+                }
+            }
+            sprites.set(name, by_zoom);
+        }
+        data.set("sprites", sprites);
+        data.set("imageZoomLevels", J::Arr(SHEET_ZOOMS.iter().map(|z| J::num(z.parse::<f64>().unwrap_or(0.0))).collect()));
+        let mut points = J::obj();
+        points.set("totalPoints", J::Int(TOTAL_PASSIVE_POINTS));
+        points.set("ascendancyPoints", J::Int(ASCENDANCY_POINTS));
+        data.set("points", points);
+        data_json = json::to_string_pretty(&data);
+        std::fs::write(out_dir.join("data.json"), &data_json).map_err(|e| e.to_string())?;
     }
 
     if options.viewer {
@@ -524,6 +634,8 @@ struct NodeContext<'a> {
     tables: &'a tables::ExtraTables,
     keystones_in_radius: &'a HashMap<u32, u32>,
     choice_parent: &'a HashMap<u32, u32>,
+    /// PoE 1's file names an ascendancy rather than pointing at its id.
+    is_poe1: bool,
 }
 
 /// Attribute points a node grants, counting the combined-attribute stats too.
@@ -531,9 +643,34 @@ fn granted_attribute(info: &SkillGraphNodeInfo, stats: &[&str]) -> i64 {
     info.stat_ids.iter().zip(info.stat_values.iter()).filter(|(id, _)| stats.contains(&id.as_str())).map(|(_, v)| *v as i64).sum()
 }
 
-const STRENGTH_STATS: [&str; 4] = ["base_strength", "base_strength_and_dexterity", "base_strength_and_intelligence", "additional_all_attributes"];
-const DEXTERITY_STATS: [&str; 4] = ["base_dexterity", "base_strength_and_dexterity", "base_dexterity_and_intelligence", "additional_all_attributes"];
-const INTELLIGENCE_STATS: [&str; 4] = ["base_intelligence", "base_strength_and_intelligence", "base_dexterity_and_intelligence", "additional_all_attributes"];
+// PoE 1 names the same grants `additional_…`, PoE 2 `base_…`.
+const STRENGTH_STATS: [&str; 7] = [
+    "base_strength",
+    "base_strength_and_dexterity",
+    "base_strength_and_intelligence",
+    "additional_strength",
+    "additional_strength_and_dexterity",
+    "additional_strength_and_intelligence",
+    "additional_all_attributes",
+];
+const DEXTERITY_STATS: [&str; 7] = [
+    "base_dexterity",
+    "base_strength_and_dexterity",
+    "base_dexterity_and_intelligence",
+    "additional_dexterity",
+    "additional_strength_and_dexterity",
+    "additional_dexterity_and_intelligence",
+    "additional_all_attributes",
+];
+const INTELLIGENCE_STATS: [&str; 7] = [
+    "base_intelligence",
+    "base_strength_and_intelligence",
+    "base_dexterity_and_intelligence",
+    "additional_intelligence",
+    "additional_strength_and_intelligence",
+    "additional_dexterity_and_intelligence",
+    "additional_all_attributes",
+];
 
 /// Stat lines plus the ones the client synthesises from other columns.
 fn stat_lines(info: &SkillGraphNodeInfo, ctx: &NodeContext) -> Vec<String> {
@@ -562,7 +699,7 @@ fn is_placeholder(info: &SkillGraphNodeInfo, db: &SkillGraphDatabase) -> bool {
 /// which have no position or links.
 fn node_json(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCalc>, ctx: &NodeContext) -> J {
     let mut o = J::obj();
-    if let Some(info) = info {
+    if let Some(info) = info.filter(|_| !ctx.is_poe1) {
         o.set("id", if is_placeholder(info, ctx.db) { J::Null } else { J::str(&info.id) });
     }
     o.set("skill", J::Int(gid as i64));
@@ -572,6 +709,9 @@ fn node_json(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCalc
         o.set("stats", J::Arr(Vec::new()));
         if let Some(a) = info.ascendancy.and_then(|a| ctx.db.ascendancies.get(a)) {
             o.set("ascendancyId", J::str(&a.id));
+            if ctx.is_poe1 && !a.name.is_empty() {
+                o.set("ascendancyName", J::str(&a.name));
+            }
         }
         if info.is_ascendancy_start {
             o.set("isAscendancyStart", J::Bool(true));
@@ -586,7 +726,7 @@ fn node_json(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCalc
         if info.is_notable {
             o.set("isNotable", J::Bool(true));
         }
-        if let Some(k) = ctx.keystones_in_radius.get(&gid) {
+        if let Some(k) = ctx.keystones_in_radius.get(&gid).filter(|_| !ctx.is_poe1) {
             o.set("keystonesInRadius", J::ints([*k as i64]));
         }
         if info.is_jewel_socket {
@@ -597,6 +737,9 @@ fn node_json(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCalc
             if let Some(img) = info.mastery_group.and_then(|g| ctx.tables.mastery_effect_images.get(&g)) {
                 o.set("activeEffectImage", J::str(&png_path(img)));
             }
+        }
+        if ctx.is_poe1 && !info.reminder_lines.is_empty() {
+            o.set("reminderText", J::strs(info.reminder_lines.iter().cloned()));
         }
         if info.is_anointment_only {
             o.set("isBlighted", J::Bool(true));
@@ -615,7 +758,62 @@ fn node_json(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCalc
             o.set("isGenericAttribute", J::Bool(true));
         }
         if let Some(a) = info.ascendancy.and_then(|a| ctx.db.ascendancies.get(a)) {
-            o.set("ascendancyId", J::str(&a.id));
+            match ctx.is_poe1 {
+                true => o.set("ascendancyName", J::str(&a.id)),
+                false => o.set("ascendancyId", J::str(&a.id)),
+            }
+        }
+        // PoE 1's alternate ascendancies are their own table.
+        if let Some(d) = info.descendancy.and_then(|d| ctx.db.descendancies.get(d)).filter(|d| !d.id.is_empty()) {
+            o.set("ascendancyName", J::str(&d.id));
+            o.set("isBloodline", J::Bool(true));
+        }
+        if ctx.is_poe1 && info.is_proxy {
+            o.set("isProxy", J::Bool(true));
+        }
+        if let Some(jewel) = ctx.tables.expansion_jewels.get(&gid) {
+            let mut e = J::obj();
+            e.set("size", J::Int(jewel.size));
+            e.set("index", J::Int(jewel.index));
+            if let Some(proxy) = jewel.proxy {
+                e.set("proxy", J::str(&proxy.to_string()));
+            }
+            if let Some(parent) = jewel.parent {
+                e.set("parent", J::str(&parent.to_string()));
+            }
+            o.set("expansionJewel", e);
+        }
+        // A mastery node offers its group's effects, and draws its own icons.
+        if let Some(group) = info.mastery_group.and_then(|g| ctx.db.mastery_groups.get(&g)).filter(|_| ctx.is_poe1) {
+            if !group.inactive_icon.is_empty() {
+                o.set("inactiveIcon", J::str(&png_path(&group.inactive_icon)));
+            }
+            if !group.active_icon.is_empty() {
+                o.set("activeIcon", J::str(&png_path(&group.active_icon)));
+            }
+            if !group.active_effect_image.is_empty() {
+                o.set("activeEffectImage", J::str(&png_path(&group.active_effect_image)));
+            }
+            if !group.effects.is_empty() {
+                o.set(
+                    "masteryEffects",
+                    J::Arr(
+                        group
+                            .effects
+                            .iter()
+                            .map(|effect| {
+                                let mut m = J::obj();
+                                m.set("effect", J::Int(effect.hash));
+                                m.set("stats", J::strs(effect.stat_lines.iter().cloned()));
+                                if !effect.reminder_lines.is_empty() {
+                                    m.set("reminderText", J::strs(effect.reminder_lines.iter().cloned()));
+                                }
+                                m
+                            })
+                            .collect(),
+                    ),
+                );
+            }
         }
         if info.is_ascendancy_start {
             o.set("isAscendancyStart", J::Bool(true));
@@ -662,21 +860,34 @@ fn node_json(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCalc
             o.set("flavourText", J::strs(f.lines().map(|l| l.trim_end())));
         }
         if !info.characters.is_empty() {
-            o.set("classStartIndex", J::ints(info.characters.iter().map(|c| *c as i64)));
+            match ctx.is_poe1 {
+                true => {
+                    if let Some(class) = info.characters.first().and_then(|c| ctx.db.characters.get(*c)) {
+                        o.set("classStartIndex", J::Int(class.integer_id as i64));
+                    }
+                }
+                false => o.set("classStartIndex", J::ints(info.characters.iter().map(|c| *c as i64))),
+            }
         }
     }
     if let Some(calc) = calc {
         o.set("group", J::Int(calc.group as i64));
         o.set("orbit", J::Int(calc.orbit as i64));
         o.set("orbitIndex", J::Int(calc.orbit_index as i64));
-        o.set("x", J::num(calc.x));
-        o.set("y", J::num(calc.y));
+        // A PoE 1 reader lays a node out from its group and orbit; the
+        // positions and edge indices are PoE 2's own additions.
+        if !ctx.is_poe1 {
+            o.set("x", J::num(calc.x));
+            o.set("y", J::num(calc.y));
+        }
         o.set("out", J::strs(calc.out.iter().map(|g| g.to_string())));
-        if let Some(parent) = ctx.choice_parent.get(&gid) {
+        if let Some(parent) = ctx.choice_parent.get(&gid).filter(|_| !ctx.is_poe1) {
             o.set("multipleChoiceParent", J::Int(*parent as i64));
         }
         o.set("in", J::strs(calc.incoming.iter().map(|g| g.to_string())));
-        o.set("edges", J::ints(calc.edge_in.iter().chain(calc.edge_out.iter()).map(|e| *e as i64)));
+        if !ctx.is_poe1 {
+            o.set("edges", J::ints(calc.edge_in.iter().chain(calc.edge_out.iter()).map(|e| *e as i64)));
+        }
     }
     o
 }
@@ -804,14 +1015,27 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
         }
     }
 
-    let ctx = NodeContext { db, tables, keystones_in_radius: &keystones_in_radius, choice_parent: &choice_parent };
+    let ctx = NodeContext {
+        db,
+        tables,
+        keystones_in_radius: &keystones_in_radius,
+        choice_parent: &choice_parent,
+        is_poe1: psg.is_poe1(),
+    };
 
     // Classes, their illustrations and ascendancy plates belong to the
     // character tree; the atlas and league graphs have no classes at all and
     // would otherwise ship seven unused background sheets and draw a
     // character portrait over the middle of the tree.
-    let (classes, class_sheets) =
+    let (classes, mut class_sheets) =
         if psg.graph_type == 0 { classes_json(db, tables) } else { (J::Arr(Vec::new()), Vec::new()) };
+    if psg.graph_type == 0 {
+        for panel in &tables.ascendancy_panels {
+            let images =
+                panel.images.iter().map(|(name, path)| (format!("{}:{}", panel.sheet, name), path.clone())).collect();
+            class_sheets.push(ClassSheet { sheet: panel.sheet.clone(), images });
+        }
+    }
 
     let mut groups = J::obj();
     for (gi, group) in psg.groups.iter().enumerate() {
@@ -823,6 +1047,9 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
         g.set("y", J::num(group.y as f64));
         g.set("orbits", J::ints(orbits.iter().map(|o| *o as i64)));
         g.set("nodes", J::strs(group.nodes.iter().map(|n| n.skill_id.to_string())));
+        if let Some(background) = poe1_group_background(psg, group) {
+            g.set("background", background);
+        }
         groups.set(&(gi + 1).to_string(), g);
     }
 
@@ -833,10 +1060,21 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
     root.set("orbitIndex", J::Int(0));
     root.set("out", J::strs(root_out.iter().map(|g| g.to_string())));
     root.set("in", J::Arr(Vec::new()));
-    root.set("edges", J::ints(root_edges.iter().map(|e| *e as i64)));
+    if !psg.is_poe1() {
+        root.set("edges", J::ints(root_edges.iter().map(|e| *e as i64)));
+    }
     nodes.set("root", root);
     for &g in &order {
         nodes.set(&g.to_string(), node_json(g, info_of(g), calc.get(&g), &ctx));
+    }
+    // A cluster jewel's own passives belong to no group; PoE 1's export lists
+    // them so a reader can show what a jewel may roll.
+    if psg.is_poe1() {
+        for &g in &tables.expansion_pool {
+            if !calc.contains_key(&g) {
+                nodes.set(&g.to_string(), node_json(g, info_of(g), None, &ctx));
+            }
+        }
     }
 
     let mut overrides = J::obj();
@@ -862,11 +1100,18 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
 
     let mut data = J::obj();
     data.set("tree", J::str(&tables.tree_name));
+    if psg.is_poe1() {
+        data.set("constants", poe1_constants(psg, db, tables));
+    }
     data.set("classes", classes);
     data.set("groups", groups);
     data.set("nodes", nodes);
-    data.set("edges", J::Arr(edges));
-    data.set("skillOverrides", overrides);
+    if psg.is_poe1() {
+        data.set("alternate_ascendancies", alternate_ascendancies(db));
+    } else {
+        data.set("edges", J::Arr(edges));
+        data.set("skillOverrides", overrides);
+    }
     data.set("jewelSlots", J::ints(tables.jewel_slots.iter().map(|g| *g as i64)));
     data.set("min_x", J::Int(min_x.trunc() as i64));
     data.set("min_y", J::Int(min_y.trunc() as i64));
@@ -877,6 +1122,7 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
     let mut icons: Vec<(String, String)> = Vec::new();
     let mut icon_seen = HashSet::new();
     let mut mastery_images: Vec<String> = Vec::new();
+    let mut mastery_icons: Vec<(String, String)> = Vec::new();
     for gid in order.iter().copied().chain(seen.iter().copied()) {
         let Some(info) = info_of(gid) else { continue };
         let category = if info.is_keystone {
@@ -898,10 +1144,29 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
                 mastery_images.push(img.clone());
             }
         }
+        // A PoE 1 mastery draws its group's own pair of icons beside its node icon.
+        if let Some(group) = info.mastery_group.and_then(|g| db.mastery_groups.get(&g)).filter(|_| psg.is_poe1()) {
+            let pattern = &group.active_effect_image;
+            if !pattern.is_empty() && !mastery_images.iter().any(|m| m.eq_ignore_ascii_case(pattern)) {
+                mastery_images.push(pattern.clone());
+            }
+            for (sheet, path) in
+                [("masteryActiveSelected", &group.active_icon), ("masteryInactive", &group.inactive_icon)]
+            {
+                let key = format!("{}:{}", sheet, png_path(path));
+                if !path.is_empty() && !mastery_icons.iter().any(|(k, _): &(String, String)| *k == key) {
+                    mastery_icons.push((key, path.clone()));
+                }
+            }
+        }
     }
     let category_rank = |c: &str| ICON_SIZES.iter().position(|(n, _, _)| *n == c).unwrap_or(9);
     icons.sort_by(|a, b| category_rank(&a.0).cmp(&category_rank(&b.0)).then_with(|| a.1.cmp(&b.1)));
     mastery_images.sort();
+    if !mastery_icons.is_empty() {
+        mastery_icons.sort();
+        class_sheets.push(ClassSheet { sheet: "mastery-icons".to_string(), images: mastery_icons });
+    }
 
     let tree_context = tree_context_for_graph_type(psg.graph_type);
     let art_set = db.art_sets.get(tree_context);
@@ -916,9 +1181,35 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
         group_backgrounds.push(("startNode:MainCircle".to_string(), crate::ui::psg_viewer::MAIN_CIRCLE.to_string()));
     }
     if let Some(a) = art_set {
-        for path in [&a.group_background.small, &a.group_background.medium, &a.group_background.large] {
-            if !path.is_empty() {
-                group_backgrounds.push((format!("groupBackground:{}", art_name(path)), path.clone()));
+        let bg = &a.group_background;
+        let poe1_names: [(&str, &String); 6] = [
+            ("PSGroupBackground1", &bg.small),
+            ("PSGroupBackground2", &bg.medium),
+            ("PSGroupBackground3", &bg.large),
+            ("GroupBackgroundSmallAlt", &bg.small_blank),
+            ("GroupBackgroundMediumAlt", &bg.medium_blank),
+            ("GroupBackgroundLargeHalfAlt", &bg.large_blank),
+        ];
+        match psg.is_poe1() {
+            true => {
+                for (name, path) in poe1_names {
+                    if !path.is_empty() {
+                        group_backgrounds.push((format!("groupBackground:{}", name), path.clone()));
+                    }
+                }
+                for ch in &db.characters {
+                    if !ch.start_background.is_empty() && !ch.name.is_empty() {
+                        let key = format!("startNode:center{}", ch.name.to_lowercase());
+                        group_backgrounds.push((key, ch.start_background.clone()));
+                    }
+                }
+            }
+            false => {
+                for path in [&bg.small, &bg.medium, &bg.large] {
+                    if !path.is_empty() {
+                        group_backgrounds.push((format!("groupBackground:{}", art_name(path)), path.clone()));
+                    }
+                }
             }
         }
     }
@@ -982,6 +1273,83 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
         atlas_backdrops: backdrops,
         texture_paths,
     }
+}
+
+/// PoE 1's alternate ascendancies — the Wildwood and bloodline trees — as its
+/// own export lists them.
+fn alternate_ascendancies(db: &SkillGraphDatabase) -> J {
+    let entries = db
+        .descendancies
+        .iter()
+        .filter(|d| !d.id.is_empty() && !d.name.is_empty())
+        .map(|d| {
+            let mut o = J::obj();
+            o.set("id", J::str(&d.id));
+            o.set("name", J::str(&d.name));
+            if !d.flavour_text.is_empty() {
+                o.set("flavourText", J::str(&d.flavour_text));
+            }
+            if !d.flavour_text_colour.is_empty() {
+                o.set("flavourTextColour", J::str(&d.flavour_text_colour));
+            }
+            if !d.coordinate_rect.is_empty() {
+                o.set("flavourTextRect", rect_json(&d.coordinate_rect));
+            }
+            o
+        })
+        .collect();
+    J::Arr(entries)
+}
+
+/// The backdrop a PoE 1 group is drawn on: the widest orbit it fills decides
+/// it, unless the graph names one itself. Checked against every group of
+/// GGG's own tree export. PoE 2 flags the few groups that get one instead.
+fn poe1_group_background(psg: &PsgFile, group: &crate::dat::psg::PsgGroup) -> Option<J> {
+    if !psg.is_poe1() || group.nodes.is_empty() {
+        return None;
+    }
+    let widest = group.nodes.iter().map(|n| n.radius).filter(|r| (1..=3).contains(r)).max();
+    let image = match (group.background_type, widest) {
+        (1, _) | (0, Some(1)) => "PSGroupBackground1",
+        (2, _) | (0, Some(2)) => "PSGroupBackground2",
+        (0, Some(3)) => "PSGroupBackground3",
+        _ => return None,
+    };
+    let mut out = J::obj();
+    out.set("image", J::str(image));
+    // The largest backdrop ships as its top half, mirrored downward.
+    if image == "PSGroupBackground3" {
+        out.set("isHalfImage", J::Bool(true));
+    }
+    Some(out)
+}
+
+/// What a PoE 1 reader needs to lay the tree out: the rings from the graph
+/// itself and the class numbering from `Characters`.
+fn poe1_constants(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::ExtraTables) -> J {
+    let mut classes = J::obj();
+    for character in &db.characters {
+        // PoE 1 names a character by its metadata path; the class key is its last part.
+        let id = character.id.rsplit('/').next().unwrap_or_default();
+        if !id.is_empty() {
+            classes.set(&format!("{}Class", id), J::Int(character.integer_id as i64));
+        }
+    }
+    let mut attributes = J::obj();
+    for (i, name) in tables.character_attributes.iter().enumerate() {
+        attributes.set(name, J::Int(i as i64));
+    }
+    let orbits = psg.passives_per_orbit.len();
+    let mut out = J::obj();
+    out.set("classes", classes);
+    if !tables.character_attributes.is_empty() {
+        out.set("characterAttributes", attributes);
+    }
+    // A client-side layout constant: no game file carries it.
+    out.set("PSSCentreInnerRadius", J::Int(PSS_CENTRE_INNER_RADIUS));
+    out.set("skillsPerOrbit", J::ints(psg.passives_per_orbit.iter().map(|n| *n as i64)));
+    out.set("orbitRadii", J::ints(psg.orbit_radii().iter().take(orbits).map(|r| *r as i64)));
+    out
 }
 
 /// Sprite name for a UI texture: the file name without the game's
@@ -1109,7 +1477,7 @@ fn viewer_extras(psg: &PsgFile, db: &SkillGraphDatabase, radii: &[f32; 10], grou
 
 // ── Sprite sheets ───────────────────────────────────────────────────────
 
-fn icon_sprites(store: &mut TextureStore, icons: &[(String, String)]) -> (Vec<(String, RgbaImage)>, Vec<(String, RgbaImage)>) {
+fn icon_sprites(store: &mut TextureStore, icons: &[(String, String)], is_poe1: bool) -> (Vec<(String, RgbaImage)>, Vec<(String, RgbaImage)>) {
     let mut active = Vec::new();
     let mut inactive = Vec::new();
     for (category, path) in icons {
@@ -1117,6 +1485,11 @@ fn icon_sprites(store: &mut TextureStore, icons: &[(String, String)]) -> (Vec<(S
         let Some(img) = store.get(path) else { continue };
         let scaled = sheets::resize(img, *w, *h);
         let png = png_path(path);
+        // PoE 1 sheets a mastery's own icon as `mastery`, and has no dimmed copy.
+        if is_poe1 && category == "mastery" {
+            active.push((format!("mastery:{}", png), scaled));
+            continue;
+        }
         inactive.push((format!("{}Inactive:{}", category, png), sheets::disabled_icon(&scaled)));
         active.push((format!("{}Active:{}", category, png), scaled));
     }
@@ -1136,7 +1509,7 @@ fn scaled_sprites(store: &mut TextureStore, items: &[(String, String)], factor: 
     items.iter().filter_map(|(key, path)| store.get(path).map(|img| (key.clone(), sheets::scale(img, factor)))).collect()
 }
 
-fn mastery_sprites(store: &mut TextureStore, images: &[String]) -> (Vec<(String, RgbaImage)>, Vec<(String, RgbaImage)>) {
+fn mastery_sprites(store: &mut TextureStore, images: &[String], is_poe1: bool) -> (Vec<(String, RgbaImage)>, Vec<(String, RgbaImage)>) {
     let mut active = Vec::new();
     let mut inactive = Vec::new();
     for path in images {
@@ -1144,6 +1517,10 @@ fn mastery_sprites(store: &mut TextureStore, images: &[String]) -> (Vec<(String,
         let h = (img.height() as f32 * MASTERY_PATTERN_WIDTH as f32 / img.width().max(1) as f32).round() as u32;
         let scaled = sheets::resize(img, MASTERY_PATTERN_WIDTH, h);
         let png = png_path(path);
+        if is_poe1 {
+            active.push((format!("masteryActiveEffect:{}", png), scaled));
+            continue;
+        }
         inactive.push((format!("masteryEffectInactive:{}", png), sheets::disabled_mastery(&scaled)));
         active.push((format!("masteryEffectActive:{}", png), scaled));
     }
@@ -1346,7 +1723,7 @@ mod real_data_tests {
         let index = Arc::new(BundleIndex::load_from_cache(&cache_path).expect("run the app once to build the index cache"));
         let schema_text = std::fs::read_to_string(crate::settings::AppSettings::get_app_data_dir().join("schema.min.json")).unwrap();
         let schema: Schema = serde_json::from_str(&schema_text).unwrap();
-        let source = TreeExportSource { reader: Some(reader), index, steam: None, schema };
+        let source = TreeExportSource::new(Some(reader), index, None, schema);
 
         let psg_path = std::env::var("TREE_EXPORT_PSG")
             .unwrap_or_else(|_| "metadata/passiveskillgraph.psg".to_string());

@@ -70,10 +70,20 @@ impl<'a> TextureStore<'a> {
             if !self.bytes.contains_key(&key) {
                 self.prefetch(std::slice::from_ref(&path.to_string()));
             }
-            let img = self.bytes.get(&key).and_then(|b| decode_full(b));
+            let mut img = self.bytes.get(&key).and_then(|b| decode_full(b));
+            if img.is_none() {
+                img = self.from_atlas(path);
+            }
             self.decoded.insert(key.clone(), img);
         }
         self.decoded.get(&key).and_then(|i| i.as_ref())
+    }
+
+    /// An image PoE 1 keeps inside a sheet, cut out of it.
+    fn from_atlas(&mut self, path: &str) -> Option<RgbaImage> {
+        let entry = self.source.atlas.as_ref()?.lookup(path)?.clone();
+        let sheet = self.get(&entry.sheet)?.clone();
+        crate::ui::ui_atlas::crop(&sheet, &entry)
     }
 }
 
@@ -210,13 +220,84 @@ pub fn encode_webp(img: &RgbaImage, quality: f32) -> Vec<u8> {
 
 /// Packs, encodes and writes `<dir>/<name>.webp` + `<dir>/<name>.json`.
 /// Returns the frames JSON for embedding in the viewer.
-pub fn write_sheet(dir: &Path, name: &str, sprites: &[(String, RgbaImage)], max_width: u32, quality: f32) -> Result<J, String> {
+pub fn write_sheet(dir: &Path, name: &str, sprites: &[(String, RgbaImage)], max_width: u32, quality: f32) -> Result<SheetJson, String> {
     let packed = pack(sprites, max_width);
     let image_name = format!("{}.webp", name);
     let json = frames_json(&packed, &image_name);
     std::fs::write(dir.join(&image_name), encode_webp(&packed.image, quality)).map_err(|e| e.to_string())?;
     std::fs::write(dir.join(format!("{}.json", name)), super::json::to_string_pretty(&json)).map_err(|e| e.to_string())?;
-    Ok(json)
+    Ok(SheetJson { sprites: sprite_json_split(&packed, &image_name, name), packer: json })
+}
+
+/// The same sheet drawn smaller: one resize of the packed image, with every
+/// rect moved with it.
+pub fn scale_packed(packed: &Packed, factor: f32) -> Packed {
+    let at = |v: u32| ((v as f32 * factor).round() as u32).max(1);
+    Packed {
+        image: scale(&packed.image, factor),
+        frames: packed
+            .frames
+            .iter()
+            .map(|f| Frame { key: f.key.clone(), x: at(f.x), y: at(f.y), w: at(f.w), h: at(f.h) })
+            .collect(),
+    }
+}
+
+/// A second copy of a sheet at another zoom, image only: the layout the
+/// bundled viewer reads is written once, at full size.
+pub fn write_zoom(
+    dir: &Path,
+    name: &str,
+    sprites: &[(String, RgbaImage)],
+    max_width: u32,
+    quality: f32,
+) -> Result<Vec<(String, J)>, String> {
+    let packed = pack(sprites, max_width);
+    let image_name = format!("{}.webp", name);
+    std::fs::write(dir.join(&image_name), encode_webp(&packed.image, quality)).map_err(|e| e.to_string())?;
+    Ok(sprite_json_split(&packed, &image_name, name))
+}
+
+/// The two ways a sheet is described: the packer layout the bundled viewer
+/// reads, and the `sprites` entries PoE 1's own tree export publishes.
+pub struct SheetJson {
+    pub packer: J,
+    pub sprites: Vec<(String, J)>,
+}
+
+/// One packed image as PoE 1 states it: a `sprites` entry per name before the
+/// `:` in each key, since its export sheets one image under several names.
+pub fn sprite_json_split(packed: &Packed, image_name: &str, default_sheet: &str) -> Vec<(String, J)> {
+    let mut out: Vec<(String, Vec<&Frame>)> = Vec::new();
+    for frame in &packed.frames {
+        let sheet = match frame.key.split_once(':') {
+            Some((sheet, _)) => sheet,
+            None => default_sheet,
+        };
+        match out.iter_mut().find(|(name, _)| name == sheet) {
+            Some((_, frames)) => frames.push(frame),
+            None => out.push((sheet.to_string(), vec![frame])),
+        }
+    }
+    out.into_iter()
+        .map(|(sheet, frames)| {
+            let mut coords = J::obj();
+            for f in frames {
+                let mut rect = J::obj();
+                rect.set("x", J::Int(f.x as i64));
+                rect.set("y", J::Int(f.y as i64));
+                rect.set("w", J::Int(f.w as i64));
+                rect.set("h", J::Int(f.h as i64));
+                coords.set(f.key.split_once(':').map_or(f.key.as_str(), |(_, key)| key), rect);
+            }
+            let mut entry = J::obj();
+            entry.set("filename", J::str(&format!("assets/{}", image_name)));
+            entry.set("w", J::Int(packed.image.width() as i64));
+            entry.set("h", J::Int(packed.image.height() as i64));
+            entry.set("coords", coords);
+            (sheet, entry)
+        })
+        .collect()
 }
 
 #[cfg(test)]

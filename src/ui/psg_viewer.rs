@@ -497,6 +497,8 @@ impl<'a> PsgViewer<'a> {
                 }
             }
 
+            // PoE 2's proxy groups stand in for nodes drawn elsewhere; PoE 1 draws its own.
+            let skip_proxy = !self.psg.is_poe1();
             let tree_context = tree_context_for_graph_type(self.psg.graph_type);
             let art_set = db.as_ref().and_then(|d| d.art_sets.get(tree_context));
             let art_for_node = |id: u32| -> Option<&SkillTreeArtSet> {
@@ -510,17 +512,32 @@ impl<'a> PsgViewer<'a> {
             // ── Group backgrounds (only groups the game flags) ────
             if let Some(art) = art_set {
                 for (gi, group) in self.psg.groups.iter().enumerate() {
-                    if group.is_proxy || group.nodes.is_empty() || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
+                    if (skip_proxy && group.is_proxy) || group.nodes.is_empty() || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
                         continue;
                     }
-                    if group.background_type == 0 && group.background_flag == 0 {
+                    if !self.psg.is_poe1() && group.background_type == 0 && group.background_flag == 0 {
                         continue;
                     }
                     let set = layout.group_ascendancy[gi].and_then(|a| db.as_ref().and_then(|d| d.ui_art_for_ascendancy(a))).unwrap_or(art);
-                    let (path, half) = match group.background_type {
-                        2 => (&set.group_background.small, false),
-                        4 => (&set.group_background.medium, false),
-                        _ => (&set.group_background.large, set.group_background.large.to_ascii_lowercase().contains("half")),
+                    let large = (&set.group_background.large, set.group_background.large.to_ascii_lowercase().contains("half"));
+                    // PoE 1 backs a group by the widest orbit it fills, unless the
+                    // graph names a backdrop itself (checked against every group of
+                    // GGG's tree export). PoE 2 flags the few groups that get one.
+                    let (path, half) = match self.psg.is_poe1() {
+                        true => {
+                            let widest = group.nodes.iter().map(|n| n.radius).filter(|r| (1..=3).contains(r)).max();
+                            match (group.background_type, widest) {
+                                (1, _) | (0, Some(1)) => (&set.group_background.small, false),
+                                (2, _) | (0, Some(2)) => (&set.group_background.medium, false),
+                                (0, Some(3)) => large,
+                                _ => continue,
+                            }
+                        }
+                        false => match group.background_type {
+                            2 => (&set.group_background.small, false),
+                            4 => (&set.group_background.medium, false),
+                            _ => large,
+                        },
                     };
                     let Some(tex) = self.find_texture(path) else { continue };
                     let [w, h] = tex.size();
@@ -545,7 +562,7 @@ impl<'a> PsgViewer<'a> {
             // The faded glyph behind a cluster sits under its lines and nodes.
             if let Some(db) = &db {
                 for (gi, group) in self.psg.groups.iter().enumerate() {
-                    if group.is_proxy || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
+                    if (skip_proxy && group.is_proxy) || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
                         continue;
                     }
                     for node in &group.nodes {
@@ -564,7 +581,7 @@ impl<'a> PsgViewer<'a> {
             // ── Connectors ────────────────────────────────────────
             let mut unique: HashMap<(u32, u32), i32> = HashMap::new();
             for (gi, group) in self.psg.groups.iter().enumerate() {
-                if group.is_proxy || layout.group_hidden[gi] {
+                if (skip_proxy && group.is_proxy) || layout.group_hidden[gi] {
                     continue;
                 }
                 for node in &group.nodes {
@@ -590,7 +607,13 @@ impl<'a> PsgViewer<'a> {
                 if info_a.map(|i| i.is_mastery).unwrap_or(false) || info_b.map(|i| i.is_mastery).unwrap_or(false) {
                     continue;
                 }
-                let (start_a, start_b) = (info_a.map(|i| !i.characters.is_empty()).unwrap_or(false), info_b.map(|i| !i.characters.is_empty()).unwrap_or(false));
+                // The roundels on PoE 2's centre ring are where its class starts
+                // connect from; PoE 1 draws its class starts in place.
+                let class_ring = !self.psg.is_poe1();
+                let (start_a, start_b) = (
+                    class_ring && info_a.map(|i| !i.characters.is_empty()).unwrap_or(false),
+                    class_ring && info_b.map(|i| !i.characters.is_empty()).unwrap_or(false),
+                );
                 let pa = if start_a { skill_tree_layout::class_start_line_end(pa, pb) } else { pa };
                 let pb = if start_b { skill_tree_layout::class_start_line_end(pb, pa) } else { pb };
                 let asc_a = layout.node_ascendancy(a);
@@ -607,7 +630,15 @@ impl<'a> PsgViewer<'a> {
                 }
                 let active = self.state.hovered_node == Some(a) || self.state.hovered_node == Some(b);
                 let tint = tint_for(asc_a);
-                let sheet = art_for_node(a).map(|s| if active { &s.connection.active } else { &s.connection.normal }).and_then(|p| self.find_texture(p));
+                // PoE 1's connector art is one sheet of nested quarter-arcs with
+                // no straight strip, so its links are stroked rather than mapped
+                // onto the PoE 2 sheet layout.
+                let sheet = match self.psg.is_poe1() {
+                    true => None,
+                    false => art_for_node(a)
+                        .map(|s| if active { &s.connection.active } else { &s.connection.normal })
+                        .and_then(|p| self.find_texture(p)),
+                };
 
                 let same_group = layout.node_group.get(&a) == layout.node_group.get(&b);
                 let (ga, gb) = (layout.node_group.get(&a).copied(), layout.node_group.get(&b).copied());
@@ -647,7 +678,7 @@ impl<'a> PsgViewer<'a> {
             // ── Centre ring ───────────────────────────────────────
             // Painted after the connectors so the class-start lines end
             // under the roundel mounts, as in game.
-            if self.psg.graph_type == 0 {
+            if self.psg.graph_type == 0 && !self.psg.is_poe1() {
                 if let Some(tex) = self.find_texture(MAIN_CIRCLE) {
                     draw_image(&painter, &cv, tex, Pos2::ZERO, Vec2::splat(MAIN_CIRCLE_SIZE), FULL);
                 }
@@ -669,7 +700,7 @@ impl<'a> PsgViewer<'a> {
 
             // ── Nodes ─────────────────────────────────────────────
             for (gi, group) in self.psg.groups.iter().enumerate() {
-                if group.is_proxy || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
+                if (skip_proxy && group.is_proxy) || layout.group_hidden[gi] || asc_hidden(layout.group_ascendancy[gi]) {
                     continue;
                 }
                 for node in &group.nodes {

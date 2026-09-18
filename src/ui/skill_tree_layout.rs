@@ -111,14 +111,37 @@ pub struct TreeLayout {
     pub slots: HashMap<usize, f32>,
 }
 
-/// Angle of a node on its orbit, clockwise from north. PoE 2 orbits are
-/// evenly spaced: theta = position / capacity * 2pi.
+/// PoE 1's 16-slot orbits are not evenly spaced: they are the twelve
+/// thirty-degree positions plus the four diagonals, as GGG's tree export
+/// README sets out for 3.17.0.
+const SIXTEEN_SLOT_DEGREES: [f32; 16] =
+    [0.0, 30.0, 45.0, 60.0, 90.0, 120.0, 135.0, 150.0, 180.0, 210.0, 225.0, 240.0, 270.0, 300.0, 315.0, 330.0];
+
+/// The 40-slot orbit follows the same rule one step finer: the thirty-six
+/// ten-degree positions plus the same four diagonals.
+const FORTY_SLOT_DEGREES: [f32; 40] = [
+    0.0, 10.0, 20.0, 30.0, 40.0, 45.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 110.0, 120.0, 130.0, 135.0, 140.0, 150.0,
+    160.0, 170.0, 180.0, 190.0, 200.0, 210.0, 220.0, 225.0, 230.0, 240.0, 250.0, 260.0, 270.0, 280.0, 290.0, 300.0,
+    310.0, 315.0, 320.0, 330.0, 340.0, 350.0,
+];
+
+/// Angle of a node on its orbit, clockwise from north. Most orbits space
+/// their slots evenly; the two PoE 1 sizes above do not, and no PoE 2 orbit
+/// holds 16 or 40.
 pub fn orbit_angle(orbit: u32, position: u32, passives_per_orbit: &[u8]) -> f32 {
-    let capacity = passives_per_orbit.get(orbit as usize).copied().unwrap_or(12) as f32;
-    if capacity <= 0.0 {
+    let capacity = passives_per_orbit.get(orbit as usize).copied().unwrap_or(12) as usize;
+    let uneven: Option<&[f32]> = match capacity {
+        16 => Some(&SIXTEEN_SLOT_DEGREES),
+        40 => Some(&FORTY_SLOT_DEGREES),
+        _ => None,
+    };
+    if let Some(table) = uneven {
+        return table[position as usize % table.len()].to_radians();
+    }
+    if capacity == 0 {
         return 0.0;
     }
-    position as f32 / capacity * std::f32::consts::TAU
+    position as f32 / capacity as f32 * std::f32::consts::TAU
 }
 
 /// Point at `radius` along `angle_deg` (clockwise from north, y down).
@@ -173,6 +196,10 @@ pub fn compute(psg: &PsgFile, db: Option<&SkillGraphDatabase>) -> TreeLayout {
                     .iter()
                     .find_map(|n| db.nodes.get(&n.skill_id).and_then(|i| i.ascendancy));
             }
+        }
+        // Only the PoE 2 client parks its ascendancies outside the tree; a
+        // PoE 1 graph already holds them where they are drawn.
+        if psg.graph_type == 0 && !psg.is_poe1() {
             layout.slots = ascendancy_slots(db);
 
             // Start group per ascendancy.
@@ -213,8 +240,11 @@ pub fn compute(psg: &PsgFile, db: Option<&SkillGraphDatabase>) -> TreeLayout {
         }
     }
 
+    // PoE 2's proxy groups stand in for nodes drawn elsewhere; PoE 1 draws
+    // its own, as its official export does.
+    let skip_proxy = !psg.is_poe1();
     for (gi, group) in psg.groups.iter().enumerate() {
-        if group.is_proxy {
+        if skip_proxy && group.is_proxy {
             continue;
         }
         let origin = pos2(group.x, group.y) + layout.group_offset[gi];

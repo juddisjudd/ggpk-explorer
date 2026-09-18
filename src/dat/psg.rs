@@ -16,9 +16,15 @@ pub struct PsgFile {
 }
 
 impl PsgFile {
-    /// Orbit radii for this graph, selected by `graph_type` (1 = atlas).
+    /// PoE 1 graphs have seven orbits; PoE 2 graphs have ten.
+    pub fn is_poe1(&self) -> bool {
+        self.passives_per_orbit.len() <= 7
+    }
+
+    /// Orbit radii for this graph. The atlas and every PoE 1 graph use the
+    /// older set, which PoE 1's official tree export states as its `orbitRadii`.
     pub fn orbit_radii(&self) -> [f32; 10] {
-        let src = if self.graph_type == 1 { ATLAS_ORBIT_RADII } else { PASSIVE_ORBIT_RADII };
+        let src = if self.graph_type == 1 || self.is_poe1() { ATLAS_ORBIT_RADII } else { PASSIVE_ORBIT_RADII };
         std::array::from_fn(|i| src.get(i).copied().unwrap_or(0) as f32)
     }
 
@@ -66,8 +72,8 @@ impl Serialize for PsgFile {
         state.serialize_field("roots", &self.roots)?;
         state.serialize_field("groups", &self.groups)?;
 
-        let orbit_radii: &[i32] = if self.graph_type == 1 {
-            ATLAS_ORBIT_RADII.as_slice()
+        let orbit_radii: &[i32] = if self.graph_type == 1 || self.is_poe1() {
+            &ATLAS_ORBIT_RADII[..self.passives_per_orbit.len().clamp(7, 10)]
         } else {
             PASSIVE_ORBIT_RADII.as_slice()
         };
@@ -115,7 +121,21 @@ pub struct PsgNode {
     pub connections: Vec<PsgConnection>,
 }
 
+/// Reads either game's layout. PoE 2 is tried first and kept unless it fails or
+/// stops short of the end; PoE 1 roots are one `u32` each and its connections
+/// carry no curvature, so a PoE 1 file read the PoE 2 way runs off the end.
 pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
+    let poe2 = parse_layout(data, false);
+    if matches!(&poe2, Ok((_, consumed)) if *consumed == data.len()) {
+        return poe2.map(|(psg, _)| psg);
+    }
+    match parse_layout(data, true) {
+        Ok((psg, consumed)) if consumed == data.len() => Ok(psg),
+        _ => poe2.map(|(psg, _)| psg),
+    }
+}
+
+fn parse_layout(data: &[u8], poe1: bool) -> Result<(PsgFile, usize), String> {
     let mut offset = 0;
     
     // Helper to read u8
@@ -167,8 +187,9 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
     let mut roots = Vec::new();
     for _ in 0..root_length {
         let connection = read_u32(&mut offset)?;
-        let _curvature = read_u32(&mut offset)?;
-        
+        if !poe1 {
+            let _curvature = read_u32(&mut offset)?;
+        }
         roots.push(connection);
     }
     
@@ -195,7 +216,7 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
             let mut connections = Vec::new();
             for _ in 0..connections_length {
                 let conn_id = read_u32(&mut offset)?;
-                let orbit = read_i32(&mut offset)?;
+                let orbit = if poe1 { 0 } else { read_i32(&mut offset)? };
                 connections.push(PsgConnection { node_id: conn_id, orbit });
             }
             
@@ -217,13 +238,15 @@ pub fn parse_psg(data: &[u8]) -> Result<PsgFile, String> {
         });
     }
 
-    
-    Ok(PsgFile {
-        graph_type,
-        roots,
-        groups,
-        passives_per_orbit,
-    })
+        Ok((
+        PsgFile {
+            graph_type,
+            roots,
+            groups,
+            passives_per_orbit,
+        },
+        offset,
+    ))
 }
 
 #[cfg(test)]
@@ -265,6 +288,36 @@ mod tests {
         assert_eq!(result.groups[0].y, 600.0);
         assert_eq!(result.groups[0].nodes[0].skill_id, 200);
         assert_eq!(result.groups[0].nodes[0].position, 5);
+    }
+
+    #[test]
+    fn a_poe1_graph_has_single_roots_and_no_curvature() {
+        let mut buffer = vec![3, 0, 7, 1, 6, 16, 16, 40, 72, 72];
+        buffer.extend_from_slice(&1u32.to_le_bytes());
+        buffer.extend_from_slice(&47u32.to_le_bytes());
+        buffer.extend_from_slice(&1u32.to_le_bytes());
+        buffer.extend_from_slice(&500.0f32.to_le_bytes());
+        buffer.extend_from_slice(&600.0f32.to_le_bytes());
+        buffer.extend_from_slice(&0u32.to_le_bytes());
+        buffer.extend_from_slice(&2u32.to_le_bytes());
+        buffer.push(1);
+        buffer.extend_from_slice(&1u32.to_le_bytes());
+        buffer.extend_from_slice(&200u32.to_le_bytes());
+        buffer.extend_from_slice(&3u32.to_le_bytes());
+        buffer.extend_from_slice(&5u32.to_le_bytes());
+        buffer.extend_from_slice(&2u32.to_le_bytes());
+        buffer.extend_from_slice(&300u32.to_le_bytes());
+        buffer.extend_from_slice(&301u32.to_le_bytes());
+
+        let psg = parse_psg(&buffer).expect("PoE 1 layout parses");
+        assert!(psg.is_poe1());
+        assert_eq!(psg.roots, vec![47]);
+        assert!(psg.groups[0].is_proxy);
+        assert_eq!(psg.groups[0].background_type, 2);
+        let node = &psg.groups[0].nodes[0];
+        assert_eq!((node.skill_id, node.radius, node.position), (200, 3, 5));
+        assert_eq!(node.connections.iter().map(|c| c.node_id).collect::<Vec<_>>(), vec![300, 301]);
+        assert_eq!(psg.orbit_radii()[..7], [0.0, 82.0, 162.0, 335.0, 493.0, 662.0, 846.0]);
     }
 
     #[test]
