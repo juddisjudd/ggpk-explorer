@@ -1126,7 +1126,8 @@ impl eframe::App for ExplorerApp {
             self.reader.is_some() || self.bundle_index.is_some(),
             game.label(),
             &poe_version,
-            &schema_date
+            &schema_date,
+            self.update_state.latest_version.as_deref().zip(self.update_state.release_url.as_deref()),
         );
 
         // Export Window logic
