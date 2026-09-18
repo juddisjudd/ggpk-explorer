@@ -84,7 +84,7 @@ impl DiffWindow {
     }
 
     pub fn refresh(&mut self) {
-        self.snapshots = crate::diff::list_snapshots();
+        self.snapshots = crate::diff::list_snapshots(crate::settings::Game::Poe2);
         if self.selected.map_or(true, |i| i >= self.snapshots.len()) {
             self.selected = if self.snapshots.is_empty() { None } else { Some(0) };
         }
@@ -121,7 +121,7 @@ impl DiffWindow {
         self.status = Some(("Saving snapshot...".to_string(), false));
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let result = crate::diff::take_snapshot(&index, &patch_version, &source)
+            let result = crate::diff::take_snapshot(&index, &patch_version, &source, crate::settings::Game::Poe2)
                 .map_err(|e| format!("Snapshot failed: {}", e));
             let _ = tx.send(result);
             ctx.request_repaint();

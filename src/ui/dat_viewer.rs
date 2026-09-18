@@ -169,7 +169,7 @@ fn refit_against(
 /// when the app notices a patch change, so this is normally the patch just gone.
 fn previous_patch() -> Option<String> {
     let current = crate::settings::AppSettings::load().poe2_patch_version;
-    crate::diff::list_snapshots()
+    crate::diff::list_snapshots(crate::settings::Game::Poe2)
         .into_iter()
         .map(|(_, meta)| meta.patch_version)
         .find(|version| *version != current)

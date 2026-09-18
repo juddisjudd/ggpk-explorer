@@ -8,6 +8,7 @@ impl StatusBar {
         status_msg: &str,
         is_loading: bool,
         is_mounted: bool,
+        game: &str,
         poe_version: &str,
         schema_date: &str,
     ) {
@@ -125,6 +126,15 @@ impl StatusBar {
                                     .monospace()
                                     .size(10.5)
                                     .color(meta_color),
+                            );
+                            ui.label(
+                                egui::RichText::new("\u{00B7}")
+                                    .monospace()
+                                    .size(10.5)
+                                    .color(meta_color),
+                            );
+                            ui.label(
+                                egui::RichText::new(game).monospace().size(10.5).color(meta_color),
                             );
                             ui.label(
                                 egui::RichText::new("\u{00B7}")

@@ -25,8 +25,8 @@ impl SnapshotMeta {
     }
 }
 
-pub fn snapshot_dir() -> PathBuf {
-    let dir = crate::settings::AppSettings::get_app_data_dir().join(SNAPSHOT_DIR);
+pub fn snapshot_dir(game: crate::settings::Game) -> PathBuf {
+    let dir = crate::settings::AppSettings::cache_dir(game).join(SNAPSHOT_DIR);
     if !dir.exists() {
         let _ = std::fs::create_dir_all(&dir);
     }
@@ -35,9 +35,9 @@ pub fn snapshot_dir() -> PathBuf {
 
 /// Serializes `(meta, index)` as a bincode tuple so the meta can later be read
 /// back on its own without deserializing the (much larger) index behind it.
-pub fn save_snapshot(meta: &SnapshotMeta, index: &Index) -> io::Result<PathBuf> {
+pub fn save_snapshot(meta: &SnapshotMeta, index: &Index, game: crate::settings::Game) -> io::Result<PathBuf> {
     let filename = format!("{}_{}.{}", meta.created_at, meta.patch_version, SNAPSHOT_EXT);
-    let path = snapshot_dir().join(filename);
+    let path = snapshot_dir(game).join(filename);
     let file = std::fs::File::create(&path)?;
     let mut writer = std::io::BufWriter::new(file);
     bincode::serialize_into(&mut writer, &(meta, index))
@@ -45,7 +45,7 @@ pub fn save_snapshot(meta: &SnapshotMeta, index: &Index) -> io::Result<PathBuf> 
     Ok(path)
 }
 
-pub fn take_snapshot(index: &Index, patch_version: &str, source: &str) -> io::Result<PathBuf> {
+pub fn take_snapshot(index: &Index, patch_version: &str, source: &str, game: crate::settings::Game) -> io::Result<PathBuf> {
     let meta = SnapshotMeta {
         patch_version: patch_version.to_string(),
         source: source.to_string(),
@@ -53,7 +53,7 @@ pub fn take_snapshot(index: &Index, patch_version: &str, source: &str) -> io::Re
         file_count: index.files.len() as u64,
         bundle_count: index.bundles.len() as u64,
     };
-    save_snapshot(&meta, index)
+    save_snapshot(&meta, index, game)
 }
 
 pub fn read_snapshot_meta(path: &Path) -> io::Result<SnapshotMeta> {
@@ -69,9 +69,9 @@ pub fn load_snapshot(path: &Path) -> io::Result<(SnapshotMeta, Index)> {
 }
 
 /// All saved snapshots, newest first. Unreadable files are skipped.
-pub fn list_snapshots() -> Vec<(PathBuf, SnapshotMeta)> {
+pub fn list_snapshots(game: crate::settings::Game) -> Vec<(PathBuf, SnapshotMeta)> {
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(snapshot_dir()) {
+    if let Ok(entries) = std::fs::read_dir(snapshot_dir(game)) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some(SNAPSHOT_EXT) {
@@ -86,8 +86,8 @@ pub fn list_snapshots() -> Vec<(PathBuf, SnapshotMeta)> {
     out
 }
 
-pub fn has_snapshot_for_version(patch_version: &str) -> bool {
-    list_snapshots().iter().any(|(_, m)| m.patch_version == patch_version)
+pub fn has_snapshot_for_version(patch_version: &str, game: crate::settings::Game) -> bool {
+    list_snapshots(game).iter().any(|(_, m)| m.patch_version == patch_version)
 }
 
 #[derive(Debug, Clone)]
@@ -328,7 +328,7 @@ mod real_snapshot_tests {
     #[test]
     #[ignore]
     fn patch_report_real_snapshots() {
-        let snaps = list_snapshots();
+        let snaps = list_snapshots(crate::settings::Game::Poe2);
         assert!(snaps.len() >= 2, "need two snapshots, found {}", snaps.len());
         let (new_path, new_meta) = &snaps[0];
         let (old_path, old_meta) = &snaps[1];

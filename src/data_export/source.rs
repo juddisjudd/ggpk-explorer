@@ -101,6 +101,24 @@ impl GameFiles {
     }
 }
 
+impl GameFiles {
+    /// Several files at once, read in bundle order so a set scattered over many
+    /// bundles decompresses each one once. Paths not in the index are left out.
+    pub fn fetch_many(&self, paths: &[String]) -> std::collections::HashMap<String, Vec<u8>> {
+        let mut located: Vec<_> = paths.iter().filter_map(|path| Some((path, self.lookup(path)?))).collect();
+        located.sort_by_key(|(_, info)| (info.bundle_index, info.file_offset));
+        located
+            .into_iter()
+            .filter_map(|(path, info)| {
+                let data = self.bundle(info.bundle_index)?;
+                let start = info.file_offset as usize;
+                let bytes = data.get(start..start.checked_add(info.file_size as usize)?)?.to_vec();
+                Some((path.clone(), bytes))
+            })
+            .collect()
+    }
+}
+
 impl FileSource for GameFiles {
     fn fetch(&self, path: &str) -> Option<Vec<u8>> {
         let info = self.lookup(path)?;

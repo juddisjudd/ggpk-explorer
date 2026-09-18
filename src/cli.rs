@@ -1,5 +1,5 @@
 use crate::ggpk::reader::GgpkReader;
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, Game};
 
 fn murmur_hash64a(key: &[u8], seed: u64) -> u64 {
     let m: u64 = 0xc6a4a7935bd1e995;
@@ -88,7 +88,9 @@ EXPORT OPTIONS:
         --textures <FMT>   dds (default), png or webp
         --audio <FMT>      ogg (default) or wav
         --data <FMT>       original (default) or json for .dat/.csd
+        --psg <FMT>        original (default), json, or tree for the web-export layout
         --dry-run          Count the files instead of writing them
+        --poe1 / --poe2    Which game to read (default: the one the install's log names)
     Plus the source options below (--ggpk / --steam / --cdn / --schema).
 
 EXPORT-DATA OPTIONS:
@@ -103,7 +105,7 @@ EXPORT-DATA OPTIONS:
         --flat             Write into <DIR> itself, not a patch-version subfolder
         --strip-null       Leave out keys with no value, shrinking every dump
         --version <VER>    Name the patch instead of reading it from the install
-        --poe1             Read a Path of Exile 1 install instead of PoE 2
+        --poe1 / --poe2    Which game to read (default: the one the install's log names, else PoE 2)
 
 LINT OPTIONS:
         --schema <FILE>    Schema to check (default: the cached schema.min.json)
@@ -133,7 +135,7 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
     let mut cdn_version: Option<Option<String>> = None;
     let mut schema_path: Option<String> = None;
     let mut options = DataExportOptions::default();
-    let mut is_poe2 = true;
+    let mut requested_game: Option<Game> = None;
     let mut ls: Option<String> = None;
     let mut cat: Option<String> = None;
 
@@ -167,7 +169,8 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
             "--flat" => options.flat = true,
             "--strip-null" => options.strip_null = true,
             "--version" => options.version = Some(value(&mut i)?),
-            "--poe1" => is_poe2 = false,
+            "--poe1" => requested_game = Some(Game::Poe1),
+            "--poe2" => requested_game = Some(Game::Poe2),
             "-l" | "--list" => {
                 for name in crate::data_export::module_names() {
                     println!("{}", name);
@@ -186,14 +189,18 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
     let settings = AppSettings::load();
     let schema = load_schema(schema_path.or_else(|| settings.schema_local_path.clone()))?;
 
-    let cdn = cdn_version.map(|explicit| {
-        let version = explicit.unwrap_or_else(|| settings.poe2_patch_version.clone());
-        println!("Using patch CDN version {}", version);
-        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::get_app_data_dir().join("cache"), Some(&version))
-    });
+    let defaults = requested_game.unwrap_or_default();
+    let cdn_requested = cdn_version.is_some();
+    let ggpk = ggpk.or_else(|| if steam.is_some() || cdn_requested { None } else { settings.ggpk_path_for(defaults).cloned() });
+    let steam = steam.or_else(|| if ggpk.is_some() || cdn_requested { None } else { settings.steam_path_for(defaults).cloned() });
+    let game = resolve_game(requested_game, ggpk.as_deref(), steam.as_deref(), cdn_version.as_ref().and_then(|v| v.as_deref()));
+    println!("Reading {}", game.label());
 
-    let ggpk = ggpk.or_else(|| if steam.is_some() || cdn.is_some() { None } else { settings.ggpk_path.clone() });
-    let steam = steam.or_else(|| if ggpk.is_some() || cdn.is_some() { None } else { settings.steam_path.clone() });
+    let cdn = cdn_version.map(|explicit| {
+        let version = explicit.unwrap_or_else(|| settings.patch_version(game).to_string());
+        println!("Using patch CDN version {}", version);
+        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version))
+    });
 
     // The patch names the output folder: taken from the CDN version when one
     // was asked for, otherwise from the install's own client log.
@@ -210,7 +217,7 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
         }
     }
 
-    let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref())?;
+    let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref(), game)?;
     println!("Index loaded: {} files", index.files.len());
 
     let files = GameFiles::new(reader, Arc::new(index), steam_loader, cdn);
@@ -236,9 +243,14 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
     }
 
     let (tx, rx) = std::sync::mpsc::channel();
-    let out_display = out.display().to_string();
+    let out_display = match (&options.version, options.flat) {
+        (Some(version), false) => out.join(options.folder_name(version)),
+        _ => out.clone(),
+    }
+    .display()
+    .to_string();
     std::thread::spawn(move || {
-        crate::data_export::run(files, schema, is_poe2, out, options, tx);
+        crate::data_export::run(files, schema, game.is_poe2(), out, options, tx);
     });
 
     let mut failed = 0;
@@ -317,7 +329,16 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
                     other => return Err(format!("--data takes original or json, not {}", other)),
                 }
             }
+            "--psg" => {
+                settings.psg_format = match value(&mut i)?.to_ascii_lowercase().as_str() {
+                    "original" => PsgFormat::Original,
+                    "json" => PsgFormat::Json,
+                    "tree" => PsgFormat::Tree,
+                    other => return Err(format!("--psg takes original, json or tree, not {}", other)),
+                }
+            }
             "--poe1" => settings.is_poe2 = false,
+            "--poe2" => settings.is_poe2 = true,
             "--dry-run" => dry_run = true,
             "-h" | "--help" => {
                 println!("{}", USAGE);
@@ -333,13 +354,18 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
     let saved = AppSettings::load();
     let schema = load_schema(schema_path.or_else(|| saved.schema_local_path.clone())).ok();
 
+    let requested_game = (!settings.is_poe2).then_some(Game::Poe1);
+    let defaults = requested_game.unwrap_or_default();
+    let cdn_requested = cdn_version.is_some();
+    let ggpk = ggpk.or_else(|| if steam.is_some() || cdn_requested { None } else { saved.ggpk_path_for(defaults).cloned() });
+    let steam = steam.or_else(|| if ggpk.is_some() || cdn_requested { None } else { saved.steam_path_for(defaults).cloned() });
+    let game = resolve_game(requested_game, ggpk.as_deref(), steam.as_deref(), cdn_version.as_ref().and_then(|v| v.as_deref()));
+    settings.is_poe2 = game.is_poe2();
     let cdn = cdn_version.map(|explicit| {
-        let version = explicit.unwrap_or_else(|| saved.poe2_patch_version.clone());
-        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::get_app_data_dir().join("cache"), Some(&version))
+        let version = explicit.unwrap_or_else(|| saved.patch_version(game).to_string());
+        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version))
     });
-    let ggpk = ggpk.or_else(|| if steam.is_some() || cdn.is_some() { None } else { saved.ggpk_path.clone() });
-    let steam = steam.or_else(|| if ggpk.is_some() || cdn.is_some() { None } else { saved.steam_path.clone() });
-    let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref())?;
+    let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref(), game)?;
 
     // A path with no extension is a folder; everything under it comes along.
     // An empty one would otherwise match the entries whose path never resolved.
@@ -367,6 +393,33 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
 
     let index = Arc::new(index);
     let (tx, rx) = std::sync::mpsc::channel();
+    // One `.psg` asked for as a tree goes through the web-export builder.
+    if settings.psg_format == PsgFormat::Tree && hashes.len() == 1 {
+        let Some(schema) = schema else { return Err("A tree export needs a schema; pass --schema".to_string()) };
+        let info = index.files.get(&hashes[0]).cloned().ok_or("that file is not in the index")?;
+        let source = crate::skill_tree_export::TreeExportSource::new(reader, index, steam_loader, schema);
+        let bytes = source.fetch(&info.path).ok_or_else(|| format!("Could not read {}", info.path))?;
+        let psg = crate::dat::psg::parse_psg(&bytes).map_err(|e| format!("Could not parse {}: {}", info.path, e))?;
+        std::thread::spawn(move || {
+            crate::skill_tree_export::run_tree_export(
+                source,
+                info.path.clone(),
+                psg,
+                None,
+                crate::skill_tree_export::TreeExportOptions::default(),
+                out,
+                tx,
+            );
+        });
+        for status in rx {
+            match status {
+                crate::export::ExportStatus::Progress { current, total, filename } => println!("[{}/{}] {}", current, total, filename),
+                crate::export::ExportStatus::Complete { message, .. } => println!("{}", message),
+                crate::export::ExportStatus::Error(e) => return Err(e),
+            }
+        }
+        return Ok(());
+    }
     std::thread::spawn(move || {
         crate::export::run_export(hashes, reader, Some(index), settings, out, cdn, steam_loader, schema, tx, None);
     });
@@ -398,16 +451,25 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
 /// Drops disk caches left over from an earlier patch before anything reads
 /// them. The GUI does this when it notices the patch change; a CLI run may be
 /// the first thing to touch the caches after an update.
-fn sync_caches_to_install(ggpk: Option<&str>, steam: Option<&str>) {
+fn sync_caches_to_install(ggpk: Option<&str>, steam: Option<&str>, game: crate::settings::Game) {
     let Some(version) = install_root(ggpk, steam).as_deref().and_then(crate::data_export::detect_version)
     else {
         return;
     };
-    match AppSettings::sync_cache_to_patch(&version) {
+    match AppSettings::sync_cache_to_patch(&version, game) {
         Ok(true) => println!("Patch {} — cleared caches built for an earlier patch", version),
         Ok(false) => {}
         Err(e) => println!("Could not clear the caches for patch {}: {}", version, e),
     }
+}
+
+/// The game to read: what was asked for, else what the CDN version or the
+/// install's client log says, else PoE 2.
+fn resolve_game(requested: Option<Game>, ggpk: Option<&str>, steam: Option<&str>, cdn_version: Option<&str>) -> Game {
+    requested
+        .or_else(|| cdn_version.map(|v| Game::from_is_poe2(v.starts_with("4."))))
+        .or_else(|| install_root(ggpk, steam).as_deref().and_then(crate::data_export::detect_game))
+        .unwrap_or_default()
 }
 
 fn install_root(ggpk: Option<&str>, steam: Option<&str>) -> Option<std::path::PathBuf> {
@@ -454,16 +516,18 @@ fn open_source(
     ggpk: Option<String>,
     steam: Option<String>,
     cdn: Option<&crate::bundles::cdn::CdnBundleLoader>,
+    game: Game,
 ) -> Result<OpenedSource, String> {
     use std::sync::Arc;
 
     if let Some(path) = ggpk {
         println!("Opening GGPK at {}", path);
-        sync_caches_to_install(Some(&path), None);
+        sync_caches_to_install(Some(&path), None, game);
         let reader = Arc::new(GgpkReader::open(&path).map_err(|e| format!("Failed to open GGPK: {}", e))?);
-        let cache = AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
-        if let Ok(index) = crate::bundles::index::Index::load_from_cache(&cache) {
+        let cache = AppSettings::index_cache_path(game);
+        if let Ok(mut index) = crate::bundles::index::Index::load_from_cache(&cache) {
             println!("Index loaded from cache");
+            index.add_ggpk_loose_files(&reader);
             return Ok((Some(reader), None, index));
         }
         let record = reader
@@ -473,13 +537,15 @@ fn open_source(
         let data = reader
             .get_data_slice(record.data_offset, record.data_length)
             .map_err(|e| format!("Failed to read the bundle index: {}", e))?;
-        let index = read_index_bundle(data)?;
+        let mut index = read_index_bundle(data)?;
+        // PoE 1 keeps its UI art beside the bundles rather than inside them.
+        index.add_ggpk_loose_files(&reader);
         return Ok((Some(reader), None, index));
     }
 
     if let Some(dir) = steam {
         println!("Opening Steam bundles at {}", dir);
-        sync_caches_to_install(None, Some(&dir));
+        sync_caches_to_install(None, Some(&dir), game);
         let loader = crate::bundles::steam::SteamBundleLoader::new(std::path::PathBuf::from(&dir));
         let bytes = loader.load_index_bytes().map_err(|e| format!("Failed to read _.index.bin: {}", e))?;
         let index = read_index_bundle(&bytes)?;
@@ -550,12 +616,12 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
 
     let ggpk = ggpk.or_else(|| if steam.is_some() { None } else { settings.ggpk_path.clone() });
     let steam = steam.or_else(|| if ggpk.is_some() { None } else { settings.steam_path.clone() });
-    let (reader, steam_loader, index) = open_source(ggpk, steam, None)?;
+    let (reader, steam_loader, index) = open_source(ggpk, steam, None, Game::Poe2)?;
     let new_files = GameFiles::new(reader, Arc::new(index), steam_loader, None);
 
     println!("Reading patch {} from the CDN to compare against", old_version);
     let cdn = crate::bundles::cdn::CdnBundleLoader::new(
-        &AppSettings::get_app_data_dir().join("cache"),
+        &AppSettings::file_cache_dir(Game::Poe2),
         Some(&old_version),
     );
     let old_index = cdn.fetch_index().map_err(|e| format!("Failed to fetch the CDN index: {}", e))?;
@@ -714,9 +780,10 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
 
     let settings = AppSettings::load();
     let schema = load_schema(schema_path.or_else(|| settings.schema_local_path.clone()))?;
-    let ggpk = ggpk.or_else(|| if steam.is_some() { None } else { settings.ggpk_path.clone() });
-    let steam = steam.or_else(|| if ggpk.is_some() { None } else { settings.steam_path.clone() });
-    let (reader, steam_loader, index) = open_source(ggpk, steam, None)?;
+    let game = Game::from_is_poe2(is_poe2);
+    let ggpk = ggpk.or_else(|| if steam.is_some() { None } else { settings.ggpk_path_for(game).cloned() });
+    let steam = steam.or_else(|| if ggpk.is_some() { None } else { settings.steam_path_for(game).cloned() });
+    let (reader, steam_loader, index) = open_source(ggpk, steam, None, game)?;
     let files = GameFiles::new(reader, Arc::new(index), steam_loader, None);
 
     // Every base-language table, read once and kept for the row counts that

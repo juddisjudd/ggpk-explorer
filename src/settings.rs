@@ -25,6 +25,31 @@ fn cache_matches_patch(stamped: Option<&str>, version: &str, saved_version: &str
     }
 }
 
+/// Which game an install, its caches and its exports belong to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Game {
+    #[default]
+    Poe2,
+    Poe1,
+}
+
+impl Game {
+    pub fn from_is_poe2(is_poe2: bool) -> Self {
+        if is_poe2 { Game::Poe2 } else { Game::Poe1 }
+    }
+
+    pub fn is_poe2(self) -> bool {
+        self == Game::Poe2
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Game::Poe2 => "PoE 2",
+            Game::Poe1 => "PoE 1",
+        }
+    }
+}
+
 pub fn tree_cache_filename(hide_shader_cache: bool) -> &'static str {
     if hide_shader_cache { TREE_CACHE_NOSHADER_FILENAME } else { TREE_CACHE_FILENAME }
 }
@@ -50,6 +75,16 @@ pub struct AppSettings {
     /// Drop the ~2.8M `shadercache*/` blobs from the index at load time.
     #[serde(default = "default_hide_shader_cache")]
     pub hide_shader_cache: bool,
+    /// The game the explorer opens; `ggpk_path`, `steam_path` and
+    /// `poe2_patch_version` belong to PoE 2.
+    #[serde(default)]
+    pub game: Game,
+    #[serde(default)]
+    pub poe1_ggpk_path: Option<String>,
+    #[serde(default)]
+    pub poe1_steam_path: Option<String>,
+    #[serde(default)]
+    pub poe1_patch_version: String,
 }
 
 fn default_hide_shader_cache() -> bool {
@@ -89,6 +124,10 @@ impl Default for AppSettings {
             schema_local_path: None,
             theme: default_theme(),
             hide_shader_cache: default_hide_shader_cache(),
+            game: Game::default(),
+            poe1_ggpk_path: None,
+            poe1_steam_path: None,
+            poe1_patch_version: String::new(),
         }
     }
 }
@@ -96,6 +135,49 @@ impl Default for AppSettings {
 use std::path::PathBuf;
 
 impl AppSettings {
+    pub fn patch_version(&self, game: Game) -> &str {
+        match game {
+            Game::Poe2 => &self.poe2_patch_version,
+            Game::Poe1 => &self.poe1_patch_version,
+        }
+    }
+
+    pub fn ggpk_path_for(&self, game: Game) -> Option<&String> {
+        match game {
+            Game::Poe2 => self.ggpk_path.as_ref(),
+            Game::Poe1 => self.poe1_ggpk_path.as_ref(),
+        }
+    }
+
+    pub fn steam_path_for(&self, game: Game) -> Option<&String> {
+        match game {
+            Game::Poe2 => self.steam_path.as_ref(),
+            Game::Poe1 => self.poe1_steam_path.as_ref(),
+        }
+    }
+
+    pub fn set_patch_version(&mut self, game: Game, version: String) {
+        match game {
+            Game::Poe2 => self.poe2_patch_version = version,
+            Game::Poe1 => self.poe1_patch_version = version,
+        }
+    }
+
+    /// Records where one game's install is, leaving the other game's alone.
+    pub fn set_ggpk_path(&mut self, game: Game, path: Option<String>) {
+        match game {
+            Game::Poe2 => self.ggpk_path = path,
+            Game::Poe1 => self.poe1_ggpk_path = path,
+        }
+    }
+
+    pub fn set_steam_path(&mut self, game: Game, path: Option<String>) {
+        match game {
+            Game::Poe2 => self.steam_path = path,
+            Game::Poe1 => self.poe1_steam_path = path,
+        }
+    }
+
     pub fn fetch_latest_patch_version(source_url: &str) -> Result<String, String> {
         // Try direct patch server protocol first (most reliable)
         match Self::fetch_patch_version_direct() {
@@ -271,8 +353,36 @@ impl AppSettings {
         }
     }
 
-    pub fn get_cache_size() -> u64 {
+    /// One game's cache folder. PoE 2 keeps the app data folder its caches have
+    /// always used; PoE 1 gets its own, so the two indexes and patch stamps do
+    /// not overwrite each other.
+    pub fn cache_dir(game: Game) -> PathBuf {
         let dir = Self::get_app_data_dir();
+        match game {
+            Game::Poe2 => dir,
+            Game::Poe1 => {
+                let dir = dir.join("poe1");
+                let _ = std::fs::create_dir_all(&dir);
+                dir
+            }
+        }
+    }
+
+    pub fn index_cache_path(game: Game) -> PathBuf {
+        Self::cache_dir(game).join(INDEX_CACHE_FILENAME)
+    }
+
+    pub fn tree_cache_path(game: Game, hide_shader_cache: bool) -> PathBuf {
+        Self::cache_dir(game).join(tree_cache_filename(hide_shader_cache))
+    }
+
+    /// Downloaded CDN bundles and other per-file caches.
+    pub fn file_cache_dir(game: Game) -> PathBuf {
+        Self::cache_dir(game).join("cache")
+    }
+
+    pub fn get_cache_size(game: Game) -> u64 {
+        let dir = Self::cache_dir(game);
         let cache_dir = dir.join("cache");
         let cache_file = dir.join(INDEX_CACHE_FILENAME);
         let tree_caches = [dir.join(TREE_CACHE_FILENAME), dir.join(TREE_CACHE_NOSHADER_FILENAME)];
@@ -305,8 +415,8 @@ impl AppSettings {
 
     /// Records which patch the caches now hold, so a later run can tell whether
     /// they still describe the installed game.
-    pub fn stamp_cache_patch(version: &str) -> std::io::Result<()> {
-        std::fs::write(Self::get_app_data_dir().join(CACHE_STAMP_FILENAME), version)
+    pub fn stamp_cache_patch(version: &str, game: Game) -> std::io::Result<()> {
+        std::fs::write(Self::cache_dir(game).join(CACHE_STAMP_FILENAME), version)
     }
 
     /// Clears the disk caches unless they were already built for `version`, and
@@ -317,18 +427,18 @@ impl AppSettings {
     /// Saves the outgoing patch's index before it is wiped. The index cache is
     /// the only full record of what the last patch shipped, so a diff against
     /// the next one is impossible once it is gone.
-    fn snapshot_outgoing(old_version: &str) {
-        if old_version.is_empty() || crate::diff::has_snapshot_for_version(old_version) {
+    fn snapshot_outgoing(old_version: &str, game: Game) {
+        if old_version.is_empty() || crate::diff::has_snapshot_for_version(old_version, game) {
             return;
         }
-        let cache = Self::get_app_data_dir().join(INDEX_CACHE_FILENAME);
+        let cache = Self::index_cache_path(game);
         if !cache.exists() {
             return;
         }
         match crate::bundles::index::Index::load_from_cache(&cache) {
             Ok(mut index) => {
                 index.drop_shader_cache();
-                match crate::diff::take_snapshot(&index, old_version, "auto (pre-patch index cache)") {
+                match crate::diff::take_snapshot(&index, old_version, "auto (pre-patch index cache)", game) {
                     Ok(_) => println!("Saved a snapshot of patch {} before clearing the caches", old_version),
                     Err(e) => println!("Could not snapshot patch {}: {}", old_version, e),
                 }
@@ -337,24 +447,25 @@ impl AppSettings {
         }
     }
 
-    pub fn sync_cache_to_patch(version: &str) -> std::io::Result<bool> {
-        let stamped = std::fs::read_to_string(Self::get_app_data_dir().join(CACHE_STAMP_FILENAME)).ok();
+    pub fn sync_cache_to_patch(version: &str, game: Game) -> std::io::Result<bool> {
+        let stamped = std::fs::read_to_string(Self::cache_dir(game).join(CACHE_STAMP_FILENAME)).ok();
         let stamped = stamped.as_deref().map(str::trim);
         if stamped == Some(version) {
             return Ok(false);
         }
         let settings = Self::load();
-        let adopt = cache_matches_patch(stamped, version, &settings.poe2_patch_version);
+        let saved_version = settings.patch_version(game).to_string();
+        let adopt = cache_matches_patch(stamped, version, &saved_version);
         if !adopt {
-            Self::snapshot_outgoing(stamped.unwrap_or(&settings.poe2_patch_version));
-            Self::clear_cache()?;
+            Self::snapshot_outgoing(stamped.unwrap_or(&saved_version), game);
+            Self::clear_cache(game)?;
         }
-        Self::stamp_cache_patch(version)?;
+        Self::stamp_cache_patch(version, game)?;
         Ok(!adopt)
     }
 
-    pub fn clear_cache() -> std::io::Result<()> {
-        let dir = Self::get_app_data_dir();
+    pub fn clear_cache(game: Game) -> std::io::Result<()> {
+        let dir = Self::cache_dir(game);
         let cache_dir = dir.join("cache");
         let cache_file = dir.join(INDEX_CACHE_FILENAME);
         let tree_caches = [dir.join(TREE_CACHE_FILENAME), dir.join(TREE_CACHE_NOSHADER_FILENAME)];
