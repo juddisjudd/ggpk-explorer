@@ -694,6 +694,7 @@ pub fn build(
     extra: ExtraTables,
     schema: &Schema,
     is_poe2: bool,
+    hardmode: bool,
 ) -> Result<SkillGraphDatabase, String> {
     let ExtraTables {
         ascendancy: ascendancy_bytes,
@@ -775,9 +776,19 @@ pub fn build(
         Vec::new()
     };
 
-    let reminders = reminder_text_bytes
+    let hard_reminders = reminder_text_bytes
+        .clone()
+        .filter(|_| hardmode)
+        .and_then(|bytes| strings_of(bytes, "reminders.datc64", schema, "ReminderText", ("Id", "TextHardmode"), is_poe2).ok())
+        .unwrap_or_default();
+    let mut reminders = reminder_text_bytes
         .and_then(|bytes| strings_of(bytes, "reminders.datc64", schema, "ReminderText", ("Id", "Text"), is_poe2).ok())
         .unwrap_or_default();
+    for (reminder, (_, hard)) in reminders.iter_mut().zip(hard_reminders) {
+        if !hard.is_empty() {
+            reminder.1 = hard;
+        }
+    }
     // A description can ask for a reminder of its own, naming a `ReminderText`.
     let reminder_by_id: HashMap<&str, &str> =
         reminders.iter().map(|(id, text)| (id.as_str(), text.as_str())).collect();
@@ -842,6 +853,16 @@ pub fn build(
     let unlocked_by_col = col_index(ps_table, "UnlockedBy");
     let visible_for_col = col_index(ps_table, "VisibleForAscendancy");
     let granted_skill_col = col_index(ps_table, "GrantedSkill");
+    // PoE 1's Ruthless ("hardmode") keeps its own name, stats, points and
+    // buffs beside the normal ones, for the nodes it changes.
+    let hardmode_col = col_index(ps_table, "HasHardmodeAlternate").filter(|_| hardmode);
+    let hard_name_col = col_index(ps_table, "NameHardmode").unwrap_or(name_col);
+    let hard_stats_col = col_index(ps_table, "StatsHardmode").or(stats_col);
+    let hard_value_cols: Vec<Option<usize>> = (1..=7)
+        .map(|n| col_index(ps_table, &format!("Stat{}ValueHardmode", n)).or(stat_value_cols[n - 1]))
+        .collect();
+    let hard_points_col = col_index(ps_table, "SkillPointsGrantedHardmode").or(points_col);
+    let hard_buffs_col = col_index(ps_table, "BuffsHardmode").or(buffs_col);
 
     // `UnlockedBy` references rows of this same table, so graph ids are
     // needed for every row before any node is built.
@@ -867,6 +888,13 @@ pub fn build(
             continue;
         }
 
+        let hard = hardmode_col.and_then(|c| row.get(c)).map(as_bool).unwrap_or(false);
+        let renamed = hard && row.get(hard_name_col).and_then(as_string).is_some_and(|n| !n.is_empty());
+        let name_col = if renamed { hard_name_col } else { name_col };
+        let stats_col = if hard { hard_stats_col } else { stats_col };
+        let stat_value_cols = if hard { &hard_value_cols } else { &stat_value_cols };
+        let points_col = if hard { hard_points_col } else { points_col };
+        let buffs_col = if hard { hard_buffs_col } else { buffs_col };
         let name = row.get(name_col).and_then(as_string).unwrap_or_default();
         let read_row_refs = |col: Option<usize>| -> Vec<usize> {
             match col.and_then(|c| row.get(c).map(|v| (c, v))) {

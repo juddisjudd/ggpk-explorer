@@ -68,13 +68,13 @@ impl J {
     }
 }
 
+/// Rounds to `digits` significant digits the way C's `%.*g` does, an exact
+/// tie going to the even digit (`-6296.125` is `-6296.12`).
 pub fn round_sig(v: f64, digits: i32) -> f64 {
     if v == 0.0 || !v.is_finite() {
         return 0.0;
     }
-    let exponent = v.abs().log10().floor() as i32;
-    let scale = 10f64.powi(digits - 1 - exponent);
-    let r = (v * scale).round() / scale;
+    let r: f64 = format!("{:.*e}", (digits - 1).max(0) as usize, v).parse().unwrap_or(v);
     if r == 0.0 { 0.0 } else { r }
 }
 

@@ -394,7 +394,7 @@ fn newline(level: usize, out: &mut String) {
 /// dkjson's `isarray`: every key a positive integer, and not so sparse that
 /// the holes outnumber the values. A numeric `n` field counts as a length.
 /// Returns how many slots the array has.
-fn array_length(t: &Table) -> Option<usize> {
+pub(crate) fn array_length(t: &Table) -> Option<usize> {
     let (mut max, mut n, mut declared) = (0f64, 0usize, 0f64);
     for (key, value) in &t.map {
         match (key, value) {
@@ -417,7 +417,7 @@ fn array_length(t: &Table) -> Option<usize> {
 
 /// dkjson's `quotestring`: control characters, `"`, `\` and DEL escaped, plus
 /// the invisible and line-breaking code points JavaScript chokes on.
-fn quote(s: &str, out: &mut String) {
+pub(crate) fn quote(s: &str, out: &mut String) {
     out.push('"');
     for c in s.chars() {
         match c {

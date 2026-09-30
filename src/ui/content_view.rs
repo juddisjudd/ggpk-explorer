@@ -3242,16 +3242,27 @@ pub(crate) fn build_skill_graph_db(
     steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
     schema: &crate::dat::schema::Schema,
 ) -> Result<crate::ui::atlas_node_db::SkillGraphDatabase, String> {
-    let fetch = |path: &str| -> Result<Vec<u8>, String> {
-        let info = find_file_info_by_path(index, path)
-            .ok_or_else(|| format!("File not found in bundle index: {}", path))?;
-        extract_bundle_file_sync(info, index, reader, steam_loader)
-            .ok_or_else(|| format!("Failed to read file: {}", path))
+    let is_poe2 = crate::data_export::game_from_index(index).map(|g| g.is_poe2()).unwrap_or(true);
+    let fetch = |path: &str| {
+        find_file_info_by_path(index, path).and_then(|info| extract_bundle_file_sync(info, index, reader, steam_loader))
     };
-    let fetch_optional = |path: &str| -> Option<Vec<u8>> { fetch(path).ok() };
+    build_skill_graph_db_from(&fetch, schema, is_poe2, false)
+}
+
+/// `build_skill_graph_db` over any source of game files. `hardmode` reads
+/// PoE 1's passives as Ruthless has them.
+pub(crate) fn build_skill_graph_db_from(
+    fetch_file: &dyn Fn(&str) -> Option<Vec<u8>>,
+    schema: &crate::dat::schema::Schema,
+    is_poe2: bool,
+    hardmode: bool,
+) -> Result<crate::ui::atlas_node_db::SkillGraphDatabase, String> {
+    let fetch = |path: &str| -> Result<Vec<u8>, String> {
+        fetch_file(path).ok_or_else(|| format!("Could not read {}", path))
+    };
+    let fetch_optional = |path: &str| -> Option<Vec<u8>> { fetch_file(path) };
     // PoE 2 keeps its tables under `data/balance/` and its descriptions as
     // `.csd`; PoE 1 keeps both one level up.
-    let is_poe2 = crate::data_export::game_from_index(index).map(|g| g.is_poe2()).unwrap_or(true);
     let table = |name: &str| match is_poe2 {
         true => format!("data/balance/{}.datc64", name),
         false => format!("data/{}.datc64", name),
@@ -3312,6 +3323,7 @@ pub(crate) fn build_skill_graph_db(
         extra,
         schema,
         is_poe2,
+        hardmode,
     )?;
 
     let node_frames = match fetch_optional(&table("passiveskilltreenodeframeart")) {

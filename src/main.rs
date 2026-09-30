@@ -12,6 +12,7 @@ pub mod update;
 pub mod export;
 pub mod data_export;
 pub mod pob_export;
+pub mod pob_tree;
 pub mod skill_tree_export;
 pub mod parsers;
 pub mod adapters;
@@ -93,6 +94,13 @@ fn main() -> eframe::Result<()> {
         }
         Some("export-pob") => {
             if let Err(e) = cli::run_pob_export(&args[2..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some("export-tree") => {
+            if let Err(e) = cli::run_tree_export(&args[2..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }

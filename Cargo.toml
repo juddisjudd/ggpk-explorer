@@ -43,6 +43,7 @@ regex = "1.12"
 serde_with = "3.18"
 anyhow = "1.0"
 webp = "0.3"
+zstd = "0.13"
 
 [build-dependencies]
 cc = "1.2"

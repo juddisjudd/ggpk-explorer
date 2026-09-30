@@ -112,15 +112,28 @@ pub struct TreeExportSource {
     pub reader: Option<Arc<GgpkReader>>,
     pub index: Arc<Index>,
     pub steam: Option<SteamBundleLoader>,
+    /// The patch CDN, for bundles the install does not have, or in place of
+    /// an install.
+    pub cdn: Option<crate::bundles::cdn::CdnBundleLoader>,
     pub schema: Schema,
     /// PoE 1's interface art lives in sheets; this says where each image sits.
     pub atlas: Option<crate::ui::ui_atlas::UiAtlas>,
 }
 
 impl TreeExportSource {
-    /// Reads the sheet descriptor up front, where the install has one.
     pub fn new(reader: Option<Arc<GgpkReader>>, index: Arc<Index>, steam: Option<SteamBundleLoader>, schema: Schema) -> Self {
-        let mut source = Self { reader, index, steam, schema, atlas: None };
+        Self::with_cdn(reader, index, steam, None, schema)
+    }
+
+    /// Reads the sheet descriptor up front, where the install has one.
+    pub fn with_cdn(
+        reader: Option<Arc<GgpkReader>>,
+        index: Arc<Index>,
+        steam: Option<SteamBundleLoader>,
+        cdn: Option<crate::bundles::cdn::CdnBundleLoader>,
+        schema: Schema,
+    ) -> Self {
+        let mut source = Self { reader, index, steam, cdn, schema, atlas: None };
         source.atlas = source
             .fetch(crate::ui::ui_atlas::ATLAS_PATH)
             .map(|bytes| crate::ui::ui_atlas::UiAtlas::parse(&crate::parsers::utils::decode_text_lossy(&bytes)))
@@ -142,7 +155,11 @@ impl TreeExportSource {
     }
 
     pub(crate) fn extract(&self, info: &FileInfo) -> Option<Vec<u8>> {
-        extract_bundle_file_sync(info, &self.index, self.reader.as_deref(), self.steam.as_ref())
+        extract_bundle_file_sync(info, &self.index, self.reader.as_deref(), self.steam.as_ref()).or_else(|| {
+            let data = self.cdn_bundle(info.bundle_index)?;
+            let start = info.file_offset as usize;
+            data.get(start..start.checked_add(info.file_size as usize)?).map(<[u8]>::to_vec)
+        })
     }
 
     pub(crate) fn fetch(&self, path: &str) -> Option<Vec<u8>> {
@@ -157,6 +174,16 @@ impl TreeExportSource {
 
     pub(crate) fn decompress_bundle(&self, bundle_index: u32) -> Option<Vec<u8>> {
         decompress_bundle(bundle_index, &self.index, self.reader.as_deref(), self.steam.as_ref())
+            .or_else(|| self.cdn_bundle(bundle_index))
+    }
+
+    /// One bundle from the patch CDN, decompressed.
+    fn cdn_bundle(&self, bundle_index: u32) -> Option<Vec<u8>> {
+        let info = self.index.bundles.get(bundle_index as usize)?;
+        let raw = self.cdn.as_ref()?.fetch_bundle(&info.name).ok()?;
+        let mut cursor = std::io::Cursor::new(raw);
+        let header = crate::bundles::bundle::Bundle::read_header(&mut cursor).ok()?;
+        header.decompress(&mut cursor).ok()
     }
 }
 
@@ -175,7 +202,7 @@ pub fn run_tree_export(
         export_tree(&source, &psg_path, &psg, db, &options, &out_dir, &tx)
     }));
     match result {
-        Ok(Ok(summary)) => {
+        Ok(Ok((summary, _))) => {
             let _ = tx.send(ExportStatus::Complete { count: summary.files, errors: 0, message: summary.message });
         }
         Ok(Err(e)) => {
@@ -199,7 +226,9 @@ pub struct ExportSummary {
 
 const STEPS: usize = 15;
 
-fn export_tree(
+/// Writes the export and hands back the finished `data.json`, with PoE 1's
+/// sheets listed in it.
+pub(crate) fn export_tree(
     source: &TreeExportSource,
     psg_path: &str,
     psg: &PsgFile,
@@ -207,7 +236,7 @@ fn export_tree(
     options: &TreeExportOptions,
     out_dir: &Path,
     tx: &Sender<ExportStatus>,
-) -> Result<ExportSummary, String> {
+) -> Result<(ExportSummary, J), String> {
     let mut step = 0usize;
     let mut progress = |msg: &str| {
         step += 1;
@@ -349,8 +378,8 @@ fn export_tree(
     }
 
     // PoE 1's readers take the sheets from data.json itself.
+    let mut data = tree.data.clone();
     if psg.is_poe1() {
-        let mut data = tree.data.clone();
         let mut order: Vec<&str> = Vec::new();
         for (name, _, _) in &sprite_jsons {
             if !order.contains(&name.as_str()) {
@@ -402,10 +431,11 @@ fn export_tree(
     }
 
     progress("Done");
-    Ok(ExportSummary {
+    let summary = ExportSummary {
         files,
         message: format!("Exported skill tree '{}' ({} nodes, {} sheets) to {}", tree.name, tree.node_count, sheet_jsons.len(), out_dir.display()),
-    })
+    };
+    Ok((summary, data))
 }
 
 // ── data.json ───────────────────────────────────────────────────────────
@@ -577,7 +607,14 @@ fn listed_ascendancies(db: &SkillGraphDatabase, character: usize) -> Vec<usize> 
 fn classes_json(db: &SkillGraphDatabase, tables: &tables::ExtraTables) -> (J, Vec<ClassSheet>) {
     let mut classes = Vec::new();
     let mut sheets = Vec::new();
-    for (ci, ch) in db.characters.iter().enumerate() {
+    // PoE 1's nodes name their class by its integer id, which is its place in
+    // this list.
+    let mut order: Vec<usize> = (0..db.characters.len()).collect();
+    if !db.is_poe2 {
+        order.sort_by_key(|&ci| db.characters[ci].integer_id);
+    }
+    for ci in order {
+        let ch = &db.characters[ci];
         let ascs = listed_ascendancies(db, ci);
         let mut o = J::obj();
         o.set("name", J::str(&ch.name));
@@ -608,10 +645,13 @@ fn classes_json(db: &SkillGraphDatabase, tables: &tables::ExtraTables) -> (J, Ve
                 e.set("image", J::str(&png_path(a.illustration.as_deref().unwrap_or(""))));
                 e.set("offsetX", J::num(ox));
                 e.set("offsetY", J::num(oy));
-                e.set("flavourText", J::str(&a.flavour_text));
-                e.set("flavourTextColour", J::str(&hex_colour(&a.flavour_text_colour)));
-                e.set("flavourTextSize", J::Int(a.flavour_text_size as i64));
-                e.set("flavourTextRect", rect_json(&a.coordinate_rect));
+                // PoE 1's export leaves the flavour out where there is none.
+                if db.is_poe2 || !a.flavour_text.is_empty() {
+                    e.set("flavourText", J::str(&a.flavour_text.replace("\r\n", "\n")));
+                    e.set("flavourTextColour", J::str(&hex_colour(&a.flavour_text_colour)));
+                    e.set("flavourTextSize", J::Int(a.flavour_text_size as i64));
+                    e.set("flavourTextRect", rect_json(&a.coordinate_rect));
+                }
                 if let Some(img) = &a.illustration {
                     images.push((format!("class{}:Class{}", ch.name, images.len()), img.clone()));
                 }
@@ -697,7 +737,33 @@ fn is_placeholder(info: &SkillGraphNodeInfo, db: &SkillGraphDatabase) -> bool {
 
 /// One node in the official layout. `calc` is `None` for override nodes,
 /// which have no position or links.
+/// The order GGG's PoE 1 export writes a node's keys in, read off every node
+/// of the 3.29 export (normal and Ruthless). Keys it never writes go before
+/// the position fields.
+const POE1_NODE_KEYS: [&str; 33] = [
+    "skill", "name", "icon", "isJewelSocket", "expansionJewel", "isKeystone", "isMastery", "inactiveIcon",
+    "activeIcon", "activeEffectImage", "isNotable", "isBlighted", "isProxy", "masteryEffects", "recipe",
+    "grantedStrength", "grantedDexterity", "grantedIntelligence", "ascendancyName", "grantedPassivePoints",
+    "isAscendancyStart", "isBloodline", "isMultipleChoice", "isMultipleChoiceOption", "stats", "classStartIndex",
+    "reminderText", "flavourText", "group", "orbit", "orbitIndex", "out", "in",
+];
+
 fn node_json(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCalc>, ctx: &NodeContext) -> J {
+    let node = node_fields(gid, info, calc, ctx);
+    match (ctx.is_poe1, node) {
+        (true, J::Obj(mut fields)) => {
+            let rank = |key: &str| {
+                let group = POE1_NODE_KEYS.iter().position(|k| *k == "group").unwrap_or(0) * 2;
+                POE1_NODE_KEYS.iter().position(|k| *k == key).map(|i| i * 2).unwrap_or(group - 1)
+            };
+            fields.sort_by_key(|(key, _)| rank(key));
+            J::Obj(fields)
+        }
+        (_, node) => node,
+    }
+}
+
+fn node_fields(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCalc>, ctx: &NodeContext) -> J {
     let mut o = J::obj();
     if let Some(info) = info.filter(|_| !ctx.is_poe1) {
         o.set("id", if is_placeholder(info, ctx.db) { J::Null } else { J::str(&info.id) });
@@ -1042,14 +1108,22 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
         let mut orbits: Vec<u32> = group.nodes.iter().map(|n| n.radius).collect();
         orbits.sort_unstable();
         orbits.dedup();
+        // PoE 1's export lists only the orbits up to 4; the 72-slot rings 5
+        // and 6 never appear in a group's list, though nodes sit on them.
+        if psg.is_poe1() {
+            orbits.retain(|&o| o < 5);
+        }
         let mut g = J::obj();
         g.set("x", J::num(group.x as f64));
         g.set("y", J::num(group.y as f64));
+        if psg.is_poe1() && group.is_proxy {
+            g.set("isProxy", J::Bool(true));
+        }
         g.set("orbits", J::ints(orbits.iter().map(|o| *o as i64)));
-        g.set("nodes", J::strs(group.nodes.iter().map(|n| n.skill_id.to_string())));
         if let Some(background) = poe1_group_background(psg, group) {
             g.set("background", background);
         }
+        g.set("nodes", J::strs(group.nodes.iter().map(|n| n.skill_id.to_string())));
         groups.set(&(gi + 1).to_string(), g);
     }
 
@@ -1123,7 +1197,9 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
     let mut icon_seen = HashSet::new();
     let mut mastery_images: Vec<String> = Vec::new();
     let mut mastery_icons: Vec<(String, String)> = Vec::new();
-    for gid in order.iter().copied().chain(seen.iter().copied()) {
+    // PoE 1 also sheets the passives a cluster jewel can add.
+    let pool = tables.expansion_pool.iter().copied().filter(|_| psg.is_poe1());
+    for gid in order.iter().copied().chain(seen.iter().copied()).chain(pool) {
         let Some(info) = info_of(gid) else { continue };
         let category = if info.is_keystone {
             "keystone"
@@ -1203,6 +1279,10 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
                         group_backgrounds.push((key, ch.start_background.clone()));
                     }
                 }
+                group_backgrounds.push((
+                    "startNode:PSStartNodeBackgroundInactive".to_string(),
+                    "Art/2DArt/UIImages/InGame/PassiveSkillScreenStartNodeBackgroundInactive".to_string(),
+                ));
             }
             false => {
                 for path in [&bg.small, &bg.medium, &bg.large] {
@@ -1287,10 +1367,10 @@ fn alternate_ascendancies(db: &SkillGraphDatabase) -> J {
             o.set("id", J::str(&d.id));
             o.set("name", J::str(&d.name));
             if !d.flavour_text.is_empty() {
-                o.set("flavourText", J::str(&d.flavour_text));
+                o.set("flavourText", J::str(&d.flavour_text.replace("\r\n", "\n")));
             }
             if !d.flavour_text_colour.is_empty() {
-                o.set("flavourTextColour", J::str(&d.flavour_text_colour));
+                o.set("flavourTextColour", J::str(&hex_colour(&d.flavour_text_colour)));
             }
             if !d.coordinate_rect.is_empty() {
                 o.set("flavourTextRect", rect_json(&d.coordinate_rect));
@@ -1328,7 +1408,9 @@ fn poe1_group_background(psg: &PsgFile, group: &crate::dat::psg::PsgGroup) -> Op
 /// itself and the class numbering from `Characters`.
 fn poe1_constants(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::ExtraTables) -> J {
     let mut classes = J::obj();
-    for character in &db.characters {
+    let mut characters: Vec<_> = db.characters.iter().collect();
+    characters.sort_by_key(|c| c.integer_id);
+    for character in characters {
         // PoE 1 names a character by its metadata path; the class key is its last part.
         let id = character.id.rsplit('/').next().unwrap_or_default();
         if !id.is_empty() {
@@ -1414,8 +1496,34 @@ fn frame_list(db: &SkillGraphDatabase, art_set: Option<&crate::ui::skill_tree_ar
     push("AttributeFrameUnallocated", crate::ui::psg_viewer::PLUS_FRAME_NORMAL, &mut out);
     push("AttributeFrameCanAllocate", PLUS_FRAME_CAN_ALLOCATE, &mut out);
     push("AttributeFrameAllocated", crate::ui::psg_viewer::PLUS_FRAME_ACTIVE, &mut out);
+    if !db.is_poe2 {
+        for (name, path) in POE1_SOCKET_FRAMES {
+            push(name, path, &mut out);
+        }
+    }
     out
 }
+
+/// Frames PoE 1's export sheets that no frame table names: a jewel socket,
+/// empty and filled, the abyss and cluster jewel sockets, and blighted
+/// notables. The UI images name them differently from the export.
+const POE1_SOCKET_FRAMES: [(&str, &str); 15] = [
+    ("JewelFrameUnallocated", "Art/2DArt/UIImages/InGame/PassiveSkillScreenJewelSocketNormal"),
+    ("JewelFrameCanAllocate", "Art/2DArt/UIImages/InGame/PassiveSkillScreenJewelSocketCanAllocate"),
+    ("JewelFrameAllocated", "Art/2DArt/UIImages/InGame/PassiveSkillScreenJewelSocketActive"),
+    ("JewelSocketAltNormal", "Art/2DArt/UIImages/InGame/PassiveSkillScreenJewelSocketAltNormal"),
+    ("JewelSocketAltCanAllocate", "Art/2DArt/UIImages/InGame/PassiveSkillScreenJewelSocketAltCanAllocate"),
+    ("JewelSocketAltActive", "Art/2DArt/UIImages/InGame/PassiveSkillScreenJewelSocketAltActive"),
+    ("BlightedNotableFrameUnallocated", "Art/2DArt/UIImages/InGame/PassiveSkillScreenBlightedNotableFrameNormal"),
+    ("BlightedNotableFrameCanAllocate", "Art/2DArt/UIImages/InGame/PassiveSkillScreenBlightedNotableFrameCanAllocate"),
+    ("BlightedNotableFrameAllocated", "Art/2DArt/UIImages/InGame/PassiveSkillScreenBlightedNotableFrameActive"),
+    ("JewelSocketClusterAltNormal1Small", "Art/2DArt/UIImages/InGame/JewelSocketClusterAltNormal1Small"),
+    ("JewelSocketClusterAltNormal1Medium", "Art/2DArt/UIImages/InGame/JewelSocketClusterAltNormal1Medium"),
+    ("JewelSocketClusterAltNormal1Large", "Art/2DArt/UIImages/InGame/JewelSocketClusterAltNormal1Large"),
+    ("JewelSocketClusterAltCanAllocate1Small", "Art/2DArt/UIImages/InGame/JewelSocketClusterAltCanAllocate1Small"),
+    ("JewelSocketClusterAltCanAllocate1Medium", "Art/2DArt/UIImages/InGame/JewelSocketClusterAltCanAllocate1Medium"),
+    ("JewelSocketClusterAltCanAllocate1Large", "Art/2DArt/UIImages/InGame/JewelSocketClusterAltCanAllocate1Large"),
+];
 
 fn viewer_extras(psg: &PsgFile, db: &SkillGraphDatabase, radii: &[f32; 10], group_art: Option<&crate::ui::skill_tree_art::GroupBackground>) -> J {
     let mut extras = J::obj();

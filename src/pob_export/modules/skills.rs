@@ -118,17 +118,17 @@ fn valid_skill_name(name: &str) -> bool {
 /// One line of `Art/UIImages1.txt` as `assetSheets.parseUIImages` reads it:
 /// the texture it sits in and four numbers PoB calls x, y, width and height.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct UiImage {
-    path: String,
-    x: Option<f64>,
-    y: Option<f64>,
-    width: Option<f64>,
-    height: Option<f64>,
+pub(crate) struct UiImage {
+    pub(crate) path: String,
+    pub(crate) x: Option<f64>,
+    pub(crate) y: Option<f64>,
+    pub(crate) width: Option<f64>,
+    pub(crate) height: Option<f64>,
 }
 
 /// `assetSheets.parseUIImages`: names and paths lower-cased, fields split on
 /// spaces and quotes.
-fn parse_ui_images(text: &str) -> HashMap<String, UiImage> {
+pub(crate) fn parse_ui_images(text: &str) -> HashMap<String, UiImage> {
     let mut out: HashMap<String, UiImage> = HashMap::new();
     for line in text.split(['\r', '\n']).filter(|l| !l.is_empty()) {
         let mut name = String::new();

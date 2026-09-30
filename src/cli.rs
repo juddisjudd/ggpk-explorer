@@ -81,6 +81,7 @@ USAGE:
     ggpk-explorer export <PATH> [OPTIONS]  Extract game files, e.g. Art/2DArt
     ggpk-explorer export-data [OPTIONS]    Write RePoE-style semantic JSON dumps
     ggpk-explorer export-pob [OPTIONS]     Write Path of Building's data files as pob-data JSON
+    ggpk-explorer export-tree [OPTIONS]    Write Path of Building's passive tree folders (src/TreeData)
     ggpk-explorer refit [OPTIONS]          Re-derive drifted table layouts from an earlier patch
     ggpk-explorer lint [OPTIONS]           Check the schema.s references and enums against the game files
 
@@ -117,6 +118,15 @@ EXPORT-POB OPTIONS:
     -l, --list             List module names and exit
     Plus --ggpk / --steam / --cdn / --schema / --flat / --version / --poe1 / --poe2 as above.
 
+EXPORT-TREE OPTIONS:
+    Path of Building's src/TreeData/<version>/ folders, built from the game
+    files: 0_X for PoE 2 (tree.lua, tree.json, .dds.zst sheets, orbit PNGs),
+    3_X and 3_X_ruthless for PoE 1 (tree.lua, sprites.lua, sheet images).
+    -o, --out <DIR>        Output folder (default: ./pob-tree)
+        --only <A,B,...>   Run only these modules (tree, ruthless)
+    -l, --list             List module names and exit
+    Plus --ggpk / --steam / --cdn / --schema / --flat / --version / --poe1 / --poe2 as above.
+
 LINT OPTIONS:
         --schema <FILE>    Schema to check (default: the cached schema.min.json)
         --suggest          Also rank target tables for references the schema leaves untargeted
@@ -140,6 +150,8 @@ enum DataKind {
     Semantic,
     /// Path of Building's `src/Data` files, as pob-data JSON.
     Pob,
+    /// Path of Building's `src/TreeData` folders.
+    Tree,
 }
 
 /// Parses `export-data` arguments and runs the export, reporting to stdout.
@@ -152,6 +164,11 @@ pub fn run_pob_export(args: &[String]) -> Result<(), String> {
     run_export_command(args, DataKind::Pob)
 }
 
+/// Parses `export-tree` arguments and writes Path of Building's tree folders.
+pub fn run_tree_export(args: &[String]) -> Result<(), String> {
+    run_export_command(args, DataKind::Tree)
+}
+
 fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
     use crate::data_export::{source::GameFiles, DataExportOptions};
     use std::path::PathBuf;
@@ -160,6 +177,7 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
     let mut out = PathBuf::from(match kind {
         DataKind::Semantic => "data",
         DataKind::Pob => "pob-data",
+        DataKind::Tree => "pob-tree",
     });
     let mut ggpk: Option<String> = None;
     let mut steam: Option<String> = None;
@@ -195,7 +213,7 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
             }
             "--ls" => ls = Some(value(&mut i)?),
             "--cat" => cat = Some(value(&mut i)?),
-            "--images" | "--trade-stats" | "--strip-null" if kind == DataKind::Pob => {
+            "--images" | "--trade-stats" | "--strip-null" if kind != DataKind::Semantic => {
                 return Err(format!("{} applies to export-data only", arg))
             }
             "--images" => options.images = true,
@@ -209,6 +227,7 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
                 let names = match kind {
                     DataKind::Semantic => crate::data_export::module_names(),
                     DataKind::Pob => crate::pob_export::module_names(),
+                    DataKind::Tree => crate::pob_tree::module_names(),
                 };
                 for name in names {
                     println!("{}", name);
@@ -241,8 +260,9 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
     });
 
     // The patch names the output folder: taken from the CDN version when one
-    // was asked for, otherwise from the install's own client log.
-    if options.version.is_none() && !options.flat {
+    // was asked for, otherwise from the install's own client log. A tree is
+    // named after its patch even in a flat export.
+    if options.version.is_none() && (!options.flat || kind == DataKind::Tree) {
         options.version = match &cdn {
             Some(cdn) => Some(cdn.patch_version().to_string()),
             None => install_root(ggpk.as_deref(), steam.as_deref())
@@ -290,6 +310,7 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
     std::thread::spawn(move || match kind {
         DataKind::Semantic => crate::data_export::run(files, schema, game.is_poe2(), out, options, tx),
         DataKind::Pob => crate::pob_export::run(files, schema, game.is_poe2(), out, options, tx),
+        DataKind::Tree => crate::pob_tree::run(files, schema, game.is_poe2(), out, options, tx),
     });
 
     let mut failed = 0;

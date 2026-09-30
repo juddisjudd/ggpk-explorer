@@ -354,15 +354,16 @@ pub fn load(source: &TreeExportSource, db: &SkillGraphDatabase, psg_path: &str) 
             }
         }
     };
+    // GGG lists the notables and keystones before the small passives.
+    if let Some(t) = open(source, db, "PassiveTreeExpansionSpecialSkills") {
+        for row in t.rows() {
+            push(t.row_ref(&row, t.pick(&["PassiveSkill", "PassiveSkillsKey"])).and_then(gid), &mut pool);
+        }
+    }
     if let Some(t) = open(source, db, "PassiveTreeExpansionSkills") {
         for row in t.rows() {
             push(t.row_ref(&row, t.pick(&["PassiveSkill", "PassiveSkillsKey"])).and_then(gid), &mut pool);
             push(t.row_ref(&row, t.pick(&["Mastery_PassiveSkill", "Mastery_PassiveSkillsKey"])).and_then(gid), &mut pool);
-        }
-    }
-    if let Some(t) = open(source, db, "PassiveTreeExpansionSpecialSkills") {
-        for row in t.rows() {
-            push(t.row_ref(&row, t.pick(&["PassiveSkill", "PassiveSkillsKey"])).and_then(gid), &mut pool);
         }
     }
     out.expansion_pool = pool;
