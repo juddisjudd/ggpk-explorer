@@ -176,6 +176,46 @@ const EXTRA_IMAGES: [(f64, f64, &str); 6] = [
     (1704.07, -3799.71, "Art/2DArt/BaseClassIllustrations/DexInt.png"),
 ];
 
+/// Every table the web export reads. It reads them without the fit check, so
+/// they are checked here first: a patch that moved one stops the run rather
+/// than letting it read the wrong bytes.
+const TABLES: [&str; 34] = [
+    "Ascendancy",
+    "AscendancyPassiveSkillOverrides",
+    "AtlasPassiveSkillSubTrees",
+    "BaseItemTypes",
+    "BlightCraftingItems",
+    "BlightCraftingRecipes",
+    "BlightCraftingResults",
+    "BuffDefinitions",
+    "BuffTemplates",
+    "Characters",
+    "ClassPassiveSkillOverrides",
+    "Descendancy",
+    "ItemVisualIdentity",
+    "PassiveJewelRadiiArt",
+    "PassiveJewelSlots",
+    "PassiveSkillMasteryEffects",
+    "PassiveSkillMasteryGroups",
+    "PassiveSkills",
+    "PassiveSkillTreeConnectionArt",
+    "PassiveSkillTreeGroupBackgroundArt",
+    "PassiveSkillTreeMasteryArt",
+    "PassiveSkillTreeNodeFrameArt",
+    "PassiveSkillTreeUIArt",
+    "PassiveSkillTreeUIArtAscendancy",
+    "PassiveSkillTrees",
+    "PassiveSkillVariantTypes",
+    "PassiveSkillVariants",
+    "PassiveTreeDecorators",
+    "PassiveTreeExpansionSkills",
+    "PassiveTreeExpansionSpecialSkills",
+    "ReminderText",
+    "SkillGems",
+    "Stats",
+    "UIArtAscendancy",
+];
+
 /// `tree.lua`'s top-level keys in the order GGG's `data.json` has them.
 const KEY_ORDER: [&str; 13] = [
     "tree",
@@ -292,6 +332,11 @@ pub fn write(ctx: &Ctx, version: &str, ruthless: bool) -> Result<(), String> {
 }
 
 fn build(ctx: &Ctx, dir: &Path, staging: &Path, ruthless: bool) -> Result<(), String> {
+    for name in TABLES {
+        if ctx.rr.table(name).is_some() {
+            ctx.table(name)?;
+        }
+    }
     let files = ctx.files;
     let source = TreeExportSource::with_cdn(
         files.reader.clone(),

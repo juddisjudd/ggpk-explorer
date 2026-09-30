@@ -16,9 +16,16 @@ fn same_slot(a: &Table, b: &Table) -> bool {
     a.name.eq_ignore_ascii_case(&b.name) && a.valid_for == b.valid_for
 }
 
+/// Points every run at another overrides file, so an unattended export can
+/// keep its re-fitted layouts apart from the GUI's and from the other game's.
+pub const PATH_ENV: &str = "GGPK_EXPLORER_OVERRIDES";
+
 impl Overrides {
     pub fn default_path() -> PathBuf {
-        crate::settings::AppSettings::get_app_data_dir().join(FILE_NAME)
+        match std::env::var_os(PATH_ENV) {
+            Some(path) if !path.is_empty() => PathBuf::from(path),
+            _ => crate::settings::AppSettings::get_app_data_dir().join(FILE_NAME),
+        }
     }
 
     /// A missing file is an empty set; an unreadable one is reported and treated as empty.

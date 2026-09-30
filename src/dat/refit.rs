@@ -125,7 +125,9 @@ fn find_id_offset(old: &DatReader, old_id_offset: usize, new: &DatReader) -> Opt
             (hits, offset)
         })
         .filter(|(hits, _)| *hits >= 8)
-        .max_by_key(|(hits, _)| *hits)
+        // Other string columns can name the same ids (a parent row, a list read
+        // as a string); on a tie the column nearest the old id wins.
+        .max_by_key(|&(hits, offset)| (hits, std::cmp::Reverse(offset.abs_diff(old_id_offset))))
         .map(|(_, offset)| offset)
 }
 

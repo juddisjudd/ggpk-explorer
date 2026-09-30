@@ -134,10 +134,16 @@ LINT OPTIONS:
 
 REFIT OPTIONS:
         --old <VERSION>    The patch to carry column names from, read over the CDN (required)
+        --cdn <VERSION>    Read the new patch from the CDN too, instead of an install
         --table <A,B,..>   Re-fit only these tables (default: the ones this patch broke)
         --all              Re-fit every table in the schema, not just the broken ones
         --write            Store the result in schema_overrides.json
+        --strict           Fail unless every table re-fits cleanly with every column placed
+        --old-dir <DIR>    Read the older patch's tables from a --save folder, not the CDN
+        --save <DIR>       Only write this patch's tables to DIR, for a later --old-dir
+        --poe1 / --poe2    Which game (default: the one --cdn or --old names)
         --ggpk / --steam / --schema as above
+    GGPK_EXPLORER_OVERRIDES=<FILE> keeps the overrides in that file instead of the app's.
     -l, --list             List module names and exit
         --ls <PREFIX>      List indexed game files under a path prefix and exit
         --cat <PATH>       Write one game file to stdout (text) and exit
@@ -643,6 +649,11 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
     let mut ggpk: Option<String> = None;
     let mut steam: Option<String> = None;
     let mut schema_path: Option<String> = None;
+    let mut cdn_version: Option<String> = None;
+    let mut requested_game: Option<Game> = None;
+    let mut strict = false;
+    let mut save_dir: Option<std::path::PathBuf> = None;
+    let mut old_dir: Option<std::path::PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -653,6 +664,12 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
         };
         match arg {
             "--old" => old_version = Some(value(&mut i)?),
+            "--cdn" => cdn_version = Some(value(&mut i)?),
+            "--poe1" => requested_game = Some(Game::Poe1),
+            "--poe2" => requested_game = Some(Game::Poe2),
+            "--strict" => strict = true,
+            "--save" => save_dir = Some(value(&mut i)?.into()),
+            "--old-dir" => old_dir = Some(value(&mut i)?.into()),
             "--table" => only.extend(value(&mut i)?.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty())),
             "--ggpk" => ggpk = Some(value(&mut i)?),
             "--steam" => steam = Some(value(&mut i)?),
@@ -668,38 +685,72 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
         i += 1;
     }
 
-    let old_version = old_version.ok_or(
-        "refit needs --old <VERSION>: the patch to learn the layout from, e.g. --old 4.5.4.11",
-    )?;
+    if save_dir.is_none() && old_version.is_none() {
+        return Err("refit needs --old <VERSION>: the patch to learn the layout from, e.g. --old 4.5.4.11".into());
+    }
     let settings = AppSettings::load();
     let schema = load_schema(schema_path.or_else(|| settings.schema_local_path.clone()))?;
 
-    let ggpk = ggpk.or_else(|| if steam.is_some() { None } else { settings.ggpk_path.clone() });
-    let steam = steam.or_else(|| if ggpk.is_some() { None } else { settings.steam_path.clone() });
-    let (reader, steam_loader, index) = open_source(ggpk, steam, None, Game::Poe2)?;
-    let new_files = GameFiles::new(reader, Arc::new(index), steam_loader, None);
+    let game = resolve_game(requested_game, None, None, cdn_version.as_deref().or(old_version.as_deref()));
+    let (dir, is_poe2) = match game {
+        Game::Poe2 => ("data/balance/", true),
+        Game::Poe1 => ("data/", false),
+    };
+    let from_install = cdn_version.is_none();
+    let ggpk = ggpk.or_else(|| if steam.is_some() || !from_install { None } else { settings.ggpk_path_for(game).cloned() });
+    let steam = steam.or_else(|| if ggpk.is_some() || !from_install { None } else { settings.steam_path_for(game).cloned() });
+    let new_cdn = cdn_version.map(|v| crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&v)));
+    let (reader, steam_loader, index) = open_source(ggpk, steam, new_cdn.as_ref(), game)?;
+    let new_files = GameFiles::new(reader, Arc::new(index), steam_loader, new_cdn);
 
-    println!("Reading patch {} from the CDN to compare against", old_version);
-    let cdn = crate::bundles::cdn::CdnBundleLoader::new(
-        &AppSettings::file_cache_dir(Game::Poe2),
-        Some(&old_version),
-    );
-    let old_index = cdn.fetch_index().map_err(|e| format!("Failed to fetch the CDN index: {}", e))?;
-    let old_files = GameFiles::new(None, Arc::new(old_index), None, Some(cdn));
+    // The CDN drops a patch once the next one ships, so an unattended run
+    // keeps each patch's tables to refit the next one against.
+    if let Some(save) = save_dir {
+        let paths: Vec<String> = new_files
+            .list_dir(dir)
+            .into_iter()
+            .filter(|p| {
+                let rest = &p.to_ascii_lowercase()[dir.len()..];
+                !rest.contains('/') && rest.ends_with(".datc64")
+            })
+            .collect();
+        let tables = new_files.fetch_many(&paths);
+        std::fs::create_dir_all(&save).map_err(|e| format!("{}: {}", save.display(), e))?;
+        for (path, bytes) in &tables {
+            let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+            std::fs::write(save.join(&name), bytes).map_err(|e| format!("{}: {}", name, e))?;
+        }
+        println!("Saved {} table(s) to {}", tables.len(), save.display());
+        return Ok(());
+    }
+    let old_version = old_version.unwrap_or_default();
+
+    let old_files: Box<dyn FileSource> = match old_dir {
+        Some(dir) => {
+            println!("Reading patch {} from {} to compare against", old_version, dir.display());
+            Box::new(SavedTables(dir))
+        }
+        None => {
+            println!("Reading patch {} from the CDN to compare against", old_version);
+            let cdn = crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&old_version));
+            let old_index = cdn.fetch_index().map_err(|e| format!("Failed to fetch the CDN index: {}", e))?;
+            Box::new(GameFiles::new(None, Arc::new(old_index), None, Some(cdn)))
+        }
+    };
 
     // Which tables to work on: the ones this patch broke, unless told otherwise.
     let mut names: Vec<String> = Vec::new();
     if !only.is_empty() {
         names = only;
     } else {
-        for path in new_files.list_dir("data/balance/") {
+        for path in new_files.list_dir(dir) {
             let lower = path.to_ascii_lowercase();
-            let Some(rest) = lower.strip_prefix("data/balance/") else { continue };
+            let Some(rest) = lower.strip_prefix(dir) else { continue };
             if rest.contains('/') || !rest.ends_with(".datc64") {
                 continue;
             }
             let stem = rest.trim_end_matches(".datc64");
-            let Some(def) = schema.find_table(stem, true) else { continue };
+            let Some(def) = schema.find_table(stem, is_poe2) else { continue };
             let Some(bytes) = new_files.fetch(&lower) else { continue };
             let Ok(dat) = crate::dat::reader::DatReader::new(bytes, &lower) else { continue };
             if dat.row_count < 4 {
@@ -720,14 +771,18 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
 
     let mut overrides = crate::dat::overrides::Overrides::load(&crate::dat::overrides::Overrides::default_path());
     let mut written = 0;
+    // Tables left as broken as they were, or with columns no longer placed.
+    let mut unresolved: Vec<&str> = Vec::new();
     for name in &names {
-        let Some(def) = schema.find_table(name, true) else {
+        let Some(def) = schema.find_table(name, is_poe2) else {
             println!("{}: not in the schema, so there are no names to carry", name);
+            unresolved.push(name);
             continue;
         };
-        let file = format!("data/balance/{}.datc64", name.to_ascii_lowercase());
+        let file = format!("{}{}.datc64", dir, name.to_ascii_lowercase());
         let (Some(old_bytes), Some(new_bytes)) = (old_files.fetch(&file), new_files.fetch(&file)) else {
             println!("{}: not in both patches", name);
+            unresolved.push(name);
             continue;
         };
         let (old_dat, new_dat) = (
@@ -746,6 +801,7 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
                     false => "",
                 }
             );
+            unresolved.push(name);
             continue;
         }
         match crate::dat::refit::carry_across_patch(&old_dat, def, &new_dat) {
@@ -774,6 +830,9 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
                     );
                 }
                 let after = crate::dat::analysis::check_fit(&new_dat, &report.table, 40);
+                if after.is_broken() || !report.lost.is_empty() {
+                    unresolved.push(name);
+                }
                 match after.is_broken() {
                     true => println!("  ! the re-fitted layout still reads impossible values: {}", after.summary()),
                     false => {
@@ -786,7 +845,10 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
                 }
                 println!();
             }
-            Err(e) => println!("{}: {}\n", name, e),
+            Err(e) => {
+                println!("{}: {}\n", name, e);
+                unresolved.push(name);
+            }
         }
     }
 
@@ -799,7 +861,20 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
     } else if written == 0 {
         println!("Re-run with --write to store these layouts as schema overrides.");
     }
+    if strict && !unresolved.is_empty() {
+        return Err(format!("{} table(s) could not be re-fitted in full: {}", unresolved.len(), unresolved.join(", ")));
+    }
     Ok(())
+}
+
+/// Tables a `refit --save` wrote, read back as the older patch.
+struct SavedTables(std::path::PathBuf);
+
+impl crate::dat::relational::FileSource for SavedTables {
+    fn fetch(&self, path: &str) -> Option<Vec<u8>> {
+        let name = path.rsplit('/').next()?.to_ascii_lowercase();
+        std::fs::read(self.0.join(name)).ok()
+    }
 }
 
 /// Parses `lint` arguments: checks the schema's own claims against the game

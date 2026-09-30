@@ -70,7 +70,7 @@ The same binary runs without the GUI:
 | `ggpk-explorer refit --old 4.5.4.11 --write` | Rebuild the table layouts a patch broke, using the patch before it. |
 | `ggpk-explorer lint` | Check the schema's foreign keys and enum indices against the game files. |
 
-`lint --schema <file>` checks a candidate schema, which is the way to test a dat-schema change before proposing it. `export-data --ls <prefix>` lists indexed paths and `--cat <path>` prints one file, which is the quickest way to check a format by hand. Pass `--help` to any subcommand for its full options.
+`lint --schema <file>` checks a candidate schema, which is the way to test a dat-schema change before proposing it. `refit` runs without an install too: `--cdn <patch>` reads the new patch from the CDN, and since the CDN only serves recent patches, `--save <dir>` keeps a patch's tables for `--old-dir <dir>` to refit the next one against. `--strict` fails unless every table re-fits with every column placed, and `GGPK_EXPLORER_OVERRIDES=<file>` keeps the result out of the app's own overrides. `export-data --ls <prefix>` lists indexed paths and `--cat <path>` prints one file, which is the quickest way to check a format by hand. Pass `--help` to any subcommand for its full options.
 
 ### UI
 - Collapsible sidebar, resizable panels.
