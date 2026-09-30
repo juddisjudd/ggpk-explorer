@@ -35,15 +35,15 @@ impl Module {
     }
 }
 
-const fn module(name: &'static str, summary: &'static str, run: ModuleFn) -> Module {
+pub const fn module(name: &'static str, summary: &'static str, run: ModuleFn) -> Module {
     Module { name, summary, run, only: None }
 }
 
-const fn poe2_only(name: &'static str, summary: &'static str, run: ModuleFn, reason: &'static str) -> Module {
+pub const fn poe2_only(name: &'static str, summary: &'static str, run: ModuleFn, reason: &'static str) -> Module {
     Module { name, summary, run, only: Some((Game::Poe2, reason)) }
 }
 
-const fn poe1_only(name: &'static str, summary: &'static str, run: ModuleFn, reason: &'static str) -> Module {
+pub const fn poe1_only(name: &'static str, summary: &'static str, run: ModuleFn, reason: &'static str) -> Module {
     Module { name, summary, run, only: Some((Game::Poe1, reason)) }
 }
 

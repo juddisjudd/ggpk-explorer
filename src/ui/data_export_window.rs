@@ -1,5 +1,6 @@
-//! Options for the semantic data export: which dumps to write, whether to
-//! pull the art with them, and where they land.
+//! Options for the data exports: which dumps to write, whether to pull the
+//! art with them, and where they land. One dialog serves both the RePoE-style
+//! dumps and Path of Building's data files.
 
 use crate::data_export::DataExportOptions;
 use crate::settings::Game;
@@ -15,7 +16,26 @@ struct ModuleChoice {
     skipped: Option<&'static str>,
 }
 
+/// Which export the dialog configures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportKind {
+    /// RePoE-style dumps, one per game concept.
+    Semantic,
+    /// Path of Building's `src/Data` files, as pob-data JSON.
+    Pob,
+}
+
+impl ExportKind {
+    fn registry(self) -> Vec<crate::data_export::modules::Module> {
+        match self {
+            ExportKind::Semantic => crate::data_export::registry(),
+            ExportKind::Pob => crate::pob_export::registry(),
+        }
+    }
+}
+
 pub struct DataExportWindow {
+    kind: ExportKind,
     open: bool,
     /// Which game the open install is, so dumps the other game owns are shown as such.
     game: Game,
@@ -33,10 +53,18 @@ pub struct DataExportWindow {
 
 impl Default for DataExportWindow {
     fn default() -> Self {
+        Self::new(ExportKind::Semantic)
+    }
+}
+
+impl DataExportWindow {
+    pub fn new(kind: ExportKind) -> Self {
         Self {
+            kind,
             open: false,
             game: Game::default(),
-            modules: crate::data_export::registry()
+            modules: kind
+                .registry()
                 .into_iter()
                 .map(|m| ModuleChoice { name: m.name, summary: m.summary, on: true, skipped: None })
                 .collect(),
@@ -47,16 +75,14 @@ impl Default for DataExportWindow {
             version: None,
         }
     }
-}
 
-impl DataExportWindow {
     pub fn open_with(&mut self, version: Option<String>, game: Game) {
         self.open = true;
         self.version = version;
         self.game = game;
         // Every dump this game writes starts ticked: a dump greyed out for the
         // other game must not stay unticked once it applies again.
-        for (module, choice) in crate::data_export::registry().into_iter().zip(&mut self.modules) {
+        for (module, choice) in self.kind.registry().into_iter().zip(&mut self.modules) {
             choice.skipped = module.skip_reason(game);
             choice.on = choice.skipped.is_none();
         }
@@ -78,11 +104,11 @@ impl DataExportWindow {
             } else {
                 self.available().filter(|m| m.on).map(|m| m.name.to_string()).collect()
             },
-            images: self.images,
-            trade_stats: self.trade_stats,
+            images: self.images && self.kind == ExportKind::Semantic,
+            trade_stats: self.trade_stats && self.kind == ExportKind::Semantic,
             version: self.versioned.then(|| self.version.clone()).flatten(),
             flat: !self.versioned,
-            strip_null: self.strip_null,
+            strip_null: self.strip_null && self.kind == ExportKind::Semantic,
         }
     }
 
@@ -99,7 +125,18 @@ impl DataExportWindow {
         let mut confirmed = false;
         let mut should_close = false;
 
-        egui::Window::new("Export Game Data")
+        let (title, blurb) = match self.kind {
+            ExportKind::Semantic => (
+                "Export Game Data",
+                "Joined JSON for mods, skills, base items and stat text — the shape RePoE publishes.",
+            ),
+            ExportKind::Pob => (
+                "Export PoB Data",
+                "Path of Building's data files — bases, skills, gems, mods, minions, stat descriptions —                  as the JSON repoe-fork publishes as pob-data. Files PoB writes by hand are listed in                  export_report.json.",
+            ),
+        };
+        let kind = self.kind;
+        egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
@@ -113,13 +150,7 @@ impl DataExportWindow {
                     egui::Color32::from_rgb(80, 80, 90)
                 };
 
-                ui.label(
-                    egui::RichText::new(
-                        "Joined JSON for mods, skills, base items and stat text — the shape RePoE publishes.",
-                    )
-                    .size(11.5)
-                    .color(muted),
-                );
+                ui.label(egui::RichText::new(blurb).size(11.5).color(muted));
                 let skipped = self.modules.len() - self.available().count();
                 let reading = match skipped {
                     0 => format!("Reading {}", self.game.label()),
@@ -148,26 +179,28 @@ impl DataExportWindow {
                     }
                 }
 
-                ui.separator();
-                modal_section(ui, "EXTRAS");
-                ui.checkbox(&mut self.images, "Include item, skill and buff icons")
-                    .on_hover_text(
-                        "Exports the art the dumps point at, as PNG and WebP under the same paths \
-                         the game uses. About 5,000 images, and roughly a minute.",
-                    );
-                ui.checkbox(&mut self.trade_stats, "Add trade site search ids to stat text")
-                    .on_hover_text(
-                        "Looks each stat's wording up on the official trade site and records the ids \
-                         it searches under, so a mod can be turned into a trade filter. \
-                         Matches about 400 stats; needs the site to be reachable.",
-                    );
-                ui.checkbox(&mut self.strip_null, "Leave out keys with no value")
-                    .on_hover_text(
-                        "Drops every null from the JSON, so an entry lists only what it has — an \
-                         amulet stops carrying the 28 weapon and armour fields it has no use for. \
-                         Halves base_items.json and takes about 14% off the whole export. Off by \
-                         default, because the published files keep the nulls.",
-                    );
+                if kind == ExportKind::Semantic {
+                    ui.separator();
+                    modal_section(ui, "EXTRAS");
+                    ui.checkbox(&mut self.images, "Include item, skill and buff icons")
+                        .on_hover_text(
+                            "Exports the art the dumps point at, as PNG and WebP under the same paths \
+                             the game uses. About 5,000 images, and roughly a minute.",
+                        );
+                    ui.checkbox(&mut self.trade_stats, "Add trade site search ids to stat text")
+                        .on_hover_text(
+                            "Looks each stat's wording up on the official trade site and records the ids \
+                             it searches under, so a mod can be turned into a trade filter. \
+                             Matches about 400 stats; needs the site to be reachable.",
+                        );
+                    ui.checkbox(&mut self.strip_null, "Leave out keys with no value")
+                        .on_hover_text(
+                            "Drops every null from the JSON, so an entry lists only what it has — an \
+                             amulet stops carrying the 28 weapon and armour fields it has no use for. \
+                             Halves base_items.json and takes about 14% off the whole export. Off by \
+                             default, because the published files keep the nulls.",
+                        );
+                }
 
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -271,6 +304,19 @@ mod tests {
         w.strip_null = true;
         assert_eq!(w.options().folder_name("4.5.4.11"), "4.5.4.11-stripped");
         assert!(w.options().strip_null);
+    }
+
+    #[test]
+    fn the_pob_dialog_lists_the_pob_modules_and_no_extras() {
+        let mut w = DataExportWindow::new(ExportKind::Pob);
+        w.images = true;
+        w.strip_null = true;
+        w.open_with(Some("4.5.5.3".into()), Game::Poe2);
+        assert!(w.modules.iter().any(|m| m.name == "stat_descriptions"));
+        assert!(w.modules.iter().any(|m| m.name == "mod_master" && m.skipped.is_some()));
+        let options = w.options();
+        assert!(!options.images && !options.strip_null, "the extras belong to the RePoE export");
+        assert!(options.only.is_empty());
     }
 
     #[test]

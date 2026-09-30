@@ -149,6 +149,8 @@ pub struct Ctx<'a> {
     tables: std::cell::RefCell<Vec<TableNote>>,
     /// The module running now, so a table note can say who asked.
     module: std::cell::Cell<&'static str>,
+    /// What the Path of Building export's modules share within a run.
+    pub pob: crate::pob_export::Caches,
 }
 
 /// A table a module could not use as asked, for `export_report.json`.
@@ -181,6 +183,7 @@ impl<'a> Ctx<'a> {
             csd: Default::default(),
             tables: Default::default(),
             module: std::cell::Cell::new(""),
+            pob: Default::default(),
         }
     }
 
@@ -372,11 +375,40 @@ pub fn run(
     options: DataExportOptions,
     tx: Sender<ExportStatus>,
 ) {
+    let kind = RunKind { file_suffix: ".json", unit: "data files", extra_report: Vec::new() };
+    run_with(registry(), kind, files, schema, is_poe2, out, options, tx);
+}
+
+/// How a run describes itself, beyond the modules it runs.
+pub struct RunKind {
+    /// Added to a module's name in progress messages; each RePoE dump is one
+    /// file named after its module.
+    pub file_suffix: &'static str,
+    /// What the completion message counts.
+    pub unit: &'static str,
+    /// Extra fields for `export_report.json`.
+    pub extra_report: Vec<(String, J)>,
+}
+
+/// Runs a set of modules over one install.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with(
+    registry: Vec<modules::Module>,
+    kind: RunKind,
+    files: GameFiles,
+    schema: crate::dat::schema::Schema,
+    is_poe2: bool,
+    out: PathBuf,
+    options: DataExportOptions,
+    tx: Sender<ExportStatus>,
+) {
+    let RunKind { file_suffix, unit, extra_report } = kind;
     let game = crate::settings::Game::from_is_poe2(is_poe2);
+    let known: Vec<&'static str> = registry.iter().map(|m| m.name).collect();
     // A dump the other game owns is always reported as skipped, whether or not
     // this run asked for it; `only` then picks from what is left.
     let (runnable, skipped_modules): (Vec<modules::Module>, Vec<modules::Module>) =
-        registry().into_iter().partition(|m| m.skip_reason(game).is_none());
+        registry.into_iter().partition(|m| m.skip_reason(game).is_none());
     let selected: Vec<modules::Module> = runnable
         .into_iter()
         .filter(|m| options.only.is_empty() || options.only.iter().any(|n| n == m.name))
@@ -384,7 +416,7 @@ pub fn run(
 
     if selected.is_empty() {
         let _ = tx.send(ExportStatus::Error(match skipped_modules.is_empty() {
-            true => format!("No modules matched {:?}. Known modules: {}", options.only, module_names().join(", ")),
+            true => format!("No modules matched {:?}. Known modules: {}", options.only, known.join(", ")),
             false => format!("None of {:?} exist for {}", options.only, game.label()),
         }));
         return;
@@ -413,7 +445,7 @@ pub fn run(
         let _ = tx.send(ExportStatus::Progress {
             current: i + 1,
             total,
-            filename: format!("{}.json", module.name),
+            filename: format!("{}{}", module.name, file_suffix),
         });
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (module.run)(&ctx)));
         let message = match outcome {
@@ -436,7 +468,7 @@ pub fn run(
     let _ = json::write_text(
         &out,
         "export_report.json",
-        &json::pretty(&report(&options, game, &selected, &skipped_modules, &failures, &ctx.table_notes())),
+        &json::pretty(&report(&options, game, &selected, &skipped_modules, &failures, &ctx.table_notes(), extra_report)),
     );
 
     let skipped = ctx.skipped_tables();
@@ -455,12 +487,13 @@ pub fn run(
     }
     let unusable = ctx.table_notes().iter().filter(|n| n.status != "missing" && n.status != "other game").count();
     let mut message = if failures.is_empty() {
-        format!("Wrote {} data files to {}.", total, out.display())
+        format!("Wrote {} {} to {}.", total, unit, out.display())
     } else {
         format!(
-            "Wrote {} of {} data files. {} failed (see data_export_errors.log).",
+            "Wrote {} of {} {}. {} failed (see data_export_errors.log).",
             total - failures.len(),
             total,
+            unit,
             failures.len()
         )
     };
@@ -480,6 +513,7 @@ fn report(
     skipped: &[modules::Module],
     failures: &[String],
     tables: &[TableNote],
+    extra: Vec<(String, J)>,
 ) -> J {
     use json::{text, Obj};
     let failed: Vec<(String, J)> =
@@ -492,7 +526,7 @@ fn report(
             .set("modules", json::strings(&n.modules))
             .build()
     });
-    Obj::new()
+    let mut report = Obj::new()
         .or_null("version", options.version.as_deref().map(text))
         .set("game", text(game.label()))
         .set("modules_run", json::strings(selected.iter().map(|m| m.name)))
@@ -501,8 +535,11 @@ fn report(
             J::Obj(skipped.iter().map(|m| (m.name.to_string(), text(m.skip_reason(game).unwrap_or_default()))).collect()),
         )
         .set("modules_failed", J::Obj(failed))
-        .set("tables", json::arr(notes))
-        .build()
+        .set("tables", json::arr(notes));
+    for (key, value) in extra {
+        report = report.set(&key, value);
+    }
+    report.build()
 }
 
 #[cfg(test)]

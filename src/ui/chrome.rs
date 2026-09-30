@@ -6,6 +6,7 @@ pub struct ChromeActions {
     pub open_settings: bool,
     pub open_diff: bool,
     pub export_data: bool,
+    pub export_pob: bool,
     pub open_about: bool,
     pub open_command_palette: bool,
     pub toggle_inspector: bool,
@@ -19,6 +20,7 @@ impl ChromeActions {
             open_settings: false,
             open_diff: false,
             export_data: false,
+            export_pob: false,
             open_about: false,
             open_command_palette: false,
             toggle_inspector: false,
@@ -303,6 +305,7 @@ impl AppChrome {
                         let mut open_ggpk = false;
                         let mut open_steam = false;
                         let mut export_data = false;
+                        let mut export_pob = false;
                         let mut toggle_inspector = false;
                         Self::nav_button_menu(ui, "File", |ui| {
                             if ui.button("Open GGPK...").clicked() {
@@ -324,6 +327,16 @@ impl AppChrome {
                                 export_data = true;
                                 ui.close_menu();
                             }
+                            if ui
+                                .button("Export PoB Data...")
+                                .on_hover_text(
+                                    "Write Path of Building's data files (bases, skills, gems, mods, minions,                                      stat descriptions) as pob-data JSON",
+                                )
+                                .clicked()
+                            {
+                                export_pob = true;
+                                ui.close_menu();
+                            }
                             ui.separator();
                             if ui.button("Toggle Inspector (Ctrl+I)").clicked() {
                                 toggle_inspector = true;
@@ -343,6 +356,9 @@ impl AppChrome {
                         }
                         if export_data {
                             actions.export_data = true;
+                        }
+                        if export_pob {
+                            actions.export_pob = true;
                         }
                         if toggle_inspector {
                             actions.toggle_inspector = true;

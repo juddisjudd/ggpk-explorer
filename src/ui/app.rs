@@ -48,6 +48,7 @@ pub struct ExplorerApp {
     pub settings_window: crate::ui::settings_window::SettingsWindow,
     pub export_window: crate::ui::export_window::ExportWindow,
     pub data_export_window: crate::ui::data_export_window::DataExportWindow,
+    pub pob_export_window: crate::ui::data_export_window::DataExportWindow,
     pub diff_window: crate::ui::diff_window::DiffWindow,
     pub show_about: bool,
     pub update_state: crate::update::UpdateState,
@@ -151,6 +152,9 @@ impl ExplorerApp {
             settings_window: crate::ui::settings_window::SettingsWindow::new(),
             export_window: crate::ui::export_window::ExportWindow::new(),
             data_export_window: Default::default(),
+            pob_export_window: crate::ui::data_export_window::DataExportWindow::new(
+                crate::ui::data_export_window::ExportKind::Pob,
+            ),
             diff_window: crate::ui::diff_window::DiffWindow::default(),
             show_about: false,
             update_state: crate::update::UpdateState::new(),
@@ -664,7 +668,7 @@ impl ExplorerApp {
 
     /// Opens the data export dialog, with the patch the install is on so it
     /// can offer to name the folder after it.
-    fn open_data_export(&mut self) {
+    fn open_data_export(&mut self, kind: crate::ui::data_export_window::ExportKind) {
         if self.bundle_index.is_none() {
             self.status_msg = "Open a GGPK or Steam folder first".to_string();
             return;
@@ -680,13 +684,21 @@ impl ExplorerApp {
             .ggpk_path_for(game)
             .or(self.settings.steam_path_for(game))
             .and_then(|path| std::path::Path::new(path).parent());
-        self.data_export_window.open_with(install_root.and_then(crate::data_export::detect_version), game);
+        let version = install_root.and_then(crate::data_export::detect_version);
+        match kind {
+            crate::ui::data_export_window::ExportKind::Semantic => self.data_export_window.open_with(version, game),
+            crate::ui::data_export_window::ExportKind::Pob => self.pob_export_window.open_with(version, game),
+        }
     }
 
     /// Writes the semantic JSON dumps (mods, skills, base items, stat
     /// translations) into a folder the user picks. Same work as the
     /// `export-data` subcommand, reported through the usual status channel.
-    fn start_data_export(&mut self, options: crate::data_export::DataExportOptions) {
+    fn start_data_export(
+        &mut self,
+        options: crate::data_export::DataExportOptions,
+        kind: crate::ui::data_export_window::ExportKind,
+    ) {
         let Some(index) = self.bundle_index.clone() else {
             self.status_msg = "Open a GGPK or Steam folder first".to_string();
             return;
@@ -696,7 +708,10 @@ impl ExplorerApp {
             return;
         };
         let Some(out_dir) = rfd::FileDialog::new()
-            .set_title("Choose a folder for the game data export")
+            .set_title(match kind {
+                crate::ui::data_export_window::ExportKind::Semantic => "Choose a folder for the game data export",
+                crate::ui::data_export_window::ExportKind::Pob => "Choose a folder for the PoB data export",
+            })
             .pick_folder()
         else {
             return;
@@ -713,8 +728,13 @@ impl ExplorerApp {
         self.export_status_rx = Some(rx);
         self.status_msg = "Starting game data export...".to_string();
         self.is_loading = true;
-        thread::spawn(move || {
-            crate::data_export::run(files, schema, is_poe2, out_dir, options, tx);
+        thread::spawn(move || match kind {
+            crate::ui::data_export_window::ExportKind::Semantic => {
+                crate::data_export::run(files, schema, is_poe2, out_dir, options, tx)
+            }
+            crate::ui::data_export_window::ExportKind::Pob => {
+                crate::pob_export::run(files, schema, is_poe2, out_dir, options, tx)
+            }
         });
     }
 
@@ -1080,11 +1100,18 @@ impl eframe::App for ExplorerApp {
             self.open_steam_dir(ctx);
         }
         if chrome_actions.export_data {
-            self.open_data_export();
+            self.open_data_export(crate::ui::data_export_window::ExportKind::Semantic);
+        }
+        if chrome_actions.export_pob {
+            self.open_data_export(crate::ui::data_export_window::ExportKind::Pob);
         }
         if self.data_export_window.show(ctx) {
             let options = self.data_export_window.options();
-            self.start_data_export(options);
+            self.start_data_export(options, crate::ui::data_export_window::ExportKind::Semantic);
+        }
+        if self.pob_export_window.show(ctx) {
+            let options = self.pob_export_window.options();
+            self.start_data_export(options, crate::ui::data_export_window::ExportKind::Pob);
         }
         if chrome_actions.open_settings {
             self.settings_window.open();

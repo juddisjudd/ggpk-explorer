@@ -54,6 +54,7 @@ The **Diff** button records a snapshot of the current bundle index and compares 
 - Progress tracking with per-file status for large folder exports.
 - **Skill trees**: The PSG viewer's **Export tree…** button writes a tree in GGG's official web export layout: `data.json`, WebP sprite sheets, and a standalone `index.html` viewer.
 - **Game data**: **File → Export Game Data…** writes RePoE-style JSON, one file per game concept rather than one per DAT table: `mods.json`, `skills.json`, `base_items.json`, `unique_details.json`, `stat_translations/`, and 27 others. A table whose layout no longer matches the schema is refused instead of exported wrong, and the run reports what it left out.
+- **Path of Building data**: **File → Export PoB Data…** writes Path of Building's data files — bases, skills and gems, mods, minions and spectres, stat descriptions and the rest — as the JSON repoe-fork publishes as pob-data, for either game. They are built from the installed patch by ports of PoB's own export scripts, so they do not wait for a PoB release. Files PoB writes by hand (ModCache, SkillStatMap, uniques, trade data) are listed in the report instead.
 
 ### Command Line
 The same binary runs without the GUI:
@@ -63,6 +64,7 @@ The same binary runs without the GUI:
 | `ggpk-explorer inspect` | Print GGPK and bundle index diagnostics. |
 | `ggpk-explorer export Art/2DArt -o out --textures png` | Extract a file or folder, converting as it goes. |
 | `ggpk-explorer export-data -o data` | Write the RePoE-style JSON dumps. |
+| `ggpk-explorer export-pob -o pob-data` | Write Path of Building's data files as pob-data JSON. |
 | `ggpk-explorer refit --old 4.5.4.11 --write` | Rebuild the table layouts a patch broke, using the patch before it. |
 | `ggpk-explorer lint` | Check the schema's foreign keys and enum indices against the game files. |
 

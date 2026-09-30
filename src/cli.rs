@@ -80,6 +80,7 @@ USAGE:
     ggpk-explorer inspect                  Print GGPK/bundle index diagnostics
     ggpk-explorer export <PATH> [OPTIONS]  Extract game files, e.g. Art/2DArt
     ggpk-explorer export-data [OPTIONS]    Write RePoE-style semantic JSON dumps
+    ggpk-explorer export-pob [OPTIONS]     Write Path of Building's data files as pob-data JSON
     ggpk-explorer refit [OPTIONS]          Re-derive drifted table layouts from an earlier patch
     ggpk-explorer lint [OPTIONS]           Check the schema.s references and enums against the game files
 
@@ -107,6 +108,15 @@ EXPORT-DATA OPTIONS:
         --version <VER>    Name the patch instead of reading it from the install
         --poe1 / --poe2    Which game to read (default: the one the install's log names, else PoE 2)
 
+EXPORT-POB OPTIONS:
+    Path of Building's src/Data files, built from the game files in the layout
+    repoe-fork publishes as pob-data: Bases/, Skills/, StatDescriptions/,
+    Mod*.json, Minions.json and so on, each as .json and .min.json.
+    -o, --out <DIR>        Output folder (default: ./pob-data)
+        --only <A,B,...>   Run only these modules
+    -l, --list             List module names and exit
+    Plus --ggpk / --steam / --cdn / --schema / --flat / --version / --poe1 / --poe2 as above.
+
 LINT OPTIONS:
         --schema <FILE>    Schema to check (default: the cached schema.min.json)
         --suggest          Also rank target tables for references the schema leaves untargeted
@@ -123,13 +133,34 @@ REFIT OPTIONS:
         --cat <PATH>       Write one game file to stdout (text) and exit
 ";
 
+/// Which set of files an export command writes.
+#[derive(Clone, Copy, PartialEq)]
+enum DataKind {
+    /// RePoE-style dumps, one per game concept.
+    Semantic,
+    /// Path of Building's `src/Data` files, as pob-data JSON.
+    Pob,
+}
+
 /// Parses `export-data` arguments and runs the export, reporting to stdout.
 pub fn run_data_export(args: &[String]) -> Result<(), String> {
+    run_export_command(args, DataKind::Semantic)
+}
+
+/// Parses `export-pob` arguments and writes Path of Building's data files.
+pub fn run_pob_export(args: &[String]) -> Result<(), String> {
+    run_export_command(args, DataKind::Pob)
+}
+
+fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
     use crate::data_export::{source::GameFiles, DataExportOptions};
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    let mut out = PathBuf::from("data");
+    let mut out = PathBuf::from(match kind {
+        DataKind::Semantic => "data",
+        DataKind::Pob => "pob-data",
+    });
     let mut ggpk: Option<String> = None;
     let mut steam: Option<String> = None;
     let mut cdn_version: Option<Option<String>> = None;
@@ -164,6 +195,9 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
             }
             "--ls" => ls = Some(value(&mut i)?),
             "--cat" => cat = Some(value(&mut i)?),
+            "--images" | "--trade-stats" | "--strip-null" if kind == DataKind::Pob => {
+                return Err(format!("{} applies to export-data only", arg))
+            }
             "--images" => options.images = true,
             "--trade-stats" => options.trade_stats = true,
             "--flat" => options.flat = true,
@@ -172,7 +206,11 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
             "--poe1" => requested_game = Some(Game::Poe1),
             "--poe2" => requested_game = Some(Game::Poe2),
             "-l" | "--list" => {
-                for name in crate::data_export::module_names() {
+                let names = match kind {
+                    DataKind::Semantic => crate::data_export::module_names(),
+                    DataKind::Pob => crate::pob_export::module_names(),
+                };
+                for name in names {
                     println!("{}", name);
                 }
                 return Ok(());
@@ -249,8 +287,9 @@ pub fn run_data_export(args: &[String]) -> Result<(), String> {
     }
     .display()
     .to_string();
-    std::thread::spawn(move || {
-        crate::data_export::run(files, schema, game.is_poe2(), out, options, tx);
+    std::thread::spawn(move || match kind {
+        DataKind::Semantic => crate::data_export::run(files, schema, game.is_poe2(), out, options, tx),
+        DataKind::Pob => crate::pob_export::run(files, schema, game.is_poe2(), out, options, tx),
     });
 
     let mut failed = 0;
