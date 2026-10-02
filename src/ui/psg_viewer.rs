@@ -1,27 +1,18 @@
 #![allow(dead_code)]
 use crate::dat::psg::PsgFile;
-use crate::ui::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo};
-use crate::ui::skill_tree_art::{FrameArt, NodeFrameKind, SkillTreeArtSet};
-use crate::ui::skill_tree_layout::{self, TreeLayout, ASCENDANCY_PLATE_SIZE, CLASS_ILLUSTRATION_SIZE, MAIN_CIRCLE_SIZE};
+use crate::skill_tree::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo};
+use crate::skill_tree::art::{
+    FrameArt, NodeFrameKind, SkillTreeArtSet, ATLAS_START, BREACH_BACKDROP, BREACH_START, MAIN_CIRCLE, MAIN_CIRCLE_ACTIVE, PLUS_FRAME_ACTIVE,
+    PLUS_FRAME_NORMAL,
+};
+use crate::skill_tree::geom;
+use crate::skill_tree::layout::{
+    self as skill_tree_layout, TreeLayout, ASCENDANCY_PLATE_SIZE, ATLAS_MAIN_TREE_BG_SCALE, ATLAS_SUBTREE_BG_MIN, ATLAS_SUBTREE_BG_SCALE,
+    CLASS_ILLUSTRATION_SIZE, MAIN_CIRCLE_SIZE,
+};
 use eframe::egui::{self, pos2, vec2, Color32, Pos2, Rect, Vec2};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-// Art the client hardcodes rather than referencing from a DAT row.
-pub const PLUS_FRAME_NORMAL: &str = "Art/2DArt/UIImages/InGame/PassiveSkillScreenPlusFrameNormal";
-pub const PLUS_FRAME_ACTIVE: &str = "Art/2DArt/UIImages/InGame/PassiveSkillScreenPlusFrameActive";
-pub const MAIN_CIRCLE: &str = "Art/2DArt/UIImages/InGame/PassiveTree/PassiveTreeMainCircle";
-pub const MAIN_CIRCLE_ACTIVE: &str = "Art/2DArt/UIImages/InGame/PassiveTree/PassiveTreeMainCircleActive";
-pub const ATLAS_START: &str = "Art/2DArt/UIImages/InGame/AtlasScreen/AtlasPassiveSkillScreenStart";
-pub const BREACH_BACKDROP: &str = "Art/2DArt/UIImages/InGame/BreachLeague/BreachTreePassiveBackground";
-pub const BREACH_START: &str = "Art/2DArt/UIImages/InGame/BreachLeague/BreachTreePassiveSkillScreenStartingPoint";
-
-/// `Art/2DArt/PassiveTree/*CurvesTogether.dds`: nine quarter-arcs (one per
-/// orbit radius, centred on the sheet's bottom-right corner) plus a straight
-/// strip along the top. Tiled for straight connectors, so it needs wrapping.
-pub fn is_connector_sheet(path: &str) -> bool {
-    path.to_ascii_lowercase().contains("2dart/passivetree/")
-}
 
 const SHEET_SIZE: f32 = 1436.0;
 /// Rows of the straight strip inside the sheet and the world height it is drawn at.
@@ -33,15 +24,6 @@ const ARC_BAND: f32 = 12.0;
 /// Frame textures are authored at one pixel per world unit (the official web
 /// tree draws them that way); icons sit inside at this fraction of the frame.
 const ICON_TO_FRAME: f32 = 0.69;
-/// How far the atlas main-tree backdrop reaches past its nodes. The painted
-/// machinery fills roughly 75% by 87% of the square texture, so a little over
-/// one covers the tree; the texture is square, so the scale is applied to the
-/// longer side and both axes get it.
-pub const ATLAS_MAIN_TREE_BG_SCALE: f32 = 1.15;
-/// The same, for the league subtree backdrops, which carry far more padding.
-pub const ATLAS_SUBTREE_BG_SCALE: f32 = 1.9;
-/// Smallest a subtree backdrop is drawn, for a subtree of one or two nodes.
-pub const ATLAS_SUBTREE_BG_MIN: f32 = 200.0;
 /// Fallback frame sizes (px) when a texture hasn't loaded yet.
 const FRAME_PASSIVE: f32 = 104.0;
 const FRAME_NOTABLE: f32 = 152.0;
@@ -317,7 +299,7 @@ impl<'a> PsgViewer<'a> {
                         if ui.small_button("Go to ascendancy").clicked() {
                             let layout = self.state.layout_for(self.psg);
                             if let Some(p) = layout.plates.iter().find(|p| p.ascendancy == a) {
-                                self.state.pan = -p.center.to_vec2() * self.state.zoom;
+                                self.state.pan = -ui_pos(p.center).to_vec2() * self.state.zoom;
                             }
                         }
                     }
@@ -400,6 +382,7 @@ impl<'a> PsgViewer<'a> {
                 if let Some(cursor) = ui.input(|i| i.pointer.latest_pos()) {
                     let mut best = f32::MAX;
                     for (&id, &pos) in &layout.node_pos {
+                        let pos = ui_pos(pos);
                         if layout.is_node_hidden(id) || asc_hidden(layout.node_ascendancy(id)) {
                             continue;
                         }
@@ -436,7 +419,7 @@ impl<'a> PsgViewer<'a> {
                 1 => {}
                 2 => {
                     if let Some(tex) = self.find_texture(BREACH_BACKDROP) {
-                        if let Some(bbox) = bbox_of(layout.node_pos.values()) {
+                        if let Some(bbox) = bbox_of(layout.node_pos.values().map(|&p| ui_pos(p))) {
                             // 9960×8728 painted backdrop at one px per world unit.
                             draw_image(&painter, &cv, tex, bbox.center(), vec2(9960.0, 8728.0), FULL);
                         }
@@ -461,13 +444,13 @@ impl<'a> PsgViewer<'a> {
                     for plate in &layout.plates {
                         let a = &db.ascendancies[plate.ascendancy];
                         if let Some(tex) = a.illustration.as_deref().and_then(|p| self.find_texture(p)) {
-                            draw_image(&painter, &cv, tex, plate.center, Vec2::splat(ASCENDANCY_PLATE_SIZE), tint_for(Some(plate.ascendancy)));
+                            draw_image(&painter, &cv, tex, ui_pos(plate.center), Vec2::splat(ASCENDANCY_PLATE_SIZE), tint_for(Some(plate.ascendancy)));
                         }
                     }
                 } else if self.psg.graph_type == 2 {
                     if let Some(tex) = self.find_texture(BREACH_START) {
                         for root in &self.psg.roots {
-                            if let Some(&pos) = layout.node_pos.get(root) {
+                            if let Some(pos) = node_pos(&layout, root) {
                                 draw_image(&painter, &cv, tex, pos, Vec2::splat(104.0), FULL);
                             }
                         }
@@ -480,7 +463,7 @@ impl<'a> PsgViewer<'a> {
                 if self.psg.graph_type == 1 {
                     self.draw_atlas_subtrees(&painter, &cv, db, &layout);
                     for d in &db.decorators {
-                        let Some(&pos) = layout.node_pos.get(&d.node) else { continue };
+                        let Some(pos) = node_pos(&layout, &d.node) else { continue };
                         let center = pos + vec2(d.x, d.y);
                         let angle = d.rotation_deg.to_radians();
                         for path in [&d.background, &d.blocked] {
@@ -542,7 +525,7 @@ impl<'a> PsgViewer<'a> {
                     let Some(tex) = self.find_texture(path) else { continue };
                     let [w, h] = tex.size();
                     let (w, h) = (w as f32, h as f32);
-                    let origin = pos2(group.x, group.y) + layout.group_offset[gi];
+                    let origin = pos2(group.x, group.y) + ui_vec(layout.group_offset[gi]);
                     let tint = tint_for(layout.group_ascendancy[gi]);
                     if half {
                         // Half images hold the top half; the bottom is the mirror.
@@ -567,7 +550,7 @@ impl<'a> PsgViewer<'a> {
                     }
                     for node in &group.nodes {
                         let Some(info) = db.nodes.get(&node.skill_id).filter(|i| i.is_mastery) else { continue };
-                        let Some(&pos) = layout.node_pos.get(&node.skill_id) else { continue };
+                        let Some(pos) = node_pos(&layout, &node.skill_id) else { continue };
                         let pattern = info.mastery_group.and_then(|g| db.mastery_effect_images.get(&g));
                         if let Some(tex) = pattern.and_then(|p| self.find_texture(p)) {
                             let tint = tint_for(layout.group_ascendancy[gi]);
@@ -600,7 +583,7 @@ impl<'a> PsgViewer<'a> {
             }
 
             for ((a, b), orbit_idx) in unique {
-                let (Some(&pa), Some(&pb)) = (layout.node_pos.get(&a), layout.node_pos.get(&b)) else { continue };
+                let (Some(pa), Some(pb)) = (node_pos(&layout, &a), node_pos(&layout, &b)) else { continue };
                 // Cluster "mastery" markers have no connectors; class starts
                 // connect from their roundel on the ring.
                 let (info_a, info_b) = (db.as_ref().and_then(|d| d.nodes.get(&a)), db.as_ref().and_then(|d| d.nodes.get(&b)));
@@ -614,8 +597,8 @@ impl<'a> PsgViewer<'a> {
                     class_ring && info_a.map(|i| !i.characters.is_empty()).unwrap_or(false),
                     class_ring && info_b.map(|i| !i.characters.is_empty()).unwrap_or(false),
                 );
-                let pa = if start_a { skill_tree_layout::class_start_line_end(pa, pb) } else { pa };
-                let pb = if start_b { skill_tree_layout::class_start_line_end(pb, pa) } else { pb };
+                let pa = if start_a { ui_pos(skill_tree_layout::class_start_line_end(world_pos(pa), world_pos(pb))) } else { pa };
+                let pb = if start_b { ui_pos(skill_tree_layout::class_start_line_end(world_pos(pb), world_pos(pa))) } else { pb };
                 let asc_a = layout.node_ascendancy(a);
                 let asc_b = layout.node_ascendancy(b);
                 // Ascendancy clusters are self-contained; a cross-link is a data artefact.
@@ -648,7 +631,7 @@ impl<'a> PsgViewer<'a> {
                 if let (Some(na), Some(nb)) = (na, nb) {
                     if same_group && na.radius == nb.radius && na.radius > 0 {
                         let gi = ga.unwrap();
-                        let center = pos2(self.psg.groups[gi].x, self.psg.groups[gi].y) + layout.group_offset[gi];
+                        let center = pos2(self.psg.groups[gi].x, self.psg.groups[gi].y) + ui_vec(layout.group_offset[gi]);
                         let r = orbit_radii[na.radius as usize];
                         let a1 = skill_tree_layout::orbit_angle(na.radius, na.position, &self.psg.passives_per_orbit);
                         let a2 = skill_tree_layout::orbit_angle(nb.radius, nb.position, &self.psg.passives_per_orbit);
@@ -688,10 +671,10 @@ impl<'a> PsgViewer<'a> {
                         self.psg.roots.iter().find(|r| db.nodes.get(r).map(|i| i.characters.contains(&c)).unwrap_or(false))
                     });
                     if let (Some(root), Some(tex)) = (start, self.find_texture(MAIN_CIRCLE_ACTIVE)) {
-                        if let Some(&p) = layout.node_pos.get(root) {
+                        if let Some(p) = node_pos(&layout, root) {
                             let outward = p.to_vec2() / p.to_vec2().length().max(1.0);
                             let angle = p.x.atan2(-p.y);
-                            let center = skill_tree_layout::class_start_anchor(p) + outward * ACTIVE_MARKER_OFFSET;
+                            let center = ui_pos(skill_tree_layout::class_start_anchor(world_pos(p))) + outward * ACTIVE_MARKER_OFFSET;
                             draw_image_rotated(&painter, &cv, tex, center, Vec2::splat(ACTIVE_MARKER_SIZE), angle, FULL);
                         }
                     }
@@ -704,7 +687,7 @@ impl<'a> PsgViewer<'a> {
                     continue;
                 }
                 for node in &group.nodes {
-                    let Some(&pos) = layout.node_pos.get(&node.skill_id) else { continue };
+                    let Some(pos) = node_pos(&layout, &node.skill_id) else { continue };
                     let screen_pos = cv.to_screen(pos);
                     if !cv.rect.expand(80.0).contains(screen_pos) {
                         continue;
@@ -889,7 +872,7 @@ impl<'a> PsgViewer<'a> {
         let root_of = self.psg.root_membership();
         let mut bbox: HashMap<u32, Rect> = HashMap::new();
         for (&node, &root) in &root_of {
-            if let Some(&p) = layout.node_pos.get(&node) {
+            if let Some(p) = node_pos(layout, &node) {
                 bbox.entry(root).and_modify(|r| *r = r.union(Rect::from_min_max(p, p))).or_insert(Rect::from_min_max(p, p));
             }
         }
@@ -902,7 +885,7 @@ impl<'a> PsgViewer<'a> {
                 continue;
             }
             let Some(b) = bbox.get(&root) else { continue };
-            let Some(tex) = self.find_texture(crate::ui::atlas_node_db::ATLAS_MAIN_TREE_BG_PATH) else { continue };
+            let Some(tex) = self.find_texture(crate::skill_tree::atlas_node_db::ATLAS_MAIN_TREE_BG_PATH) else { continue };
             let side = b.width().max(b.height()) * ATLAS_MAIN_TREE_BG_SCALE;
             draw_image(painter, cv, tex, b.center(), Vec2::splat(side), FULL);
         }
@@ -910,7 +893,7 @@ impl<'a> PsgViewer<'a> {
         for &root in &self.psg.roots {
             let Some(info) = db.nodes.get(&root) else { continue };
             let Some((bg, ix, iy)) = &info.atlas_subtree_background else { continue };
-            let (Some(&pos), Some(b)) = (layout.node_pos.get(&root), bbox.get(&root)) else { continue };
+            let (Some(pos), Some(b)) = (node_pos(layout, &root), bbox.get(&root)) else { continue };
             let Some(tex) = self.find_texture(bg) else { continue };
             let diameter = (b.width().max(b.height()) * ATLAS_SUBTREE_BG_SCALE).max(ATLAS_SUBTREE_BG_MIN);
             draw_image(painter, cv, tex, pos + vec2(*ix, *iy), Vec2::splat(diameter), FULL);
@@ -979,9 +962,25 @@ fn fallback_stroke(cv: &Canvas, tint: Color32, active: bool) -> egui::Stroke {
     egui::Stroke::new((if active { 2.5 } else { 1.0 }) * cv.zoom.max(0.5), color)
 }
 
-fn bbox_of<'a>(points: impl Iterator<Item = &'a Pos2>) -> Option<Rect> {
+fn ui_pos(p: geom::Pos2) -> Pos2 {
+    pos2(p.x, p.y)
+}
+
+fn ui_vec(v: geom::Vec2) -> Vec2 {
+    vec2(v.x, v.y)
+}
+
+fn world_pos(p: Pos2) -> geom::Pos2 {
+    geom::pos2(p.x, p.y)
+}
+
+fn node_pos(layout: &TreeLayout, id: &u32) -> Option<Pos2> {
+    layout.node_pos.get(id).map(|&p| ui_pos(p))
+}
+
+fn bbox_of(points: impl Iterator<Item = Pos2>) -> Option<Rect> {
     let mut rect: Option<Rect> = None;
-    for &p in points {
+    for p in points {
         rect = Some(match rect {
             Some(r) => r.union(Rect::from_min_max(p, p)),
             None => Rect::from_min_max(p, p),

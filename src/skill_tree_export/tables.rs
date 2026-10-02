@@ -5,7 +5,7 @@
 use super::TreeExportSource;
 use crate::dat::reader::{DatReader, DatValue};
 use crate::dat::schema::Table;
-use crate::ui::atlas_node_db::SkillGraphDatabase;
+use crate::skill_tree::atlas_node_db::SkillGraphDatabase;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Default)]
@@ -244,7 +244,9 @@ fn open<'a>(source: &'a TreeExportSource, db: &SkillGraphDatabase, name: &str) -
         false => format!("data/{}.datc64", name.to_ascii_lowercase()),
     };
     let bytes = source.fetch(&path)?;
-    let reader = DatReader::new(bytes, &path).ok()?;
+    let reader = crate::dat::analysis::open_checked(bytes, &path, table)
+        .map_err(|e| println!("Leaving out {}", e))
+        .ok()?;
     Some(Dat { reader, table })
 }
 

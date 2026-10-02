@@ -112,7 +112,7 @@ mod real_data_tests {
             let mut versions = std::collections::BTreeMap::new();
             let (mut anims, mut anims_decoded, mut bundles, mut bundles_decoded) = (0usize, 0usize, 0usize, 0usize);
             for fi in &sample {
-                let Some(bytes) = crate::ui::content_view::extract_bundle_file_sync(fi, &index, Some(&reader), None) else {
+                let Some(bytes) = crate::bundles::extract::extract_bundle_file_sync(fi, &index, Some(&reader), None) else {
                     continue;
                 };
                 match parse_model(&fi.path, &bytes) {

@@ -13,6 +13,8 @@ pub mod export;
 pub mod data_export;
 pub mod pob_export;
 pub mod pob_tree;
+pub mod skill_tree;
+pub mod patch_check;
 pub mod skill_tree_export;
 pub mod parsers;
 pub mod adapters;
@@ -73,6 +75,13 @@ fn main() -> eframe::Result<()> {
         }
         Some("lint") => {
             if let Err(e) = cli::run_lint(&args[2..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some("patch-check") => {
+            if let Err(e) = cli::run_patch_check(&args[2..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }

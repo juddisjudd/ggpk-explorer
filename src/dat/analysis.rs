@@ -5,7 +5,7 @@
 
 use crate::dat::reader::{get_column_size, DatReader, DatValue};
 use crate::dat::schema::{Column, Table, TableReference};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Guess {
@@ -844,10 +844,47 @@ impl FitReport {
 }
 
 /// Reads `sample` rows through `table` and counts the values that cannot be
-/// real: list and string offsets outside the file, absurd list lengths, and
-/// foreign keys past any plausible row count. Cheap enough to run before every
-/// table read.
+/// real: list lengths and foreign keys no table could hold, and string and
+/// list offsets that `check_order` shows were never written. Cheap enough to
+/// run before every table read.
 pub fn check_fit(reader: &DatReader, table: &Table, sample: usize) -> FitReport {
+    let mut report = check_sampled(reader, table, sample);
+    let order = check_order(reader, table);
+    for (column, bad, read) in order.stray {
+        // A column read only a handful of times says too little either way.
+        if read < ORDER_MIN_VALUES {
+            continue;
+        }
+        let name = column_name(table, column);
+        let share = bad as f32 / read as f32;
+        match report.impossible.iter_mut().find(|(n, _)| *n == name) {
+            Some(entry) => entry.1 = entry.1.max(share),
+            None => report.impossible.push((name, share)),
+        }
+    }
+    report.impossible.sort_by(|a, b| b.1.total_cmp(&a.1));
+    report
+}
+
+const ORDER_MIN_VALUES: usize = 8;
+
+fn column_name(table: &Table, index: usize) -> String {
+    table.columns[index].name.clone().unwrap_or_else(|| format!("column {}", index))
+}
+
+/// Opens a table for reading, refusing it when the schema no longer describes
+/// the file: reading on would turn every column past the drift into fiction.
+pub fn open_checked(bytes: Vec<u8>, file: &str, table: &Table) -> Result<DatReader, String> {
+    let reader = DatReader::new(bytes, file).map_err(|e| format!("{}: {}", file, e))?;
+    let fit = check_fit(&reader, table, 40);
+    if fit.is_broken() {
+        return Err(format!("{} no longer matches the schema (re-fit it with `refit`): {}", table.name, fit.summary()));
+    }
+    Ok(reader)
+}
+
+/// The value checks alone, over `sample` rows.
+pub fn check_sampled(reader: &DatReader, table: &Table, sample: usize) -> FitReport {
     let data_len = reader.get_data().len();
     let var_start = reader.data_section_offset as usize;
     let mut report = FitReport {
@@ -879,13 +916,143 @@ pub fn check_fit(reader: &DatReader, table: &Table, sample: usize) -> FitReport 
         if *count == 0 {
             continue;
         }
-        let name = table.columns[c]
-            .name
-            .clone()
-            .unwrap_or_else(|| format!("column {}", c));
-        report.impossible.push((name, *count as f32 / sampled));
+        report.impossible.push((column_name(table, c), *count as f32 / sampled));
     }
     report.impossible.sort_by(|a, b| b.1.total_cmp(&a.1));
+    report
+}
+
+/// How a layout's strings and lists sit in the data section. The game writes
+/// each new value where the last one ended, in row then column order (a string
+/// list's strings just before the list that points at them), and points a
+/// repeated value back at its first copy. So a right layout reads every offset
+/// either at the write position or at the start of an earlier value; a
+/// misplaced string or list column reads offsets that do neither.
+#[derive(Debug, Default, Clone)]
+pub struct OrderReport {
+    /// Strings and non-empty lists read.
+    pub values: usize,
+    /// Offsets that skip bytes no column points into: a string or list column
+    /// the layout leaves out.
+    pub gaps: usize,
+    /// Offsets into the middle of an earlier value or outside the section,
+    /// per column index, with how many values that column read.
+    pub stray: Vec<(usize, usize, usize)>,
+}
+
+pub fn check_order(reader: &DatReader, table: &Table) -> OrderReport {
+    let mut report = OrderReport::default();
+    let Some(row_len) = reader.row_length else { return report };
+    let data = reader.get_data();
+    let ptr = if reader.is_64bit { 8 } else { 4 };
+    let var_start = reader.data_section_offset as usize;
+    let read = |at: usize| -> Option<u64> {
+        let bytes = data.get(at..at + ptr)?;
+        Some(if ptr == 8 { u64::from_le_bytes(bytes.try_into().ok()?) } else { u32::from_le_bytes(bytes.try_into().ok()?) as u64 })
+    };
+    // Offsets count from the 8-byte marker that opens the section.
+    let to_file = |p: u64| -> Option<usize> {
+        let i = var_start.checked_add(p.checked_sub(8)? as usize)?;
+        (i < data.len()).then_some(i)
+    };
+    let string_end = |p: u64| -> Option<u64> {
+        let start = to_file(p)?;
+        let mut i = start;
+        while i + 1 < data.len() {
+            if data[i] == 0 && data[i + 1] == 0 {
+                let wide = data.get(i + 2..i + 4) == Some(&[0, 0]);
+                return Some(p + (i - start) as u64 + if wide { 4 } else { 2 });
+            }
+            i += 2;
+        }
+        None
+    };
+
+    let mut columns = Vec::new();
+    let mut at = 0;
+    for (index, col) in table.columns.iter().enumerate() {
+        let size = get_column_size(col, reader.is_64bit);
+        if at + size > row_len {
+            break;
+        }
+        let string = matches!(col.r#type.as_str(), "string" | "ref|string") && !col.interval;
+        if col.array || string {
+            let elem = Column { array: false, ..col.clone() };
+            let elem_size = (!matches!(col.r#type.as_str(), "array" | "_")).then(|| get_column_size(&elem, reader.is_64bit));
+            columns.push((index, at, col.array, string, elem_size));
+        }
+        at += size;
+    }
+    if columns.is_empty() {
+        return report;
+    }
+
+    let mut counts: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut write_at = 8u64;
+    // A list of unknown element type ends wherever the next value starts.
+    let mut open_ended = false;
+    let mut visit = |start: u64, end: Option<Option<u64>>, column: usize, report: &mut OrderReport| {
+        report.values += 1;
+        let entry = counts.entry(column).or_default();
+        entry.0 += 1;
+        let readable = to_file(start).is_some()
+            && match end {
+                Some(Some(end)) => end > start && to_file(end - 1).is_some(),
+                Some(None) => false,
+                None => true,
+            };
+        if readable && start >= write_at {
+            if start != write_at && !open_ended {
+                report.gaps += 1;
+            }
+            seen.insert(start);
+            match end {
+                Some(Some(end)) => {
+                    write_at = end;
+                    open_ended = false;
+                }
+                _ => {
+                    write_at = start;
+                    open_ended = true;
+                }
+            }
+        } else if !readable || !seen.contains(&start) {
+            entry.1 += 1;
+        }
+    };
+
+    for row in 0..reader.row_count as usize {
+        let base = 4 + row * row_len;
+        for &(index, offset, array, string, elem_size) in &columns {
+            let Some(first) = read(base + offset) else { continue };
+            if !array {
+                visit(first, Some(string_end(first)), index, &mut report);
+                continue;
+            }
+            let (count, start) = (first, read(base + offset + ptr).unwrap_or(0));
+            if count == 0 {
+                continue;
+            }
+            if count > 1_000_000 {
+                visit(u64::MAX, None, index, &mut report);
+                continue;
+            }
+            if string {
+                for k in 0..count {
+                    let Some(elem) = to_file(start).and_then(|i| read(i + k as usize * ptr)) else { break };
+                    visit(elem, Some(string_end(elem)), index, &mut report);
+                }
+            }
+            let end = elem_size.map(|size| count.checked_mul(size as u64).and_then(|n| start.checked_add(n)));
+            visit(start, end, index, &mut report);
+        }
+    }
+
+    let mut stray: Vec<(usize, usize, usize)> =
+        counts.into_iter().filter(|(_, (_, bad))| *bad > 0).map(|(c, (n, bad))| (c, bad, n)).collect();
+    stray.sort_by(|a, b| (b.1 * a.2).cmp(&(a.1 * b.2)).then(a.0.cmp(&b.0)));
+    report.stray = stray;
     report
 }
 
@@ -1025,6 +1192,28 @@ pub fn lint_table(
                 violations: bad,
             });
         }
+    }
+
+    let order = check_order(reader, table);
+    if order.gaps > 0 {
+        findings.push(LintFinding {
+            table: table.name.clone(),
+            column: "(layout)".to_string(),
+            kind: "data the layout never points at",
+            detail: "a string or list column the schema leaves out, or a list read with the wrong element type".to_string(),
+            sampled: order.values,
+            violations: order.gaps,
+        });
+    }
+    for (column, bad, read) in order.stray {
+        findings.push(LintFinding {
+            table: table.name.clone(),
+            column: column_name(table, column),
+            kind: "offset that was never written",
+            detail: "points into the middle of an earlier value or past the data: probably not a string or list".to_string(),
+            sampled: read,
+            violations: bad,
+        });
     }
     findings
 }
@@ -1281,6 +1470,71 @@ mod fit_real_data_tests {
     use super::*;
     use crate::bundles::index::Index as BundleIndex;
 
+    /// What the order walk adds to the fit check, on the newest kept patch:
+    /// tables the current schema now fails, and how much more simulated drift
+    /// (a stale layout missing one 4-byte column) is caught.
+    /// Run with: cargo test --release order_check_real_data -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn order_check_real_data() {
+        use crate::dat::relational::FileSource;
+        use crate::dat::table_store::{versions, StoredTables};
+        use crate::settings::{AppSettings, Game};
+
+        let version = versions(Game::Poe2).into_iter().next().expect("no kept patch; run export-data once");
+        let stored = StoredTables::open(Game::Poe2, &version).unwrap();
+        let settings = AppSettings::load();
+        let path = settings.schema_local_path.map(std::path::PathBuf::from).unwrap_or_else(|| AppSettings::get_app_data_dir().join("schema.min.json"));
+        let schema: crate::dat::schema::Schema = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+
+        let (mut tables, mut clean, mut newly_broken) = (0, 0, Vec::new());
+        let (mut drifted, mut caught_before, mut caught_now) = (0, 0, 0);
+        for entry in std::fs::read_dir(stored.dir()).unwrap().flatten() {
+            let file = entry.file_name().to_string_lossy().to_string();
+            let Some(name) = file.strip_suffix(".datc64.zst") else { continue };
+            let Some(def) = schema.find_table(name, true) else { continue };
+            let path = format!("data/balance/{}.datc64", name);
+            let Some(dat) = stored.fetch(&path).and_then(|b| DatReader::new(b, &path).ok()) else { continue };
+            if dat.row_count < 4 {
+                continue;
+            }
+            tables += 1;
+            let order = check_order(&dat, def);
+            let stray: usize = order.stray.iter().map(|(_, n, _)| n).sum();
+            if stray == 0 && order.gaps == 0 {
+                clean += 1;
+            }
+            if check_fit(&dat, def, 40).is_broken() && !check_sampled(&dat, def, 40).is_broken() {
+                newly_broken.push(format!("{} ({} of {} values stray, {} gaps)", def.name, stray, order.values, order.gaps));
+            }
+
+            // A stale layout: drop the first 4-byte scalar that has a string or
+            // list after it, and pad the row back out at the end.
+            let pointer = |c: &Column| c.array || c.r#type == "string";
+            let Some(first) = def.columns.iter().position(|c| !pointer(c) && !c.interval && get_column_size(c, true) == 4) else { continue };
+            if !def.columns[first + 1..].iter().any(pointer) {
+                continue;
+            }
+            let mut stale = def.clone();
+            let removed = stale.columns.remove(first);
+            stale.columns.push(Column { name: None, ..removed });
+            drifted += 1;
+            if check_sampled(&dat, &stale, 40).is_broken() {
+                caught_before += 1;
+            }
+            if check_fit(&dat, &stale, 40).is_broken() {
+                caught_now += 1;
+            }
+        }
+        println!("patch {}: {} tables, {} with a perfect order walk", version, tables, clean);
+        println!("tables the current schema now fails: {}", newly_broken.len());
+        for line in &newly_broken {
+            println!("   {}", line);
+        }
+        println!("simulated drift in {} tables: caught {} before, {} now", drifted, caught_before, caught_now);
+        assert!(caught_now >= caught_before);
+    }
+
     /// Scores every schema table on the installed patch, so the fit check's
     /// threshold can be set against how the community schema really behaves.
     /// Run with: cargo test --release fit_check_real_data -- --ignored --nocapture
@@ -1307,7 +1561,7 @@ mod fit_real_data_tests {
             }
             let name = rest.trim_end_matches(".datc64");
             let Some(def) = schema.find_table(name, true) else { continue };
-            let Some(bytes) = crate::ui::content_view::extract_bundle_file_sync(file, &index, Some(&reader), None)
+            let Some(bytes) = crate::bundles::extract::extract_bundle_file_sync(file, &index, Some(&reader), None)
             else {
                 continue;
             };

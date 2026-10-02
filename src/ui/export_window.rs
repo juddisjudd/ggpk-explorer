@@ -1,55 +1,6 @@
 use eframe::egui;
+use crate::export::{AudioFormat, DataFormat, ExportSettings, PsgFormat, TextureFormat};
 use crate::ui::components::modal_section;
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum TextureFormat {
-    OriginalDds,
-    WebP,
-    Png,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AudioFormat {
-    Original,
-    Wav,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum DataFormat {
-    Original,
-    Json,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum PsgFormat {
-    Original,
-    Json,
-    /// `data.json` + sprite sheets + HTML viewer, like GGG's official export.
-    Tree,
-}
-
-#[derive(Clone)]
-pub struct ExportSettings {
-    pub texture_format: TextureFormat,
-    pub audio_format: AudioFormat,
-    pub data_format: DataFormat,
-    pub psg_format: PsgFormat,
-    pub recursive: bool,
-    pub is_poe2: bool,
-}
-
-impl Default for ExportSettings {
-    fn default() -> Self {
-        Self {
-            texture_format: TextureFormat::OriginalDds,
-            audio_format: AudioFormat::Original,
-            data_format: DataFormat::Original,
-            psg_format: PsgFormat::Original,
-            recursive: true,
-            is_poe2: false,
-        }
-    }
-}
 
 pub struct ExportWindow {
     open: bool,

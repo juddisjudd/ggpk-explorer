@@ -128,8 +128,9 @@ enum Layout {
 }
 
 /// Mutations collected while the table is drawn and applied once its borrows end.
-/// A re-fit running against an earlier patch fetched from the CDN. The download
-/// and the column search both take seconds, so they happen off the UI thread.
+/// A re-fit running against an earlier patch's copy of the table. Reading it
+/// (over the CDN when it was not kept) and the column search both take
+/// seconds, so they happen off the UI thread.
 struct RefitJob {
     version: String,
     table: String,
@@ -137,9 +138,10 @@ struct RefitJob {
 }
 
 
-/// Reads one table out of an earlier patch and works out where this patch moved
-/// its columns to. Runs on a worker thread: the CDN fetch alone can take a while.
+/// Reads one table out of an earlier patch — the kept copy, else the CDN — and
+/// works out where this patch moved its columns to. Runs on a worker thread.
 fn refit_against(
+    game: crate::settings::Game,
     version: &str,
     path: &str,
     new_bytes: Vec<u8>,
@@ -147,32 +149,35 @@ fn refit_against(
 ) -> Result<crate::dat::refit::RefitReport, String> {
     use crate::dat::relational::FileSource;
 
-    let cdn = crate::bundles::cdn::CdnBundleLoader::new(
-        &crate::settings::AppSettings::get_app_data_dir().join("cache"),
-        Some(version),
-    );
-    let index = cdn.fetch_index().map_err(|e| format!("could not read patch {}: {}", version, e))?;
-    let files = crate::data_export::source::GameFiles::new(None, Arc::new(index), None, Some(cdn));
-    let old_bytes = files
-        .fetch(path)
-        .ok_or_else(|| format!("{} is not in patch {}", path, version))?;
-
-    let old = DatReader::new(old_bytes, path).map_err(|e| e.to_string())?;
-    let new = DatReader::new(new_bytes, path).map_err(|e| e.to_string())?;
-    if analysis::check_fit(&old, &def, 40).is_broken() {
-        return Err(format!("the schema does not describe patch {} either, so there is nothing to carry", version));
+    let old_bytes = match crate::dat::table_store::StoredTables::open(game, version) {
+        Some(stored) => stored.fetch(path),
+        None => {
+            let cdn = crate::bundles::cdn::CdnBundleLoader::new(&crate::settings::AppSettings::file_cache_dir(game), Some(version));
+            let index = cdn.fetch_index().map_err(|e| format!("could not read patch {}: {}", version, e))?;
+            crate::data_export::source::GameFiles::new(None, Arc::new(index), None, Some(cdn)).fetch(path)
+        }
     }
-    crate::dat::refit::carry_across_patch(&old, &def, &new)
+    .ok_or_else(|| format!("{} is not in patch {}", path, version))?;
+
+    match crate::dat::refit::refit_file(old_bytes, new_bytes, path, &def) {
+        Ok(refitted) => Ok(refitted.report),
+        Err(crate::dat::refit::RefitError::OldDoesNotFit) => {
+            Err(format!("the schema does not describe patch {} either, so there is nothing to carry", version))
+        }
+        Err(crate::dat::refit::RefitError::Failed(e)) => Err(e),
+    }
 }
-/// The patch before the one installed, taken from the newest saved index
-/// snapshot that is not the current patch. Snapshots are written automatically
-/// when the app notices a patch change, so this is normally the patch just gone.
-fn previous_patch() -> Option<String> {
-    let current = crate::settings::AppSettings::load().poe2_patch_version;
-    crate::diff::list_snapshots(crate::settings::Game::Poe2)
-        .into_iter()
-        .map(|(_, meta)| meta.patch_version)
-        .find(|version| *version != current)
+/// The patch before the one installed: the newest one whose tables were kept,
+/// else the newest index snapshot that is not the current patch (read over the
+/// CDN, which may no longer serve it).
+fn previous_patch(game: crate::settings::Game) -> Option<String> {
+    let current = crate::settings::AppSettings::load().patch_version(game).to_string();
+    crate::dat::table_store::previous(game, &current).or_else(|| {
+        crate::diff::list_snapshots(game)
+            .into_iter()
+            .map(|(_, meta)| meta.patch_version)
+            .find(|version| *version != current)
+    })
 }
 
 enum Deferred {
@@ -621,6 +626,11 @@ impl DatViewer {
         self.rebuild_schema();
     }
 
+    /// The schema as downloaded, before the user's overrides.
+    pub fn community_schema(&self) -> Option<&Schema> {
+        self.base_schema.as_ref()
+    }
+
     /// Reads `schema_overrides.json` from the app data dir and layers it over the schema.
     pub fn load_overrides(&mut self) {
         self.overrides = Overrides::load(&self.overrides_path);
@@ -669,7 +679,7 @@ impl DatViewer {
         }
         // Reading the snapshot directory is disk work, so the answer is kept.
         if self.prev_patch.is_none() {
-            self.prev_patch = Some(previous_patch());
+            self.prev_patch = Some(previous_patch(crate::settings::Game::from_is_poe2(is_poe2)));
         }
         let Some(version) = self.prev_patch.clone().flatten() else { return };
         if ui
@@ -696,8 +706,9 @@ impl DatViewer {
         let bytes = reader.get_data().to_vec();
         let (tx, rx) = std::sync::mpsc::channel();
         let job_version = version.clone();
+        let game = crate::settings::Game::from_is_poe2(is_poe2);
         std::thread::spawn(move || {
-            let _ = tx.send(refit_against(&job_version, &path, bytes, def));
+            let _ = tx.send(refit_against(game, &job_version, &path, bytes, def));
         });
         self.refit = Some(RefitJob { version, table: table_name.to_string(), rx });
     }

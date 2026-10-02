@@ -1,11 +1,60 @@
 use crate::bundles::index::Index as BundleIndex;
 use crate::dat::schema::Schema;
 use crate::ggpk::reader::GgpkReader;
-use crate::ui::export_window::{AudioFormat, DataFormat, ExportSettings, PsgFormat, TextureFormat};
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc::Sender, Arc, Mutex};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TextureFormat {
+    OriginalDds,
+    WebP,
+    Png,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AudioFormat {
+    Original,
+    Wav,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DataFormat {
+    Original,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PsgFormat {
+    Original,
+    Json,
+    /// `data.json` + sprite sheets + HTML viewer, like GGG's official export.
+    Tree,
+}
+
+#[derive(Clone)]
+pub struct ExportSettings {
+    pub texture_format: TextureFormat,
+    pub audio_format: AudioFormat,
+    pub data_format: DataFormat,
+    pub psg_format: PsgFormat,
+    pub recursive: bool,
+    pub is_poe2: bool,
+}
+
+impl Default for ExportSettings {
+    fn default() -> Self {
+        Self {
+            texture_format: TextureFormat::OriginalDds,
+            audio_format: AudioFormat::Original,
+            data_format: DataFormat::Original,
+            psg_format: PsgFormat::Original,
+            recursive: true,
+            is_poe2: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum ExportStatus {

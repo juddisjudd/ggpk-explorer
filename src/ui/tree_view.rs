@@ -43,7 +43,7 @@ pub enum TreeViewAction {
         immediate_hashes: Option<Vec<u64>>,
         name: String,
         is_folder: bool,
-        settings: Option<crate::ui::export_window::ExportSettings>,
+        settings: Option<crate::export::ExportSettings>,
     },
 }
 

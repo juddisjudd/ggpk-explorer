@@ -42,6 +42,7 @@ pub struct ExplorerApp {
     pub schema_check_rx: Option<Receiver<Result<i64, String>>>,
     pub export_status_rx: Option<Receiver<crate::export::ExportStatus>>,
     pub auto_snapshot_rx: Option<Receiver<Result<String, String>>>,
+    patch_check_rx: Option<Receiver<Result<crate::patch_check::Report, String>>>,
     is_loading: bool,
 
     pub settings: crate::settings::AppSettings,
@@ -147,6 +148,7 @@ impl ExplorerApp {
             schema_check_rx: None,
             export_status_rx: None,
             auto_snapshot_rx: None,
+            patch_check_rx: None,
             is_loading: false,
             settings: settings.clone(),
             settings_window: crate::ui::settings_window::SettingsWindow::new(),
@@ -666,6 +668,68 @@ impl ExplorerApp {
         }
     }
 
+    /// Keeps the opened patch's tables on a worker thread, to re-fit the next
+    /// patch against once the CDN stops serving this one.
+    fn keep_tables(game: crate::settings::Game, version: String, files: crate::data_export::source::GameFiles) {
+        if crate::dat::table_store::has(game, &version) {
+            return;
+        }
+        std::thread::spawn(move || match crate::dat::table_store::ensure_saved(&files, game, &version) {
+            Ok(Some(n)) => println!("Kept {} table(s) of patch {} to re-fit the next patch against", n, version),
+            Ok(None) => {}
+            Err(e) => println!("Could not keep the tables of patch {}: {}", version, e),
+        });
+    }
+
+    /// Checks a patch the app has not seen on a worker thread: keeps its
+    /// tables, re-fits what it moved from the last kept patch, and saves the
+    /// re-fits as custom layouts. Without a schema it only keeps the tables.
+    fn start_patch_check<F>(&mut self, game: crate::settings::Game, version: String, source: F)
+    where
+        F: FnOnce() -> Result<crate::data_export::source::GameFiles, String> + Send + 'static,
+    {
+        if self.patch_check_rx.is_some() {
+            return;
+        }
+        let schema = self.content_view.dat_viewer.community_schema().cloned();
+        let (tx, rx) = channel();
+        self.patch_check_rx = Some(rx);
+        self.status_msg = format!("Checking patch {} against the schema…", version);
+        thread::spawn(move || {
+            let result = source().and_then(|files| match schema {
+                Some(schema) => {
+                    let overrides = crate::dat::overrides::Overrides::default_path();
+                    crate::patch_check::run(&files, game, &version, &schema, &overrides, true)
+                }
+                None => crate::dat::table_store::ensure_saved(&files, game, &version)
+                    .map(|kept| crate::patch_check::Report { version: version.clone(), kept, ..Default::default() }),
+            });
+            let _ = tx.send(result);
+        });
+    }
+
+    fn poll_patch_check(&mut self) {
+        let Some(rx) = &self.patch_check_rx else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the patch check stopped without a result".to_string()),
+        };
+        self.patch_check_rx = None;
+        match result {
+            Ok(report) => {
+                for line in report.lines() {
+                    println!("{}", line);
+                }
+                self.status_msg = report.headline();
+                if report.written && (!report.refitted.is_empty() || !report.retired.is_empty()) {
+                    self.content_view.dat_viewer.load_overrides();
+                }
+            }
+            Err(e) => self.status_msg = format!("Patch check failed: {}", e),
+        }
+    }
+
     /// Opens the data export dialog, with the patch the install is on so it
     /// can offer to name the folder after it.
     fn open_data_export(&mut self, kind: crate::ui::data_export_window::ExportKind) {
@@ -741,7 +805,7 @@ impl ExplorerApp {
     /// Runs the official-layout skill tree export when the export dialog
     /// targeted a single `.psg` with the "Skill tree" format selected.
     fn try_start_tree_export(&mut self, hashes: &[u64], target_dir: &std::path::Path) -> bool {
-        if self.export_window.settings.psg_format != crate::ui::export_window::PsgFormat::Tree || hashes.len() != 1 {
+        if self.export_window.settings.psg_format != crate::export::PsgFormat::Tree || hashes.len() != 1 {
             return false;
         }
         let Some(index) = self.bundle_index.clone() else { return false };
@@ -1044,6 +1108,18 @@ impl eframe::App for ExplorerApp {
                                  let game = crate::settings::Game::from_is_poe2(is_poe2);
                                  let version = path.parent().and_then(crate::data_export::detect_version);
                                  let known = self.settings.patch_version(game).to_string();
+                                 if let (Some(version), Some(index)) = (version.clone(), self.bundle_index.clone()) {
+                                     let files = crate::data_export::source::GameFiles::new(
+                                         self.reader.clone(),
+                                         index,
+                                         self.content_view.steam_loader.clone(),
+                                         None,
+                                     );
+                                     match crate::patch_check::was_checked(game, &version) {
+                                         true => Self::keep_tables(game, version, files),
+                                         false => self.start_patch_check(game, version, move || Ok(files)),
+                                     }
+                                 }
                                  if self.settings.game != game || version.as_deref().is_some_and(|v| v != known) {
                                      self.settings.game = game;
                                      if let Some(version) = version {
@@ -1274,6 +1350,8 @@ impl eframe::App for ExplorerApp {
             }
         }
 
+        self.poll_patch_check();
+
         if let Some(rx) = &self.auto_snapshot_rx {
             match rx.try_recv() {
                 Ok(result) => {
@@ -1284,6 +1362,21 @@ impl eframe::App for ExplorerApp {
                     self.auto_snapshot_rx = None;
                     if self.diff_window.is_open() {
                         self.diff_window.refresh();
+                    }
+                    // The patch is live before the install updates; check it
+                    // from the CDN while the last patch's tables are at hand.
+                    let game = crate::settings::Game::Poe2;
+                    let version = self.settings.poe2_patch_version.clone();
+                    if !version.is_empty() && !crate::patch_check::was_checked(game, &version) {
+                        let cdn_version = version.clone();
+                        self.start_patch_check(game, version, move || {
+                            let cdn = crate::bundles::cdn::CdnBundleLoader::new(
+                                &crate::settings::AppSettings::file_cache_dir(game),
+                                Some(&cdn_version),
+                            );
+                            let index = cdn.fetch_index().map_err(|e| format!("could not read patch {} from the CDN: {}", cdn_version, e))?;
+                            Ok(crate::data_export::source::GameFiles::new(None, Arc::new(index), None, Some(cdn)))
+                        });
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}

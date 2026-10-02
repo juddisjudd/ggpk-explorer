@@ -2,6 +2,22 @@ use crate::dat::reader::{DatReader, DatValue};
 use crate::dat::schema::{Schema, Table};
 use std::collections::HashMap;
 
+// Art the client hardcodes rather than referencing from a DAT row.
+pub const PLUS_FRAME_NORMAL: &str = "Art/2DArt/UIImages/InGame/PassiveSkillScreenPlusFrameNormal";
+pub const PLUS_FRAME_ACTIVE: &str = "Art/2DArt/UIImages/InGame/PassiveSkillScreenPlusFrameActive";
+pub const MAIN_CIRCLE: &str = "Art/2DArt/UIImages/InGame/PassiveTree/PassiveTreeMainCircle";
+pub const MAIN_CIRCLE_ACTIVE: &str = "Art/2DArt/UIImages/InGame/PassiveTree/PassiveTreeMainCircleActive";
+pub const ATLAS_START: &str = "Art/2DArt/UIImages/InGame/AtlasScreen/AtlasPassiveSkillScreenStart";
+pub const BREACH_BACKDROP: &str = "Art/2DArt/UIImages/InGame/BreachLeague/BreachTreePassiveBackground";
+pub const BREACH_START: &str = "Art/2DArt/UIImages/InGame/BreachLeague/BreachTreePassiveSkillScreenStartingPoint";
+
+/// `Art/2DArt/PassiveTree/*CurvesTogether.dds`: nine quarter-arcs (one per
+/// orbit radius, centred on the sheet's bottom-right corner) plus a straight
+/// strip along the top. Tiled for straight connectors, so it needs wrapping.
+pub fn is_connector_sheet(path: &str) -> bool {
+    path.to_ascii_lowercase().contains("2dart/passivetree/")
+}
+
 /// Which `PassiveSkillTreeUIArt` frame-reference column a node's frame
 /// texture comes from, chosen by its `SkillGraphNodeInfo` type flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,7 +94,7 @@ fn as_string(val: &DatValue) -> String {
 /// `PassiveSkillTreeUIArt`'s foreignrow fields reference it by row index.
 pub fn parse_node_frame_art(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<FrameArt>, String> {
     let table = find_table(schema, "PassiveSkillTreeNodeFrameArt", is_poe2)?;
-    let reader = DatReader::new(bytes, "passiveskilltreenodeframeart.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, "passiveskilltreenodeframeart.datc64", table)?;
     let id_col = col_index(table, "Id");
     let normal_col = col_index(table, "Normal");
     let can_allocate_col = col_index(table, "CanAllocate");
@@ -106,7 +122,7 @@ pub fn parse_node_frame_art(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> R
 /// reads cleanly) into a row-index-ordered `Vec`, for the same reason.
 pub fn parse_connection_art(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<ConnectionArt>, String> {
     let table = find_table(schema, "PassiveSkillTreeConnectionArt", is_poe2)?;
-    let reader = DatReader::new(bytes, "passiveskilltreeconnectionart.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, "passiveskilltreeconnectionart.datc64", table)?;
     let normal_col = col_index(table, "Normal");
     let intermediate_col = col_index(table, "Intermediate");
     let intermediate2_col = col_index(table, "Intermediate2");
@@ -204,7 +220,7 @@ fn read_foreignrow_field(data: &[u8], pos: usize) -> Option<usize> {
 /// rows point into. PoE 2 keeps the same paths on the UI art row itself.
 pub fn parse_group_background_art(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<GroupBackground>, String> {
     let table = find_table(schema, "PassiveSkillTreeGroupBackgroundArt", is_poe2)?;
-    let reader = DatReader::new(bytes, "passiveskilltreegroupbackgroundart.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, "passiveskilltreegroupbackgroundart.datc64", table)?;
     let get = |name: &str| col_index(table, name);
     let (small, medium, large) = (get("Small"), get("Medium"), get("Large"));
     let (small_blank, medium_blank, large_blank) = (get("SmallBlank"), get("MediumBlank"), get("LargeBlank"));
@@ -240,7 +256,7 @@ pub fn parse_ui_art_poe1(
     backgrounds: &[GroupBackground],
 ) -> Result<(HashMap<String, SkillTreeArtSet>, Vec<String>), String> {
     let table = find_table(schema, "PassiveSkillTreeUIArt", false)?;
-    let reader = DatReader::new(bytes, "passiveskilltreeuiart.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, "passiveskilltreeuiart.datc64", table)?;
     let id_col = col_index(table, "Id").ok_or("PassiveSkillTreeUIArt missing Id")?;
     let bg_col = col_index(table, "BackgroundArt");
     let frame_cols = [
@@ -375,7 +391,7 @@ mod tests {
     use crate::bundles::index::Index as BundleIndex;
     use crate::export::{run_export, ExportStatus};
     use crate::ggpk::reader::GgpkReader;
-    use crate::ui::export_window::ExportSettings;
+    use crate::export::ExportSettings;
     use std::sync::Arc;
 
     fn fetch_real(paths: &[&str]) -> std::path::PathBuf {

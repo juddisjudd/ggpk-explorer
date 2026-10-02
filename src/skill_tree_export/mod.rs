@@ -19,10 +19,11 @@ use crate::dat::psg::PsgFile;
 use crate::dat::schema::Schema;
 use crate::export::ExportStatus;
 use crate::ggpk::reader::GgpkReader;
-use crate::ui::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo, ATLAS_MAIN_TREE_BG_PATH};
-use crate::ui::content_view::{build_skill_graph_db, dds_path_candidates, decompress_bundle, extract_bundle_file_sync};
-use crate::ui::skill_tree_art::{FrameArt, NodeFrameKind};
-use crate::ui::skill_tree_layout::{self, ASCENDANCY_PLATE_SIZE, CLASS_ILLUSTRATION_SIZE, CLASS_START_MOUNT_RADIUS, CLASS_START_RING_RADIUS, MAIN_CIRCLE_SIZE};
+use crate::skill_tree::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo, ATLAS_MAIN_TREE_BG_PATH};
+use crate::bundles::extract::{dds_path_candidates, decompress_bundle, extract_bundle_file_sync};
+use crate::skill_tree::build_skill_graph_db;
+use crate::skill_tree::art::{FrameArt, NodeFrameKind};
+use crate::skill_tree::layout::{self as skill_tree_layout, ASCENDANCY_PLATE_SIZE, CLASS_ILLUSTRATION_SIZE, CLASS_START_MOUNT_RADIUS, CLASS_START_RING_RADIUS, MAIN_CIRCLE_SIZE};
 use image::RgbaImage;
 use json::J;
 use sheets::TextureStore;
@@ -117,7 +118,7 @@ pub struct TreeExportSource {
     pub cdn: Option<crate::bundles::cdn::CdnBundleLoader>,
     pub schema: Schema,
     /// PoE 1's interface art lives in sheets; this says where each image sits.
-    pub atlas: Option<crate::ui::ui_atlas::UiAtlas>,
+    pub atlas: Option<crate::skill_tree::ui_atlas::UiAtlas>,
 }
 
 impl TreeExportSource {
@@ -135,8 +136,8 @@ impl TreeExportSource {
     ) -> Self {
         let mut source = Self { reader, index, steam, cdn, schema, atlas: None };
         source.atlas = source
-            .fetch(crate::ui::ui_atlas::ATLAS_PATH)
-            .map(|bytes| crate::ui::ui_atlas::UiAtlas::parse(&crate::parsers::utils::decode_text_lossy(&bytes)))
+            .fetch(crate::skill_tree::ui_atlas::ATLAS_PATH)
+            .map(|bytes| crate::skill_tree::ui_atlas::UiAtlas::parse(&crate::parsers::utils::decode_text_lossy(&bytes)))
             .filter(|atlas| !atlas.is_empty());
         source
     }
@@ -496,7 +497,7 @@ struct AtlasBackdrop {
 /// subtrees sit well outside the main tree, so the whole graph's extent is far
 /// too big. Mirrors what `psg_viewer` draws in the app.
 fn atlas_backdrops(psg: &PsgFile, db: &SkillGraphDatabase, calc: &HashMap<u32, NodeCalc>) -> Vec<AtlasBackdrop> {
-    use crate::ui::psg_viewer::{ATLAS_MAIN_TREE_BG_SCALE, ATLAS_SUBTREE_BG_MIN, ATLAS_SUBTREE_BG_SCALE};
+    use crate::skill_tree::layout::{ATLAS_MAIN_TREE_BG_SCALE, ATLAS_SUBTREE_BG_MIN, ATLAS_SUBTREE_BG_SCALE};
     if psg.graph_type != 1 {
         return Vec::new();
     }
@@ -1254,7 +1255,7 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
     let mut group_backgrounds = Vec::new();
     if psg.graph_type == 0 {
         group_backgrounds.push(("startNode:MainCircleActive".to_string(), MAIN_CIRCLE_ACTIVE_FULL.to_string()));
-        group_backgrounds.push(("startNode:MainCircle".to_string(), crate::ui::psg_viewer::MAIN_CIRCLE.to_string()));
+        group_backgrounds.push(("startNode:MainCircle".to_string(), crate::skill_tree::art::MAIN_CIRCLE.to_string()));
     }
     if let Some(a) = art_set {
         let bg = &a.group_background;
@@ -1443,7 +1444,7 @@ fn art_name(path: &str) -> String {
 }
 
 /// Frame textures with the names the official `frame` sheet uses.
-fn frame_list(db: &SkillGraphDatabase, art_set: Option<&crate::ui::skill_tree_art::SkillTreeArtSet>) -> Vec<(String, String)> {
+fn frame_list(db: &SkillGraphDatabase, art_set: Option<&crate::skill_tree::art::SkillTreeArtSet>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     let push = |name: &str, path: &str, out: &mut Vec<(String, String)>| {
         if !path.is_empty() && !out.iter().any(|(n, _)| n == name) {
@@ -1493,9 +1494,9 @@ fn frame_list(db: &SkillGraphDatabase, art_set: Option<&crate::ui::skill_tree_ar
             }
         }
     }
-    push("AttributeFrameUnallocated", crate::ui::psg_viewer::PLUS_FRAME_NORMAL, &mut out);
+    push("AttributeFrameUnallocated", crate::skill_tree::art::PLUS_FRAME_NORMAL, &mut out);
     push("AttributeFrameCanAllocate", PLUS_FRAME_CAN_ALLOCATE, &mut out);
-    push("AttributeFrameAllocated", crate::ui::psg_viewer::PLUS_FRAME_ACTIVE, &mut out);
+    push("AttributeFrameAllocated", crate::skill_tree::art::PLUS_FRAME_ACTIVE, &mut out);
     if !db.is_poe2 {
         for (name, path) in POE1_SOCKET_FRAMES {
             push(name, path, &mut out);
@@ -1525,7 +1526,7 @@ const POE1_SOCKET_FRAMES: [(&str, &str); 15] = [
     ("JewelSocketClusterAltCanAllocate1Large", "Art/2DArt/UIImages/InGame/JewelSocketClusterAltCanAllocate1Large"),
 ];
 
-fn viewer_extras(psg: &PsgFile, db: &SkillGraphDatabase, radii: &[f32; 10], group_art: Option<&crate::ui::skill_tree_art::GroupBackground>) -> J {
+fn viewer_extras(psg: &PsgFile, db: &SkillGraphDatabase, radii: &[f32; 10], group_art: Option<&crate::skill_tree::art::GroupBackground>) -> J {
     let mut extras = J::obj();
     extras.set("tree", J::Int(psg.graph_type as i64));
     extras.set("orbitRadii", J::ints(radii.iter().map(|r| *r as i64)));
@@ -1768,7 +1769,7 @@ mod real_data_tests {
     #[test]
     #[ignore]
     fn dump_tables() {
-        use crate::ui::export_window::{DataFormat, ExportSettings};
+        use crate::export::{DataFormat, ExportSettings};
         let settings = crate::settings::AppSettings::load();
         let ggpk_path = settings.ggpk_path.expect("no ggpk_path configured");
         let reader = Arc::new(GgpkReader::open(&ggpk_path).unwrap());

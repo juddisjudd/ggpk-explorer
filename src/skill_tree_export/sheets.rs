@@ -83,7 +83,7 @@ impl<'a> TextureStore<'a> {
     fn from_atlas(&mut self, path: &str) -> Option<RgbaImage> {
         let entry = self.source.atlas.as_ref()?.lookup(path)?.clone();
         let sheet = self.get(&entry.sheet)?.clone();
-        crate::ui::ui_atlas::crop(&sheet, &entry)
+        crate::skill_tree::ui_atlas::crop(&sheet, &entry)
     }
 }
 

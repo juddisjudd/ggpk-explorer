@@ -231,6 +231,42 @@ fn fingerprint(value: &DatValue) -> String {
     }
 }
 
+/// Tag on layouts derived here, so a later check can retire them once the
+/// community schema describes the table again.
+pub const REFIT_TAG: &str = "refit";
+
+pub fn is_refit(table: &Table) -> bool {
+    table.tags.as_ref().is_some_and(|tags| tags.iter().any(|t| t == REFIT_TAG))
+}
+
+pub enum RefitError {
+    /// The layout misreads the older copy too, so it holds no names to carry.
+    OldDoesNotFit,
+    Failed(String),
+}
+
+/// A table carried across a patch, and how its new layout reads.
+pub struct Refitted {
+    pub report: RefitReport,
+    pub after: analysis::FitReport,
+}
+
+/// Carries `def` from `file`'s copy in an earlier patch to its copy in this one.
+pub fn refit_file(old_bytes: Vec<u8>, new_bytes: Vec<u8>, file: &str, def: &Table) -> Result<Refitted, RefitError> {
+    let old = DatReader::new(old_bytes, file).map_err(|e| RefitError::Failed(e.to_string()))?;
+    let new = DatReader::new(new_bytes, file).map_err(|e| RefitError::Failed(e.to_string()))?;
+    if analysis::check_fit(&old, def, 40).is_broken() {
+        return Err(RefitError::OldDoesNotFit);
+    }
+    let mut report = carry_across_patch(&old, def, &new).map_err(RefitError::Failed)?;
+    let tags = report.table.tags.get_or_insert_with(Vec::new);
+    if !tags.iter().any(|t| t == REFIT_TAG) {
+        tags.push(REFIT_TAG.to_string());
+    }
+    let after = analysis::check_fit(&new, &report.table, 40);
+    Ok(Refitted { report, after })
+}
+
 /// Re-derives `old_def`'s layout against a newer copy of the same file.
 pub fn carry_across_patch(
     old: &DatReader,

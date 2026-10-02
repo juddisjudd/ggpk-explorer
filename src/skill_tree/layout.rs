@@ -10,10 +10,19 @@
 //! translated so its start group lands on the plate centre.
 
 use crate::dat::psg::PsgFile;
-use crate::ui::atlas_node_db::SkillGraphDatabase;
-use eframe::egui::{pos2, vec2, Pos2, Vec2};
+use crate::skill_tree::atlas_node_db::SkillGraphDatabase;
+use crate::skill_tree::geom::{pos2, vec2, Pos2, Vec2};
 use std::collections::HashMap;
 
+/// How far the atlas main-tree backdrop reaches past its nodes. The painted
+/// machinery fills roughly 75% by 87% of the square texture, so a little over
+/// one covers the tree; the texture is square, so the scale is applied to the
+/// longer side and both axes get it.
+pub const ATLAS_MAIN_TREE_BG_SCALE: f32 = 1.15;
+/// The same, for the league subtree backdrops, which carry far more padding.
+pub const ATLAS_SUBTREE_BG_SCALE: f32 = 1.9;
+/// Smallest a subtree backdrop is drawn, for a subtree of one or two nodes.
+pub const ATLAS_SUBTREE_BG_MIN: f32 = 200.0;
 pub const ASCENDANCY_RING_RADIUS: f32 = 15537.0;
 pub const ASCENDANCY_SLOT_STEP_DEG: f32 = 12.0;
 
@@ -301,10 +310,10 @@ mod real_data_tests {
         let index = crate::bundles::index::Index::load_from_cache(&cache_path).expect("run the app once to build the index cache");
         let schema_text = std::fs::read_to_string(crate::settings::AppSettings::get_app_data_dir().join("schema.min.json")).unwrap();
         let schema: crate::dat::schema::Schema = serde_json::from_str(&schema_text).unwrap();
-        let db = crate::ui::content_view::build_skill_graph_db(Some(&reader), &index, None, &schema).unwrap();
+        let db = crate::skill_tree::build_skill_graph_db(Some(&reader), &index, None, &schema).unwrap();
 
         let fi = index.files.values().find(|f| f.path.eq_ignore_ascii_case("metadata/passiveskillgraph.psg")).unwrap();
-        let bytes = crate::ui::content_view::extract_bundle_file_sync(fi, &index, Some(&reader), None).unwrap();
+        let bytes = crate::bundles::extract::extract_bundle_file_sync(fi, &index, Some(&reader), None).unwrap();
         let psg = crate::dat::psg::parse_psg(&bytes).unwrap();
         let layout = compute(&psg, Some(&db));
 
@@ -326,8 +335,8 @@ mod real_data_tests {
             let d = (pos - p.center).length();
             assert!(d < 1500.0, "{} start node {} units from its plate", db.ascendancies[p.ascendancy].id, d);
         }
-        let paths = crate::ui::content_view::collect_needed_texture_paths(&psg, &db);
-        let missing: Vec<_> = paths.iter().filter(|p| crate::ui::content_view::resolve_texture_path(&index, p).is_none()).cloned().collect();
+        let paths = crate::skill_tree::collect_needed_texture_paths(&psg, &db);
+        let missing: Vec<_> = paths.iter().filter(|p| crate::bundles::extract::resolve_texture_path(&index, p).is_none()).cloned().collect();
         println!("texture paths: {} needed, {} unresolved", paths.len(), missing.len());
         for m in missing.iter().take(20) {
             println!("   missing {}", m);

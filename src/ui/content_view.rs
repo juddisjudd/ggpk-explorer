@@ -1,4 +1,6 @@
 use eframe::egui;
+use crate::bundles::extract::{decompress_bundle, dds_path_candidates, extract_bundle_file_sync, find_file_info_by_path, resolve_texture_path};
+use crate::skill_tree::{build_skill_graph_db, collect_needed_texture_paths};
 use crate::ggpk::reader::GgpkReader;
 use std::collections::HashMap;
 
@@ -70,13 +72,15 @@ pub struct ContentView {
     audio_sink: Option<rodio::Player>,
     pub last_error: Option<String>,
     pub failed_loads: std::collections::HashSet<u64>,
+    /// The file being read and decoded off the UI thread, by path hash.
+    loading: Option<(u64, std::sync::mpsc::Receiver<LoadedFile>)>,
     image_view_states: HashMap<u64, ImageViewState>,
 
     pub cdn_loader: Option<crate::bundles::cdn::CdnBundleLoader>,
     pub steam_loader: Option<crate::bundles::steam::SteamBundleLoader>,
     pub audio_volume: f32,
 
-    pub export_requested: Option<(Vec<u64>, String, Option<crate::ui::export_window::ExportSettings>)>,
+    pub export_requested: Option<(Vec<u64>, String, Option<crate::export::ExportSettings>)>,
     pub selection_requested: Option<crate::ui::app::FileSelection>,
 
     // Remembers the search-results view a file was opened from (keyed by
@@ -116,8 +120,8 @@ pub struct ContentView {
     // Atlas skill graph node database (PassiveSkillGraphId -> name/stats),
     // resolved once in the background from PassiveSkills/Stats DAT tables +
     // the atlas stat-description CSD files, shared by every open atlas .psg.
-    pub skill_graph_db: Option<std::sync::Arc<crate::ui::atlas_node_db::SkillGraphDatabase>>,
-    skill_graph_db_rx: Option<std::sync::mpsc::Receiver<Result<crate::ui::atlas_node_db::SkillGraphDatabase, String>>>,
+    pub skill_graph_db: Option<std::sync::Arc<crate::skill_tree::atlas_node_db::SkillGraphDatabase>>,
+    skill_graph_db_rx: Option<std::sync::mpsc::Receiver<Result<crate::skill_tree::atlas_node_db::SkillGraphDatabase, String>>>,
     table_stats_rx: Option<std::sync::mpsc::Receiver<Vec<crate::dat::analysis::TableStats>>>,
     /// Identity of the index the DAT viewer's table stats were computed for.
     table_stats_for: usize,
@@ -175,6 +179,7 @@ impl Default for ContentView {
             audio_sink: None,
             last_error: None,
             failed_loads: std::collections::HashSet::new(),
+            loading: None,
             image_view_states: HashMap::new(),
 
             cdn_loader: None,
@@ -305,6 +310,7 @@ impl ContentView {
             }
         }
 
+        self.poll_load(ui.ctx());
         self.poll_thumbnails(ui.ctx());
         self.poll_tree_export();
         if let Some(rx) = &self.psg_texture_rx {
@@ -317,7 +323,7 @@ impl ContentView {
                     }
                     if let Some(color_image) = img {
                         // Connector sheets are tiled along straight lines.
-                        let options = if crate::ui::psg_viewer::is_connector_sheet(&path) {
+                        let options = if crate::skill_tree::art::is_connector_sheet(&path) {
                             egui::TextureOptions { wrap_mode: egui::TextureWrapMode::Repeat, ..Default::default() }
                         } else {
                             egui::TextureOptions::default()
@@ -398,7 +404,7 @@ impl ContentView {
                                  }
                              }
                              
-                             if self.failed_loads.contains(&hash) {
+                             if self.failed_loads.contains(&hash) || self.is_loading(hash) {
                                  perform_load = false;
                              }
 
@@ -432,13 +438,15 @@ impl ContentView {
                              ui.separator();
 
                              if perform_load {
-                                 self.load_bundled_content(ui.ctx(), reader.as_deref(), index, file_info, hash);
+                                 self.load_bundled_content(ui.ctx(), reader.clone(), index, file_info, hash);
                              }
                              
                               if file_info.path.ends_with(".dat") || file_info.path.ends_with(".dat64") || file_info.path.ends_with(".datc64") || file_info.path.ends_with(".datl") || file_info.path.ends_with(".datl64") {
                                    // DatViewer handles its own scrolling via TableBuilder
                                    // If dat viewer has error, show generic hex views?
-                                   if self.dat_viewer.error_msg.is_some() || self.dat_viewer.reader.is_none() {
+                                   if self.is_loading(hash) {
+                                       ui.spinner();
+                                   } else if self.dat_viewer.error_msg.is_some() || self.dat_viewer.reader.is_none() {
                                        egui::ScrollArea::vertical().show(ui, |ui| {
                                            if let Some(last_err) = &self.last_error {
                                                ui.horizontal(|ui| {
@@ -782,7 +790,7 @@ impl ContentView {
                     }
                 }
             } else if file_info.path.ends_with(".ogg") || file_info.path.ends_with(".wav") || file_info.path.ends_with(".mp3") {
-                                           self.show_audio_player(ui, reader.as_deref(), index, file_info, hash);
+                                           self.show_audio_player(ui, reader.clone(), index, file_info, hash);
                                       } else if file_info.path.ends_with(".bank") {
                                            if self.bank_info_cache.contains_key(&hash) {
                                                self.show_bank_viewer(ui, file_info, hash);
@@ -1395,7 +1403,7 @@ impl ContentView {
         rows
     }
 
-    fn show_audio_player(&mut self, ui: &mut egui::Ui, reader: Option<&GgpkReader>, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
+    fn show_audio_player(&mut self, ui: &mut egui::Ui, reader: Option<std::sync::Arc<GgpkReader>>, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
         ui.spacing_mut().item_spacing.y = 6.0;
 
         let file_name = std::path::Path::new(&file_info.path)
@@ -1435,7 +1443,7 @@ impl ContentView {
                 }
             } else {
                 if ui.button("▶  Play").clicked() {
-                    self.load_bundled_content(ui.ctx(), reader, index, file_info, hash);
+                    self.load_bundled_content(ui.ctx(), reader.clone(), index, file_info, hash);
                 }
             }
         });
@@ -1470,6 +1478,8 @@ impl ContentView {
         // Status dot + label
         let (dot_color, status_text) = if is_playing {
             (egui::Color32::from_rgb(74, 222, 128), "Playing")
+        } else if self.is_loading(hash) {
+            (egui::Color32::from_rgb(82, 82, 91), "Loading…")
         } else {
             (egui::Color32::from_rgb(82, 82, 91), "Stopped")
         };
@@ -2002,38 +2012,6 @@ impl ContentView {
             }
     }
 
-    // Caching helpers
-    //
-    // Stored under the app's managed `cache/` dir (not the system temp dir)
-    // so it's included in Settings' cache size display and "Clear Cache",
-    // and gets wiped along with everything else on a patch-version change.
-    fn get_cache_path(hash: u64) -> std::path::PathBuf {
-        let mut path = crate::settings::AppSettings::get_app_data_dir().join("cache").join("parsed");
-        let _ = std::fs::create_dir_all(&path);
-        path.push(format!("{:x}.bin", hash));
-        path
-    }
-
-    fn try_load_from_cache(&mut self, hash: u64) -> bool {
-        let path = Self::get_cache_path(hash);
-        if path.exists() {
-             if let Ok(file) = std::fs::File::open(&path) {
-                 if let Ok(value) = bincode::deserialize_from::<_, serde_json::Value>(std::io::BufReader::new(file)) {
-                     self.json_cache.insert(hash, value);
-                     return true;
-                 }
-             }
-        }
-        false
-    }
-
-    fn save_to_cache(hash: u64, value: &serde_json::Value) {
-        let path = Self::get_cache_path(hash);
-        if let Ok(file) = std::fs::File::create(&path) {
-            let _ = bincode::serialize_into(std::io::BufWriter::new(file), value);
-        }
-    }
-
     /// Runs the background row-count scan the DAT viewer uses to suggest foreign-key
     /// targets — once per index, and only after the viewer asks for it.
     fn service_table_stats(&mut self, ctx: &egui::Context, reader: Option<std::sync::Arc<GgpkReader>>, index: &std::sync::Arc<crate::bundles::index::Index>) {
@@ -2189,178 +2167,57 @@ impl ContentView {
         }
     }
 
-    pub fn load_bundled_content(&mut self, ctx: &egui::Context, reader: Option<&GgpkReader>, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
-         // Reset previous state
-         self.dat_viewer.reader = None;
-         self.dat_viewer.error_msg = None;
-         self.last_error = None;
+    /// Reads and decodes the file on a worker thread; `poll_load` stores the
+    /// result. The read can reach the patch CDN, so it must not block a frame.
+    pub fn load_bundled_content(&mut self, ctx: &egui::Context, reader: Option<std::sync::Arc<GgpkReader>>, index: &std::sync::Arc<crate::bundles::index::Index>, file_info: &crate::bundles::index::FileInfo, hash: u64) {
+        self.dat_viewer.reader = None;
+        self.dat_viewer.error_msg = None;
+        self.last_error = None;
 
-         // Check persistent cache for JSON/PSG
-         if is_json_path(&file_info.path) || file_info.path.ends_with(".psg") || file_info.path.ends_with(".fxgraph") {
-             if self.try_load_from_cache(hash) {
-                 println!("Loaded {} from disk cache.", file_info.path);
-                 return;
-             }
-         }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.loading = Some((hash, rx));
+        let index = index.clone();
+        let file_info = file_info.clone();
+        let steam_loader = self.steam_loader.clone();
+        let cdn_loader = self.cdn_loader.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let content = crate::bundles::extract::read_file(&file_info, &index, reader.as_deref(), steam_loader.as_ref(), cdn_loader.as_ref())
+                .map(|data| decode_file(&file_info.path, data));
+            let _ = tx.send(LoadedFile { hash, path: file_info.path, content });
+            ctx.request_repaint();
+        });
+    }
 
-         // Loose file (Steam Art/ directory) — read directly from disk
-         if file_info.bundle_index == crate::bundles::steam::LOOSE_FILE_SENTINEL {
-             // Resolve the path first so the immutable steam_loader borrow is
-             // released before we mutate the caches.
-             let loose_path = self.steam_loader.as_ref()
-                 .and_then(|steam| steam.loose_file_path(&file_info.path));
-             if let Some(loose_path) = loose_path {
-                 match std::fs::read(&loose_path) {
-                     Ok(data) => {
-                         self.failed_loads.remove(&hash);
-                         self.last_error = None;
-                         self.route_file_data(ctx, &file_info.path, hash, data);
-                     }
-                     Err(e) => {
-                         self.last_error = Some(format!("Failed to read loose file: {}", e));
-                         self.failed_loads.insert(hash);
-                     }
-                 }
-             } else if self.steam_loader.is_some() {
-                 self.last_error = Some(format!("Loose file not found on disk: {}", file_info.path));
-                 self.failed_loads.insert(hash);
-             }
-             return;
-         }
+    fn is_loading(&self, hash: u64) -> bool {
+        self.loading.as_ref().is_some_and(|(h, _)| *h == hash)
+    }
 
-         // Loose GGPK record (FMOD/*.bank, Media/*.bk2, ...) — read directly
-         // from the GGPK file records instead of a bundle.
-         if file_info.bundle_index == crate::bundles::index::GGPK_LOOSE_FILE_SENTINEL {
-             let data = reader.and_then(|r| {
-                 r.read_file_by_path(&file_info.path).ok().flatten().and_then(|rec| {
-                     r.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec())
-                 })
-             });
-             match data {
-                 Some(data) => {
-                     self.failed_loads.remove(&hash);
-                     self.last_error = None;
-                     self.route_file_data(ctx, &file_info.path, hash, data);
-                 }
-                 None => {
-                     self.last_error = Some(format!("Failed to read loose GGPK file: {}", file_info.path));
-                     self.failed_loads.insert(hash);
-                 }
-             }
-             return;
-         }
-
-         if let Some(bundle_info) = index.bundles.get(file_info.bundle_index as usize) {
-             let mut raw_bundle_data: Option<Vec<u8>> = None;
-
-             // 1. Try Local GGPK
-             if let Some(reader) = reader {
-                 let candidates = vec![
-                     format!("Bundles2/{}", bundle_info.name),
-                     format!("Bundles2/{}.bundle.bin", bundle_info.name),
-                     bundle_info.name.clone(),
-                     format!("{}.bundle.bin", bundle_info.name),
-                 ];
-                 for cand in &candidates {
-                     if let Ok(Some(rec)) = reader.read_file_by_path(cand) {
-                         println!("Bundle found in GGPK: {}", cand);
-                         if let Ok(data) = reader.get_data_slice(rec.data_offset, rec.data_length) {
-                             raw_bundle_data = Some(data.to_vec());
-                             break;
-                         }
-                     }
-                 }
-             }
-
-             // 1.5. Try Steam directory
-             if raw_bundle_data.is_none() {
-                 if let Some(steam) = &self.steam_loader {
-                     if let Ok(data) = steam.fetch_bundle(&bundle_info.name) {
-                         println!("Bundle found in Steam dir: {}", bundle_info.name);
-                         raw_bundle_data = Some(data);
-                     }
-                 }
-             }
-
-             // 2. Try CDN Fallback
-             if raw_bundle_data.is_none() {
-                 if let Some(cdn) = &self.cdn_loader {
-                     // PoE2 CDN expects .bundle.bin suffix usually
-                     let fetch_name = if bundle_info.name.ends_with(".bundle.bin") {
-                         bundle_info.name.clone()
-                     } else {
-                         format!("{}.bundle.bin", bundle_info.name)
-                     };
-                     
-                     println!("Bundle missing from GGPK. Attempting CDN fetch for: {}", fetch_name);
-                     match cdn.fetch_bundle(&fetch_name) {
-                         Ok(data) => {
-                             println!("Bundle fetched from CDN. Size: {}", data.len());
-                             raw_bundle_data = Some(data);
-                         },
-                         Err(e) => {
-                             let msg = format!("CDN Fetch Failed: {}", e);
-                             println!("{}", msg);
-                             self.last_error = Some(msg);
-                             self.failed_loads.insert(hash);
-                         }
-                     }
-                 } else {
-                     let msg = format!("Bundle not found in GGPK and CDN Loader not initialized. Hash: {}", hash);
-                     println!("{}", msg);
-                     self.last_error = Some(msg);
-                     self.failed_loads.insert(hash);
-                 }
-             }
-
-             let mut decompressed_bundle_data: Option<Vec<u8>> = None;
-
-             if let Some(data) = raw_bundle_data {
-                 let mut cursor = std::io::Cursor::new(data);
-                 if let Ok(bundle) = crate::bundles::bundle::Bundle::read_header(&mut cursor) {
-                     if let Ok(decompressed) = bundle.decompress(&mut cursor) {
-                         decompressed_bundle_data = Some(decompressed);
-                     }
-                 }
-             }
-
-             if decompressed_bundle_data.is_none() {
-                 if let Some(reader) = reader {
-                     println!("Bundle not found or decompression failed. Attempting direct GGPK file lookup for: {}", file_info.path);
-                     if let Ok(Some(rec)) = reader.read_file_by_path(&file_info.path) {
-                         if let Ok(data) = reader.get_data_slice(rec.data_offset, rec.data_length) {
-                             let start = file_info.file_offset as usize;
-                             let end = start + data.len();
-                             let mut fake_decompressed = vec![0u8; end];
-                             fake_decompressed[start..end].copy_from_slice(data);
-                             decompressed_bundle_data = Some(fake_decompressed);
-                             println!("Direct GGPK fallback succeeded for: {}", file_info.path);
-                         }
-                     }
-                 }
-             }
-
-             if let Some(decompressed_data) = decompressed_bundle_data {
-                 self.failed_loads.remove(&hash);
-                 let start = file_info.file_offset as usize;
-                 let end = start + file_info.file_size as usize;
-                 
-                 if end <= decompressed_data.len() {
-                     let file_data = decompressed_data[start..end].to_vec();
-                     self.route_file_data(ctx, &file_info.path, hash, file_data);
-                 } else {
-                     let msg = format!("Decompressed bounds check failed for '{}'", file_info.path);
-                     println!("{}", msg);
-                     self.last_error = Some(msg);
-                     self.failed_loads.insert(hash);
-                 }
-             } else {
-                 let msg = format!("Failed to load or decompress data for '{}' (bundle not found and GGPK lookup failed)", file_info.path);
-                 println!("{}", msg);
-                 self.last_error = Some(msg);
-                 self.failed_loads.insert(hash);
-             }
-          }
+    fn poll_load(&mut self, ctx: &egui::Context) {
+        let Some((hash, rx)) = &self.loading else { return };
+        let hash = *hash;
+        let loaded = match rx.try_recv() {
+            Ok(loaded) => loaded,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.loading = None;
+                self.last_error = Some("Reading the file failed; see crash.log".to_string());
+                self.failed_loads.insert(hash);
+                return;
+            }
+        };
+        self.loading = None;
+        match loaded.content {
+            Ok(decoded) => {
+                self.failed_loads.remove(&loaded.hash);
+                self.store_decoded(ctx, &loaded.path, loaded.hash, decoded);
+            }
+            Err(msg) => {
+                println!("{}", msg);
+                self.last_error = Some(msg);
+                self.failed_loads.insert(loaded.hash);
+            }
+        }
     }
 
     /// Kicks off a background build of the atlas skill node database (name +
@@ -2493,241 +2350,204 @@ impl ContentView {
         });
     }
 
-    /// Routes raw file bytes into the appropriate viewer state based on the
-    /// file extension. Shared by bundled, Steam-loose, and GGPK-loose loads.
-    fn route_file_data(&mut self, ctx: &egui::Context, path: &str, hash: u64, file_data: Vec<u8>) {
-                     println!("Loaded content for: {}", path);
-
-                     if path.ends_with(".dat") || path.ends_with(".dat64") || path.ends_with(".datc64") || path.ends_with(".datl") || path.ends_with(".datl64") {
-                          println!("Loading DAT: {} ({} bytes)", path, file_data.len());
-                          self.dat_viewer.load_from_bytes(file_data, path);
-                          if self.dat_viewer.reader.is_none() {
-                              self.last_error = Some(format!("Failed to parse DAT file: {}", self.dat_viewer.error_msg.as_deref().unwrap_or("Unknown error")));
-                              // Prevent retry loop
-                              self.failed_loads.insert(hash);
-                          } else {
-                              self.last_error = None;
-                          }
-                      } else if is_image_path(path) {
-                          // Try to load Image
-                          self.last_error = None;
-
-                          println!("Image Loading: Data Length {}", file_data.len());
-
-                          // Special handling for DDS
-                          if path.ends_with(".dds") || path.ends_with(".dds.header") {
-                              let dds_bytes = dds_payload(&file_data);
-                              if dds_bytes.len() > 16 {
-                                  let magic = &dds_bytes[0..4];
-                                  if magic != b"DDS " {
-                                      println!("WARNING: Magic bytes mismatch! Expected 'DDS ', found {:?}", magic);
-                                  }
-                              }
-
-                              // Method 1: Try image_dds first (better support for various DXT/BC formats for DDS)
-                              let mut loaded = false;
-                              let mut cursor = std::io::Cursor::new(dds_bytes);
-                              match ddsfile::Dds::read(&mut cursor) {
-                                  Ok(dds) => {
-                                      println!("DDS Header Read OK.");
-                                      match image_dds::image_from_dds(&dds, 0) {
-                                          Ok(image) => {
-                                              println!("image_dds conversion OK. Size: {}x{}", image.width(), image.height());
-                                              let size = [image.width() as usize, image.height() as usize];
-                                              let pixels = image.as_raw();
-                                              let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                                  size,
-                                                  pixels,
-                                              );
-                                              let texture = ctx.load_texture(
-                                                  path,
-                                                  color_image,
-                                                  egui::TextureOptions::default()
-                                              );
-                                              self.insert_texture(hash, texture);
-                                              loaded = true;
-                                          },
-                                          Err(e) => {
-                                              println!("image_dds failed to convert: {:?}", e);
-                                          }
-                                      }
-                                  },
-                                  Err(e) => {
-                                      println!("DDS Header Read Failed: {:?}", e);
-                                  }
-                              }
-                              
-                              if !loaded {
-                                   // Fallback to Method 2 below
-                              } else {
-                                  self.failed_loads.remove(&hash);
-                                  self.last_error = None;
-                                  return;
-                              }
-                          }
-
-                          // Method 2: Standard image crate (supports png, jpg, webp, and some dds)
-                          if let Ok(img) = image::load_from_memory(&file_data) {
-                              let size = [img.width() as usize, img.height() as usize];
-                              let image_buffer = img.to_rgba8();
-                              let pixels = image_buffer.as_flat_samples();
-                              let color_image = egui::ColorImage::from_rgba_unmultiplied(
-                                  size,
-                                  pixels.as_slice(),
-                              );
-                              
-                              let texture = ctx.load_texture(
-                                  path,
-                                  color_image,
-                                  egui::TextureOptions::default()
-                              );
-                              self.insert_texture(hash, texture);
-                              self.failed_loads.remove(&hash);
-                              self.last_error = None;
-                          } else {
-                              let msg = format!("Failed to decode image. File size: {}", file_data.len());
-                              self.last_error = Some(msg);
-                              self.failed_loads.insert(hash);
-                          }
-                     } else if path.ends_with(".ogg") || path.ends_with(".wav") || path.ends_with(".mp3") {
-                          println!("Audio file selected: {}", path);
-                          
-                          // Initialize audio if needed
-                          if self.audio_device.is_none() {
-                              if let Ok(device) = rodio::DeviceSinkBuilder::open_default_sink() {
-                                  self.audio_device = Some(device);
-                              } else {
-                                  println!("Failed to get default audio output device");
-                              }
-                          }
-                          
-                          if let Some(device) = &self.audio_device {
-                              use std::io::Cursor;
-                              let cursor = Cursor::new(file_data);
-                              
-                              if let Ok(decoder) = rodio::Decoder::new(cursor) {
-                                   // Recreate sink for each playback to avoid state issues
-                                   let sink = rodio::Player::connect_new(device.mixer());
-                                   sink.set_volume(self.audio_volume);
-                                   sink.append(decoder);
-                                   sink.play();
-                                   self.audio_sink = Some(sink);
-                              } else {
-                                  self.last_error = Some("Failed to decode Audio (Might be Wwise WEM)".to_string());
-                              }
-                          }
-                      } else if path.ends_with(".csd") {
-                          match csd::parse_csd(&file_data, path) {
-                              Ok(csd_file) => {
-                                  self.csd_cache.insert(hash, csd_file);
-                                  self.last_error = None;
-                              },
-                              Err(e) => {
-                                  self.last_error = Some(format!("CSD Parse Error: {}", e));
-                                  self.failed_loads.insert(hash);
-                              }
-                          }
-                      } else if crate::parsers::model::is_model_path(path) {
-                          match crate::parsers::model::parse_model(path, &file_data) {
-                              Ok(model) => {
-                                  let summary = model.summary();
-                                  self.model_cache.insert(hash, (std::sync::Arc::new(model), summary));
-                                  self.last_error = None;
-                              }
-                              Err(e) => {
-                                  self.last_error = Some(format!("Model parse error: {}", e));
-                              }
-                          }
-                          self.insert_raw(hash, file_data);
-                      } else if is_json_path(path) {
-                           // Read file content as string
-                           let text = decode_text_with_detection(&file_data);
-                           match serde_json::from_str::<serde_json::Value>(&text) {
-                               Ok(val) => {
-                                    self.json_cache.insert(hash, val);
-                                    self.last_error = None;
-                               },
-                               Err(e) => {
-                                    self.last_error = Some(format!("JSON Parse Error: {}", e));
-                                    self.failed_loads.insert(hash);
-                               }
-                           }
-                      } else if path.ends_with(".psg") {
-                          match psg::parse_psg(&file_data) {
-                              Ok(psg_file) => {
-                                  self.psg_cache.insert(hash, psg_file.clone());
-                                  
-                                  // Convert PSG to Value for JSON view (fallback)
-                                  if let Ok(v) = serde_json::to_value(&psg_file) {
-                                      Self::save_to_cache(hash, &v);
-                                      self.json_cache.insert(hash, v);
-                                      self.last_error = None;
-                                  } else {
-                                       self.last_error = Some("Failed to serialize PSG to JSON".to_string());
-                                       // self.failed_loads.insert(hash); // Don't fail load if graph works?
-                                  }
-                              },
-                              Err(e) => {
-                                  // println!("PSG Parse Error: {}", e);
-                                  self.last_error = Some(format!("PSG Parse Error: {}", e));
-                                  self.insert_raw(hash, file_data.clone());
-                                  self.failed_loads.insert(hash);
-                              }
-                          }
-                      } else if path.ends_with(".fxgraph") {
-                          match crate::parsers::fxgraph::parse_fxgraph(&file_data) {
-                              Ok(graph) => {
-                                  self.fxgraph_cache.insert(hash, graph.clone());
-
-                                  // Convert to Value for the JSON fallback/toggle view
-                                  if let Ok(v) = serde_json::to_value(&graph) {
-                                      Self::save_to_cache(hash, &v);
-                                      self.json_cache.insert(hash, v);
-                                      self.last_error = None;
-                                  } else {
-                                       self.last_error = Some("Failed to serialize FX graph to JSON".to_string());
-                                  }
-                              },
-                              Err(e) => {
-                                  self.last_error = Some(format!("FX Graph Parse Error: {}", e));
-                                  self.insert_raw(hash, file_data.clone());
-                                  self.failed_loads.insert(hash);
-                              }
-                          }
-                      } else if is_text_file(path) {
-                          // Just store raw data, we decode on render
-                          self.insert_raw(hash, file_data);
-                          self.last_error = None;
-                      } else if path.ends_with(".bank") {
-                          match crate::parsers::fmod_bank::parse_bank_info(&file_data) {
-                              Ok(info) => {
-                                  self.bank_info_cache.insert(hash, info);
-                                  self.last_error = None;
-                              }
-                              Err(e) => {
-                                  self.last_error = Some(format!("Bank parse failed: {}", e));
-                              }
-                          }
-                          // Keep raw bytes for on-demand stream decode (and to stop re-loading)
-                          self.insert_raw(hash, file_data);
-                      } else {
-                          // Fallback for unknown files - cache raw data to stop re-loading
-                          self.insert_raw(hash, file_data);
-                          self.last_error = None;
-                      }
+    /// Puts a decoded file into the cache its viewer reads.
+    fn store_decoded(&mut self, ctx: &egui::Context, path: &str, hash: u64, decoded: Decoded) {
+        println!("Loaded content for: {}", path);
+        match decoded {
+            Decoded::Dat(data) => {
+                println!("Loading DAT: {} ({} bytes)", path, data.len());
+                self.dat_viewer.load_from_bytes(data, path);
+                if self.dat_viewer.reader.is_none() {
+                    self.last_error = Some(format!("Failed to parse DAT file: {}", self.dat_viewer.error_msg.as_deref().unwrap_or("Unknown error")));
+                    // Prevent retry loop
+                    self.failed_loads.insert(hash);
+                } else {
+                    self.last_error = None;
+                }
+            }
+            Decoded::Image(Ok(image)) => {
+                let texture = ctx.load_texture(path, image, egui::TextureOptions::default());
+                self.insert_texture(hash, texture);
+                self.last_error = None;
+            }
+            Decoded::Image(Err(msg)) => {
+                self.last_error = Some(msg);
+                self.failed_loads.insert(hash);
+            }
+            Decoded::Audio(data) => {
+                if self.audio_device.is_none() {
+                    match rodio::DeviceSinkBuilder::open_default_sink() {
+                        Ok(device) => self.audio_device = Some(device),
+                        Err(_) => println!("Failed to get default audio output device"),
+                    }
+                }
+                if let Some(device) = &self.audio_device {
+                    match rodio::Decoder::new(std::io::Cursor::new(data)) {
+                        Ok(decoder) => {
+                            // Recreate sink for each playback to avoid state issues
+                            let sink = rodio::Player::connect_new(device.mixer());
+                            sink.set_volume(self.audio_volume);
+                            sink.append(decoder);
+                            sink.play();
+                            self.audio_sink = Some(sink);
+                        }
+                        Err(_) => self.last_error = Some("Failed to decode Audio (Might be Wwise WEM)".to_string()),
+                    }
+                }
+            }
+            Decoded::Csd(Ok(csd_file)) => {
+                self.csd_cache.insert(hash, csd_file);
+                self.last_error = None;
+            }
+            Decoded::Csd(Err(e)) => {
+                self.last_error = Some(format!("CSD Parse Error: {}", e));
+                self.failed_loads.insert(hash);
+            }
+            Decoded::Model(model, data) => {
+                match model {
+                    Ok((model, summary)) => {
+                        self.model_cache.insert(hash, (model, summary));
+                        self.last_error = None;
+                    }
+                    Err(e) => self.last_error = Some(format!("Model parse error: {}", e)),
+                }
+                self.insert_raw(hash, data);
+            }
+            Decoded::Json(Ok(value)) => {
+                self.json_cache.insert(hash, value);
+                self.last_error = None;
+            }
+            Decoded::Json(Err(e)) => {
+                self.last_error = Some(format!("JSON Parse Error: {}", e));
+                self.failed_loads.insert(hash);
+            }
+            Decoded::Psg(Ok((psg_file, json))) => {
+                self.psg_cache.insert(hash, psg_file);
+                match json {
+                    Some(v) => {
+                        self.json_cache.insert(hash, v);
+                        self.last_error = None;
+                    }
+                    None => self.last_error = Some("Failed to serialize PSG to JSON".to_string()),
+                }
+            }
+            Decoded::Psg(Err((e, data))) => {
+                self.last_error = Some(format!("PSG Parse Error: {}", e));
+                self.insert_raw(hash, data);
+                self.failed_loads.insert(hash);
+            }
+            Decoded::FxGraph(Ok((graph, json))) => {
+                self.fxgraph_cache.insert(hash, graph);
+                match json {
+                    Some(v) => {
+                        self.json_cache.insert(hash, v);
+                        self.last_error = None;
+                    }
+                    None => self.last_error = Some("Failed to serialize FX graph to JSON".to_string()),
+                }
+            }
+            Decoded::FxGraph(Err((e, data))) => {
+                self.last_error = Some(format!("FX Graph Parse Error: {}", e));
+                self.insert_raw(hash, data);
+                self.failed_loads.insert(hash);
+            }
+            Decoded::Bank(info, data) => {
+                match info {
+                    Ok(info) => {
+                        self.bank_info_cache.insert(hash, info);
+                        self.last_error = None;
+                    }
+                    Err(e) => self.last_error = Some(format!("Bank parse failed: {}", e)),
+                }
+                // Keep raw bytes for on-demand stream decode (and to stop re-loading)
+                self.insert_raw(hash, data);
+            }
+            Decoded::Raw(data) => {
+                self.insert_raw(hash, data);
+                self.last_error = None;
+            }
+        }
     }
-
-
-
-
-
-
-
-
-
 }
 
+/// A file read and decoded on a worker thread, ready to store.
+struct LoadedFile {
+    hash: u64,
+    path: String,
+    content: Result<Decoded, String>,
+}
 
+/// A file parsed for the viewer its extension picks. A parse that fails but
+/// still leaves something to show keeps the raw bytes.
+enum Decoded {
+    Dat(Vec<u8>),
+    Image(Result<egui::ColorImage, String>),
+    Audio(Vec<u8>),
+    Csd(Result<csd::CsdFile, String>),
+    Model(Result<(std::sync::Arc<crate::parsers::model::ModelFile>, serde_json::Value), String>, Vec<u8>),
+    Json(Result<serde_json::Value, String>),
+    Psg(Result<(psg::PsgFile, Option<serde_json::Value>), (String, Vec<u8>)>),
+    FxGraph(Result<(crate::parsers::fxgraph::FxGraph, Option<serde_json::Value>), (String, Vec<u8>)>),
+    Bank(Result<crate::parsers::fmod_bank::FmodBankInfo, String>, Vec<u8>),
+    Raw(Vec<u8>),
+}
+
+fn decode_file(path: &str, data: Vec<u8>) -> Decoded {
+    if path.ends_with(".dat") || path.ends_with(".dat64") || path.ends_with(".datc64") || path.ends_with(".datl") || path.ends_with(".datl64") {
+        Decoded::Dat(data)
+    } else if is_image_path(path) {
+        Decoded::Image(decode_image(path, &data))
+    } else if path.ends_with(".ogg") || path.ends_with(".wav") || path.ends_with(".mp3") {
+        Decoded::Audio(data)
+    } else if path.ends_with(".csd") {
+        Decoded::Csd(csd::parse_csd(&data, path))
+    } else if crate::parsers::model::is_model_path(path) {
+        let model = crate::parsers::model::parse_model(path, &data).map(|model| {
+            let summary = model.summary();
+            (std::sync::Arc::new(model), summary)
+        });
+        Decoded::Model(model, data)
+    } else if is_json_path(path) {
+        Decoded::Json(serde_json::from_str(&decode_text_with_detection(&data)).map_err(|e| e.to_string()))
+    } else if path.ends_with(".psg") {
+        Decoded::Psg(match psg::parse_psg(&data) {
+            Ok(file) => {
+                let json = serde_json::to_value(&file).ok();
+                Ok((file, json))
+            }
+            Err(e) => Err((e, data)),
+        })
+    } else if path.ends_with(".fxgraph") {
+        Decoded::FxGraph(match crate::parsers::fxgraph::parse_fxgraph(&data) {
+            Ok(graph) => {
+                let json = serde_json::to_value(&graph).ok();
+                Ok((graph, json))
+            }
+            Err(e) => Err((e, data)),
+        })
+    } else if path.ends_with(".bank") {
+        let info = crate::parsers::fmod_bank::parse_bank_info(&data);
+        Decoded::Bank(info, data)
+    } else {
+        Decoded::Raw(data)
+    }
+}
+
+/// DDS through image_dds first (it covers more BC formats), then the image crate.
+fn decode_image(path: &str, data: &[u8]) -> Result<egui::ColorImage, String> {
+    if path.ends_with(".dds") || path.ends_with(".dds.header") {
+        match ddsfile::Dds::read(&mut std::io::Cursor::new(dds_payload(data))) {
+            Ok(dds) => match image_dds::image_from_dds(&dds, 0) {
+                Ok(image) => return Ok(rgba_to_color_image(&image)),
+                Err(e) => println!("image_dds failed to convert: {:?}", e),
+            },
+            Err(e) => println!("DDS Header Read Failed: {:?}", e),
+        }
+    }
+    image::load_from_memory(data)
+        .map(|img| rgba_to_color_image(&img.to_rgba8()))
+        .map_err(|_| format!("Failed to decode image. File size: {}", data.len()))
+}
 
 fn is_text_file(path: &str) -> bool {
     let p = path.to_lowercase();
@@ -3028,50 +2848,6 @@ fn launch_bink_player(path: &std::path::Path, _game_root: Option<&std::path::Pat
     open::that(path).map_err(|e| e.to_string())
 }
 
-/// Synchronously extracts one file from the bundle system without going through the cache.
-pub(crate) fn extract_bundle_file_sync(
-    file_info: &crate::bundles::index::FileInfo,
-    index: &crate::bundles::index::Index,
-    reader: Option<&GgpkReader>,
-    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
-) -> Option<Vec<u8>> {
-    if file_info.bundle_index == crate::bundles::index::GGPK_LOOSE_FILE_SENTINEL {
-        let r = reader?;
-        let rec = r.read_file_by_path(&file_info.path).ok().flatten()?;
-        return r.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec());
-    }
-
-    let bundle_info = index.bundles.get(file_info.bundle_index as usize)?;
-    let raw = fetch_bundle_raw(bundle_info, reader, steam_loader)?;
-
-    let mut cursor = std::io::Cursor::new(raw);
-    let header = crate::bundles::bundle::Bundle::read_header(&mut cursor).ok()?;
-    let data = header.decompress(&mut cursor).ok()?;
-    let start = file_info.file_offset as usize;
-    let end = start + file_info.file_size as usize;
-    if end <= data.len() { Some(data[start..end].to_vec()) } else { None }
-}
-
-/// Compressed bytes of one bundle, from the GGPK if it has them, else the Steam install.
-fn fetch_bundle_raw(
-    bundle_info: &crate::bundles::index::BundleInfo,
-    reader: Option<&GgpkReader>,
-    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
-) -> Option<Vec<u8>> {
-    let from_ggpk = reader.and_then(|reader| {
-        let candidates = [
-            format!("Bundles2/{}", bundle_info.name),
-            format!("Bundles2/{}.bundle.bin", bundle_info.name),
-        ];
-        candidates.iter().find_map(|c| {
-            reader.read_file_by_path(c).ok().flatten().and_then(|rec| {
-                reader.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec())
-            })
-        })
-    });
-    from_ggpk.or_else(|| steam_loader.and_then(|s| s.fetch_bundle(&bundle_info.name).ok()))
-}
-
 fn is_dat_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     p.ends_with(".dat") || p.ends_with(".dat64") || p.ends_with(".datc64") || p.ends_with(".datl") || p.ends_with(".datl64")
@@ -3110,11 +2886,7 @@ pub(crate) fn scan_table_stats(
             }
             continue;
         }
-        let Some(bundle_info) = index.bundles.get(bundle_index as usize) else { continue };
-        let Some(raw) = fetch_bundle_raw(bundle_info, reader, steam_loader) else { continue };
-        let mut cursor = std::io::Cursor::new(raw);
-        let Ok(header) = crate::bundles::bundle::Bundle::read_header(&mut cursor) else { continue };
-        let Ok(data) = header.decompress(&mut cursor) else { continue };
+        let Some(data) = decompress_bundle(bundle_index, index, reader, steam_loader) else { continue };
         for f in files {
             let start = f.file_offset as usize;
             let end = start + f.file_size as usize;
@@ -3127,235 +2899,6 @@ pub(crate) fn scan_table_stats(
         }
     }
     out
-}
-
-pub(crate) fn find_file_info_by_path<'a>(
-    index: &'a crate::bundles::index::Index,
-    path: &str,
-) -> Option<&'a crate::bundles::index::FileInfo> {
-    index.files.values().find(|f| f.path.eq_ignore_ascii_case(path))
-}
-
-/// Every DDS path the given `.psg`'s art (icons + tree-context frames,
-/// connectors, group backgrounds) will need, deduplicated. Only 771 unique
-/// node icons exist across the *entire* game's passive skill data, so a
-/// single tree's subset is small enough to bulk-request in one go.
-pub(crate) fn collect_needed_texture_paths(
-    psg: &crate::dat::psg::PsgFile,
-    db: &crate::ui::atlas_node_db::SkillGraphDatabase,
-) -> Vec<String> {
-    use crate::ui::psg_viewer as pv;
-    let tree_context = crate::ui::atlas_node_db::tree_context_for_graph_type(psg.graph_type);
-    let mut paths = Vec::new();
-
-    let push_art_set = |art: &crate::ui::skill_tree_art::SkillTreeArtSet, paths: &mut Vec<String>| {
-        paths.push(art.group_background.small.clone());
-        paths.push(art.group_background.medium.clone());
-        paths.push(art.group_background.large.clone());
-        paths.push(art.connection.normal.clone());
-        paths.push(art.connection.active.clone());
-        for frame in art.frames.values() {
-            paths.push(frame.normal.clone());
-            paths.push(frame.active.clone());
-        }
-    };
-
-    match psg.graph_type {
-        1 => {
-            paths.push(crate::ui::atlas_node_db::ATLAS_MAIN_TREE_BG_PATH.to_string());
-            paths.push(pv::ATLAS_START.to_string());
-            for d in &db.decorators {
-                paths.push(d.background.clone());
-                paths.push(d.blocked.clone());
-            }
-        }
-        2 => {
-            paths.push(pv::BREACH_BACKDROP.to_string());
-            paths.push(pv::BREACH_START.to_string());
-        }
-        _ => {
-            paths.push(pv::MAIN_CIRCLE.to_string());
-            paths.push(pv::MAIN_CIRCLE_ACTIVE.to_string());
-            paths.push(pv::PLUS_FRAME_NORMAL.to_string());
-            paths.push(pv::PLUS_FRAME_ACTIVE.to_string());
-            for &c in &db.playable_characters() {
-                let ch = &db.characters[c];
-                if let Some(i) = &ch.illustration {
-                    paths.push(i.clone());
-                }
-            }
-            for (i, a) in db.ascendancies.iter().enumerate() {
-                if !a.is_enabled() {
-                    continue;
-                }
-                if let Some(img) = &a.illustration {
-                    paths.push(img.clone());
-                }
-                if let Some(art) = db.ui_art_for_ascendancy(i) {
-                    push_art_set(art, &mut paths);
-                }
-            }
-            for frame in &db.node_frames {
-                paths.push(frame.normal.clone());
-                paths.push(frame.active.clone());
-            }
-        }
-    }
-
-    if let Some(art) = db.art_sets.get(tree_context) {
-        push_art_set(art, &mut paths);
-    }
-
-    for group in &psg.groups {
-        for node in &group.nodes {
-            if let Some(info) = db.nodes.get(&node.skill_id) {
-                if let Some(icon) = &info.icon {
-                    paths.push(icon.clone());
-                }
-                if let Some(pattern) = info.mastery_group.and_then(|g| db.mastery_effect_images.get(&g)) {
-                    paths.push(pattern.clone());
-                }
-                if let Some((bg, _, _)) = &info.atlas_subtree_background {
-                    paths.push(bg.clone());
-                }
-                if let Some(icon) = &info.atlas_subtree_icon {
-                    paths.push(icon.clone());
-                }
-            }
-        }
-    }
-
-    paths.retain(|p| !p.is_empty());
-    paths.sort();
-    paths.dedup();
-    paths
-}
-
-/// Fetches the DAT/CSD files needed to resolve skill graph nodes (passive
-/// tree, atlas, and league/Brequel trees all share the `PassiveSkills` table,
-/// just with different stat-description sources) and builds the resolved
-/// database. Runs on a background thread — these files total several MB and
-/// parsing them synchronously would stall a frame.
-pub(crate) fn build_skill_graph_db(
-    reader: Option<&GgpkReader>,
-    index: &crate::bundles::index::Index,
-    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
-    schema: &crate::dat::schema::Schema,
-) -> Result<crate::ui::atlas_node_db::SkillGraphDatabase, String> {
-    let is_poe2 = crate::data_export::game_from_index(index).map(|g| g.is_poe2()).unwrap_or(true);
-    let fetch = |path: &str| {
-        find_file_info_by_path(index, path).and_then(|info| extract_bundle_file_sync(info, index, reader, steam_loader))
-    };
-    build_skill_graph_db_from(&fetch, schema, is_poe2, false)
-}
-
-/// `build_skill_graph_db` over any source of game files. `hardmode` reads
-/// PoE 1's passives as Ruthless has them.
-pub(crate) fn build_skill_graph_db_from(
-    fetch_file: &dyn Fn(&str) -> Option<Vec<u8>>,
-    schema: &crate::dat::schema::Schema,
-    is_poe2: bool,
-    hardmode: bool,
-) -> Result<crate::ui::atlas_node_db::SkillGraphDatabase, String> {
-    let fetch = |path: &str| -> Result<Vec<u8>, String> {
-        fetch_file(path).ok_or_else(|| format!("Could not read {}", path))
-    };
-    let fetch_optional = |path: &str| -> Option<Vec<u8>> { fetch_file(path) };
-    // PoE 2 keeps its tables under `data/balance/` and its descriptions as
-    // `.csd`; PoE 1 keeps both one level up.
-    let table = |name: &str| match is_poe2 {
-        true => format!("data/balance/{}.datc64", name),
-        false => format!("data/{}.datc64", name),
-    };
-    let passiveskills_bytes = fetch(&table("passiveskills"))?;
-    let stats_bytes = fetch(&table("stats"))?;
-
-    // Covers all three known graph types: character/ascendancy, atlas, and
-    // Brequel (Chayula league tree). Later files redefine earlier entries,
-    // so the generic `stat_descriptions.csd` goes before the passive-tree
-    // files; the atlas files come first so they never shadow passive text.
-    let csd_paths: Vec<String> = match is_poe2 {
-        true => ["atlas_stat_descriptions", "atlas_variant_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions", "passive_skill_variant_stat_descriptions"]
-            .iter()
-            .map(|n| format!("data/statdescriptions/{}.csd", n))
-            .collect(),
-        // A node states what it grants you; the aura file rewords the same
-        // stats as what nearby enemies or allies get, and belongs to buffs.
-        false => ["atlas_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions"]
-            .iter()
-            .map(|n| format!("metadata/statdescriptions/{}.txt", n))
-            .collect(),
-    };
-    let mut stat_csd_sources = Vec::new();
-    for path in csd_paths {
-        // A tree file one game does not ship simply adds nothing.
-        let Some(bytes) = fetch_optional(&path) else { continue };
-        stat_csd_sources.push(crate::ui::atlas_node_db::StatCsdSource { path, bytes });
-    }
-    if stat_csd_sources.is_empty() {
-        return Err("no passive tree stat descriptions found".to_string());
-    }
-
-    let extra = crate::ui::atlas_node_db::ExtraTables {
-        ascendancy: fetch_optional(&table("ascendancy")),
-        descendancy: fetch_optional(&table("descendancy")),
-        mastery_effects: fetch_optional(&table("passiveskillmasteryeffects")),
-        reminder_text: fetch_optional(&table("remindertext")),
-        aura_descriptions: fetch_optional("metadata/statdescriptions/passive_skill_aura_stat_descriptions.txt").map(|bytes| {
-            crate::ui::atlas_node_db::StatCsdSource {
-                path: "metadata/statdescriptions/passive_skill_aura_stat_descriptions.txt".to_string(),
-                bytes,
-            }
-        }),
-        buff_templates: fetch_optional(&table("bufftemplates")),
-        buff_definitions: fetch_optional(&table("buffdefinitions")),
-        atlas_subtrees: fetch_optional(&table("atlaspassiveskillsubtrees")),
-        characters: fetch_optional(&table("characters")),
-        decorators: fetch_optional(&table("passivetreedecorators")),
-        mastery_groups: fetch_optional(&table("passiveskillmasterygroups")),
-        mastery_art: fetch_optional(&table("passiveskilltreemasteryart")),
-    };
-
-    let mut db = crate::ui::atlas_node_db::build(
-        passiveskills_bytes,
-        stats_bytes,
-        &stat_csd_sources,
-        extra,
-        schema,
-        is_poe2,
-        hardmode,
-    )?;
-
-    let node_frames = match fetch_optional(&table("passiveskilltreenodeframeart")) {
-        Some(bytes) => crate::ui::skill_tree_art::parse_node_frame_art(bytes, schema, is_poe2)?,
-        None => Vec::new(),
-    };
-    let ui_art_bytes = fetch(&table("passiveskilltreeuiart"))?;
-    // PoE 1 points its UI art at a background-art row and names no connector art.
-    let (art_sets, ui_art_ids) = match is_poe2 {
-        true => {
-            let connection_bytes = fetch(&table("passiveskilltreeconnectionart"))?;
-            let connections = crate::ui::skill_tree_art::parse_connection_art(connection_bytes, schema, is_poe2)?;
-            crate::ui::skill_tree_art::parse_ui_art(ui_art_bytes, &node_frames, &connections)?
-        }
-        false => {
-            let backgrounds = match fetch_optional(&table("passiveskilltreegroupbackgroundart")) {
-                Some(bytes) => crate::ui::skill_tree_art::parse_group_background_art(bytes, schema, is_poe2)?,
-                None => Vec::new(),
-            };
-            crate::ui::skill_tree_art::parse_ui_art_poe1(ui_art_bytes, schema, &node_frames, &backgrounds)?
-        }
-    };
-    db.art_sets = art_sets;
-    db.ui_art_ids = ui_art_ids;
-    db.node_frames = node_frames;
-    // PoE 1 names its interface art inside sheets rather than shipping files.
-    db.ui_atlas = fetch_optional(crate::ui::ui_atlas::ATLAS_PATH)
-        .map(|bytes| crate::ui::ui_atlas::UiAtlas::parse(&crate::parsers::utils::decode_text_lossy(&bytes)))
-        .filter(|atlas| !atlas.is_empty())
-        .map(std::sync::Arc::new);
-
-    Ok(db)
 }
 
 fn rgba_to_color_image(img: &image::RgbaImage) -> egui::ColorImage {
@@ -3409,56 +2952,12 @@ fn tree_art_cache_path(game: crate::settings::Game, path: &str, info: &crate::bu
         .join(format!("{:016x}.png", key))
 }
 
-/// Decompresses a whole bundle (the raw payload for `bundle_index`).
-pub(crate) fn decompress_bundle(
-    bundle_index: u32,
-    index: &crate::bundles::index::Index,
-    reader: Option<&GgpkReader>,
-    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
-) -> Option<Vec<u8>> {
-    let bundle_info = index.bundles.get(bundle_index as usize)?;
-    let raw = reader
-        .and_then(|reader| {
-            [format!("Bundles2/{}", bundle_info.name), format!("Bundles2/{}.bundle.bin", bundle_info.name)]
-                .iter()
-                .find_map(|c| {
-                    reader.read_file_by_path(c).ok().flatten().and_then(|rec| {
-                        reader.get_data_slice(rec.data_offset, rec.data_length).ok().map(|d| d.to_vec())
-                    })
-                })
-        })
-        .or_else(|| steam_loader.and_then(|s| s.fetch_bundle(&bundle_info.name).ok()))?;
-    let mut cursor = std::io::Cursor::new(raw);
-    let header = crate::bundles::bundle::Bundle::read_header(&mut cursor).ok()?;
-    header.decompress(&mut cursor).ok()
-}
-
-/// DAT-stored texture paths under `Art/2DArt/UIImages/...` (group
-/// backgrounds, node frames) are missing a `Textures/Interface/2D/` segment
-/// that the actual bundle path has — confirmed against the real index:
-/// `Art/2DArt/UIImages/InGame/PassiveSkillScreenGroupBackgroundSmall` in the
-/// DAT resolves to
-/// `Art/Textures/Interface/2D/2DArt/UIImages/InGame/PassiveSkillScreenGroupBackgroundSmall.dds`
-/// on disk. Icon (`SkillIcons`) and connector (`PassiveTree`) paths don't
-/// need this — only try it for the `UIImages` case.
-pub(crate) fn dds_path_candidates(path: &str) -> Vec<String> {
-    let mut candidates = vec![path.to_string(), format!("{}.dds", path)];
-    let lower = path.to_ascii_lowercase();
-    if let Some(rest) = lower.strip_prefix("art/2dart/uiimages") {
-        let suffix = &path[path.len() - rest.len()..];
-        let corrected = format!("Art/Textures/Interface/2D/2DArt/UIImages{}", suffix);
-        candidates.push(format!("{}.dds", corrected));
-        candidates.push(corrected);
-    }
-    candidates
-}
-
 /// Fetches and decodes a batch of skill-graph art textures by path.
 fn fetch_and_decode_dds_batch(
     reader: Option<&GgpkReader>,
     index: &crate::bundles::index::Index,
     steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
-    atlas: Option<&crate::ui::ui_atlas::UiAtlas>,
+    atlas: Option<&crate::skill_tree::ui_atlas::UiAtlas>,
     game: crate::settings::Game,
     paths: Vec<String>,
 ) -> Vec<(String, Option<egui::ColorImage>)> {
@@ -3469,7 +2968,7 @@ fn fetch_and_decode_dds_batch(
 
     // Group by bundle so each bundle is decompressed once per batch. A path
     // PoE 1 keeps inside a sheet is read as that sheet and cut out of it.
-    let mut jobs: Vec<(String, Option<&crate::bundles::index::FileInfo>, Option<crate::ui::ui_atlas::AtlasEntry>)> = paths
+    let mut jobs: Vec<(String, Option<&crate::bundles::index::FileInfo>, Option<crate::skill_tree::ui_atlas::AtlasEntry>)> = paths
         .into_iter()
         .map(|p| match resolve_texture_path(index, &p) {
             Some(info) => (p, Some(info), None),
@@ -3514,7 +3013,7 @@ fn fetch_and_decode_dds_batch(
                     current_sheet
                         .as_ref()
                         .and_then(|(_, sheet)| sheet.as_ref())
-                        .and_then(|sheet| crate::ui::ui_atlas::crop(sheet, entry))
+                        .and_then(|sheet| crate::skill_tree::ui_atlas::crop(sheet, entry))
                 }
                 None => bytes.and_then(|b| decode_dds_rgba(&b)),
             };
@@ -3524,14 +3023,6 @@ fn fetch_and_decode_dds_batch(
             (path, img.map(|i| rgba_to_color_image(&i)))
         })
         .collect()
-}
-
-/// Index entry for a DAT-style texture path (with or without `.dds`, with or
-/// without the `Textures/Interface/2D` segment).
-pub(crate) fn resolve_texture_path<'a>(index: &'a crate::bundles::index::Index, path: &str) -> Option<&'a crate::bundles::index::FileInfo> {
-    dds_path_candidates(path)
-        .iter()
-        .find_map(|candidate| find_file_info_by_path(index, candidate))
 }
 
 fn render_parsed_content(ui: &mut egui::Ui, file_name: &str, parsed: &crate::parsers::ParsedContent) {
@@ -3546,6 +3037,45 @@ fn render_parsed_content(ui: &mut egui::Ui, file_name: &str, parsed: &crate::par
         }
         _ => {
             TextConfigViewer::show(ui, file_name, parsed);
+        }
+    }
+}
+
+#[cfg(test)]
+mod load_tests {
+    use super::*;
+
+    /// The worker half of opening a file — `read_file` then `decode_file` —
+    /// against the real GGPK, one file per viewer kind.
+    /// `cargo test --release -- --ignored real_file_loads --nocapture`
+    #[test]
+    #[ignore]
+    fn real_file_loads() {
+        let settings = crate::settings::AppSettings::load();
+        let reader = GgpkReader::open(settings.ggpk_path.expect("no ggpk_path configured")).unwrap();
+        let cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
+        let index = crate::bundles::index::Index::load_from_cache(&cache_path).expect("run the app once to build the index cache");
+        for path in [
+            "art/2dart/atlas/atlas.dds",
+            "data/balance/baseitemtypes.datc64",
+            "metadata/passiveskillgraph.psg",
+            "data/statdescriptions/stat_descriptions.csd",
+            "shaders/archnemesiseffects.hlsl",
+        ] {
+            let fi = find_file_info_by_path(&index, path).unwrap_or_else(|| panic!("{} not in the index", path));
+            let start = std::time::Instant::now();
+            let data = crate::bundles::extract::read_file(fi, &index, Some(&reader), None, None).unwrap();
+            let decoded = decode_file(&fi.path, data);
+            let kind = match &decoded {
+                Decoded::Dat(d) => format!("dat, {} bytes", d.len()),
+                Decoded::Image(img) => format!("image {:?}", img.as_ref().map(|i| i.size).unwrap()),
+                Decoded::Csd(csd) => format!("csd, {} entries", csd.as_ref().unwrap().entries.len()),
+                Decoded::Psg(psg) => format!("psg, {} groups", psg.as_ref().map_err(|(e, _)| e).unwrap().0.groups.len()),
+                Decoded::Raw(d) => format!("raw, {} bytes", d.len()),
+                _ => "other".to_string(),
+            };
+            println!("{:45} {:>6.0} ms  {}", path, start.elapsed().as_secs_f64() * 1000.0, kind);
+            assert!(kind != "other", "{} decoded to an unexpected kind", path);
         }
     }
 }

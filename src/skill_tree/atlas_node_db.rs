@@ -1,5 +1,5 @@
 use crate::dat::csd::{self, CsdFile};
-use crate::dat::reader::{DatReader, DatValue};
+use crate::dat::reader::DatValue;
 use crate::dat::schema::{Schema, Table};
 use crate::dat::stat_translation::TranslationLookup;
 use std::collections::HashMap;
@@ -150,12 +150,12 @@ pub struct SkillGraphDatabase {
     /// `"Character"`/`"Atlas"`/`"BrequelSkillTree"`. Populated by the caller
     /// (see `content_view.rs::build_skill_graph_db`) after `build()` returns,
     /// since it comes from a different set of DAT tables
-    /// ([crate::ui::skill_tree_art]) than node/stat resolution.
-    pub art_sets: HashMap<String, crate::ui::skill_tree_art::SkillTreeArtSet>,
+    /// ([crate::skill_tree::art]) than node/stat resolution.
+    pub art_sets: HashMap<String, crate::skill_tree::art::SkillTreeArtSet>,
     /// `PassiveSkillTreeUIArt` ids in row order (foreignrow targets).
     pub ui_art_ids: Vec<String>,
     /// `PassiveSkillTreeNodeFrameArt` rows in row order (foreignrow targets).
-    pub node_frames: Vec<crate::ui::skill_tree_art::FrameArt>,
+    pub node_frames: Vec<crate::skill_tree::art::FrameArt>,
     pub ascendancies: Vec<AscendancyInfo>,
     pub characters: Vec<CharacterInfo>,
     pub decorators: Vec<Decorator>,
@@ -172,7 +172,7 @@ pub struct SkillGraphDatabase {
     pub is_poe2: bool,
     /// Where PoE 1's interface art sits inside its sheets, when the install
     /// has the descriptor. Filled by the caller, like `art_sets`.
-    pub ui_atlas: Option<std::sync::Arc<crate::ui::ui_atlas::UiAtlas>>,
+    pub ui_atlas: Option<std::sync::Arc<crate::skill_tree::ui_atlas::UiAtlas>>,
 }
 
 impl SkillGraphDatabase {
@@ -195,7 +195,7 @@ impl SkillGraphDatabase {
             .collect()
     }
 
-    pub fn ui_art_for_ascendancy(&self, asc: usize) -> Option<&crate::ui::skill_tree_art::SkillTreeArtSet> {
+    pub fn ui_art_for_ascendancy(&self, asc: usize) -> Option<&crate::skill_tree::art::SkillTreeArtSet> {
         let id = self.ascendancies.get(asc)?.ui_art.and_then(|i| self.ui_art_ids.get(i))?;
         self.art_sets.get(id).or_else(|| self.art_sets.get("Ascendancy"))
     }
@@ -309,7 +309,7 @@ fn as_float(val: &DatValue) -> f32 {
 
 fn parse_characters(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<CharacterInfo>, String> {
     let table = find_table(schema, "Characters", is_poe2)?;
-    let reader = DatReader::new(bytes, "characters.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, "characters.datc64", table)?;
     let id_col = col_index(table, "Id").ok_or("Characters missing Id")?;
     let name_col = col_index(table, "Name");
     let img_col = col_index(table, "PassiveTreeImage");
@@ -346,7 +346,7 @@ fn parse_characters(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Ve
 
 fn parse_ascendancies(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<AscendancyInfo>, String> {
     let table = find_table(schema, "Ascendancy", is_poe2)?;
-    let reader = DatReader::new(bytes, "ascendancy.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, "ascendancy.datc64", table)?;
     let id_col = col_index(table, "Id").ok_or("Ascendancy missing Id")?;
     let get = |name: &str| col_index(table, name);
     let (name_col, char_col, class_col, img_col, angle_col, disabled_col, base_col, ui_col) = (
@@ -393,7 +393,7 @@ fn strings_of(
     is_poe2: bool,
 ) -> Result<Vec<(String, String)>, String> {
     let table = find_table(schema, table_name, is_poe2)?;
-    let reader = DatReader::new(bytes, name).map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, name, table)?;
     let key = col_index(table, columns.0).ok_or_else(|| format!("{} missing {}", table_name, columns.0))?;
     let col = col_index(table, columns.1).ok_or_else(|| format!("{} missing {}", table_name, columns.1))?;
     Ok((0..reader.row_count)
@@ -417,7 +417,7 @@ fn parse_buff_template_lines(
     lookup: &TranslationLookup,
 ) -> Result<HashMap<usize, Vec<String>>, String> {
     let def_table = find_table(schema, "BuffDefinitions", is_poe2)?;
-    let def_reader = DatReader::new(definitions, "buffdefinitions.datc64").map_err(|e| e.to_string())?;
+    let def_reader = crate::dat::analysis::open_checked(definitions, "buffdefinitions.datc64", def_table)?;
     let def_stats = col_index(def_table, "StatsKeys").or_else(|| col_index(def_table, "Stats"));
     let def_flags = col_index(def_table, "GrantedFlags");
     let stats_of = |row: &[DatValue], col: Option<usize>| -> Vec<String> {
@@ -442,7 +442,7 @@ fn parse_buff_template_lines(
         .collect();
 
     let table = find_table(schema, "BuffTemplates", is_poe2)?;
-    let reader = DatReader::new(templates, "bufftemplates.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(templates, "bufftemplates.datc64", table)?;
     let buff_col = col_index(table, "BuffDefinitionsKey").or_else(|| col_index(table, "BuffDefinition"));
     let values_col = col_index(table, "Buff_StatValues");
     let mut out = HashMap::new();
@@ -486,7 +486,7 @@ fn parse_buff_template_lines(
 /// `Descendancy`: the id, name and panel text of each alternate ascendancy.
 fn parse_descendancies(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<DescendancyInfo>, String> {
     let table = find_table(schema, "Descendancy", is_poe2)?;
-    let reader = DatReader::new(bytes, "descendancy.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, "descendancy.datc64", table)?;
     let get = |name: &str| col_index(table, name);
     let (id, name, flavour, colour, rect) =
         (get("Id"), get("Name"), get("FlavourText"), get("RGBFlavourTextColour"), get("CoordinateRect"));
@@ -516,7 +516,7 @@ fn parse_mastery_groups(
     reminder_by_id: &HashMap<&str, &str>,
 ) -> Result<HashMap<usize, MasteryGroup>, String> {
     let effect_table = find_table(schema, "PassiveSkillMasteryEffects", is_poe2)?;
-    let effect_reader = DatReader::new(effects, "passiveskillmasteryeffects.datc64").map_err(|e| e.to_string())?;
+    let effect_reader = crate::dat::analysis::open_checked(effects, "passiveskillmasteryeffects.datc64", effect_table)?;
     let hash_col = col_index(effect_table, "HASH16").or_else(|| col_index(effect_table, "HASH32"));
     let stats_col = col_index(effect_table, "Stats");
     let value_cols: Vec<Option<usize>> = (1..=4).map(|n| col_index(effect_table, &format!("Stat{}Value", n))).collect();
@@ -561,7 +561,7 @@ fn parse_mastery_groups(
         .collect();
 
     let group_table = find_table(schema, "PassiveSkillMasteryGroups", is_poe2)?;
-    let group_reader = DatReader::new(groups, "passiveskillmasterygroups.datc64").map_err(|e| e.to_string())?;
+    let group_reader = crate::dat::analysis::open_checked(groups, "passiveskillmasterygroups.datc64", group_table)?;
     let (active, inactive, effect_image) = (
         col_index(group_table, "ActiveIcon"),
         col_index(group_table, "InactiveIcon"),
@@ -597,7 +597,7 @@ fn parse_mastery_groups(
 
 fn parse_decorators(bytes: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<Vec<Decorator>, String> {
     let table = find_table(schema, "PassiveTreeDecorators", is_poe2)?;
-    let reader = DatReader::new(bytes, "passivetreedecorators.datc64").map_err(|e| e.to_string())?;
+    let reader = crate::dat::analysis::open_checked(bytes, "passivetreedecorators.datc64", table)?;
     let bg_col = col_index(table, "BackgroundArt");
     let blocked_col = col_index(table, "BlockedArt");
     let tree_col = col_index(table, "SkillTree");
@@ -669,13 +669,13 @@ pub struct ExtraTables {
 
 fn parse_mastery_effect_images(groups: Vec<u8>, art: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<HashMap<usize, String>, String> {
     let art_table = find_table(schema, "PassiveSkillTreeMasteryArt", is_poe2)?;
-    let art_reader = DatReader::new(art, "passiveskilltreemasteryart.datc64").map_err(|e| e.to_string())?;
+    let art_reader = crate::dat::analysis::open_checked(art, "passiveskilltreemasteryart.datc64", art_table)?;
     let image_col = col_index(art_table, "ActiveEffectImage").ok_or("PassiveSkillTreeMasteryArt missing ActiveEffectImage")?;
     let images: Vec<Option<String>> = (0..art_reader.row_count)
         .map(|i| art_reader.read_row(i, art_table).ok().and_then(|r| r.get(image_col).and_then(as_string)))
         .collect();
     let groups_table = find_table(schema, "PassiveSkillMasteryGroups", is_poe2)?;
-    let groups_reader = DatReader::new(groups, "passiveskillmasterygroups.datc64").map_err(|e| e.to_string())?;
+    let groups_reader = crate::dat::analysis::open_checked(groups, "passiveskillmasterygroups.datc64", groups_table)?;
     let art_col = col_index(groups_table, "Art").ok_or("PassiveSkillMasteryGroups missing Art")?;
     let mut out = HashMap::new();
     for i in 0..groups_reader.row_count {
@@ -716,7 +716,7 @@ pub fn build(
         _ => HashMap::new(),
     };
     let stats_table = find_table(schema, "Stats", is_poe2)?;
-    let stats_reader = DatReader::new(stats_bytes, "stats.datc64").map_err(|e| e.to_string())?;
+    let stats_reader = crate::dat::analysis::open_checked(stats_bytes, "stats.datc64", stats_table)?;
     let stats_id_col = col_index(stats_table, "Id").ok_or("Stats table missing Id column")?;
 
     let mut stat_ids: Vec<String> = Vec::with_capacity(stats_reader.row_count as usize);
@@ -756,7 +756,7 @@ pub fn build(
     // AtlasPassiveSkillSubTrees row index -> (UI_Background, IllustrationX, IllustrationY), UI_Image.
     let atlas_subtrees: Vec<AtlasSubtreeArt> = if let Some(bytes) = atlas_subtrees_bytes {
         let table = find_table(schema, "AtlasPassiveSkillSubTrees", is_poe2)?;
-        let reader = DatReader::new(bytes, "atlaspassiveskillsubtrees.datc64").map_err(|e| e.to_string())?;
+        let reader = crate::dat::analysis::open_checked(bytes, "atlaspassiveskillsubtrees.datc64", table)?;
         let bg_col = col_index(table, "UI_Background");
         let icon_col = col_index(table, "UI_Image");
         let ix_col = col_index(table, "IllustrationX");
@@ -817,7 +817,7 @@ pub fn build(
         .unwrap_or_default();
 
     let ps_table = find_table(schema, "PassiveSkills", is_poe2)?;
-    let ps_reader = DatReader::new(passiveskills_bytes, "passiveskills.datc64").map_err(|e| e.to_string())?;
+    let ps_reader = crate::dat::analysis::open_checked(passiveskills_bytes, "passiveskills.datc64", ps_table)?;
 
     let graph_id_col = col_index(ps_table, "PassiveSkillGraphId")
         .ok_or("PassiveSkills table missing PassiveSkillGraphId column")?;

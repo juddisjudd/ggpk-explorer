@@ -350,7 +350,7 @@ fn build(ctx: &Ctx, dir: &Path, staging: &Path, ruthless: bool) -> Result<(), St
     let psg_path = format!("{}.psg", graph);
     let psg_bytes = source.fetch(&psg_path).ok_or_else(|| format!("{} is not in this install", psg_path))?;
     let psg = crate::dat::psg::parse_psg(&psg_bytes)?;
-    let db = crate::ui::content_view::build_skill_graph_db_from(&|p| source.fetch(p), &source.schema, false, ruthless)?;
+    let db = crate::skill_tree::build_skill_graph_db_from(&|p| source.fetch(p), &source.schema, false, ruthless)?;
     let (tx, _rx) = std::sync::mpsc::channel();
     let options = TreeExportOptions { viewer: false, ..Default::default() };
     let (_, data) = export_tree(&source, &psg_path, &psg, Some(Arc::new(db)), &options, staging, &tx)?;
