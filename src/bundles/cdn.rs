@@ -1,9 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::io::Write;
+use std::time::Duration;
 use reqwest::blocking::Client;
 use std::error::Error;
 use crate::settings::Game;
+
+const ATTEMPTS: u32 = 3;
 
 #[derive(Clone)]
 pub struct CdnBundleLoader {
@@ -19,9 +22,15 @@ impl CdnBundleLoader {
         if !cache_dir.exists() {
             let _ = fs::create_dir_all(&cache_dir);
         }
+        // reqwest's default 30 s limit covers the whole body, and the PoE2 index alone is over 100 MB.
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(600))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         CdnBundleLoader {
             cache_dir,
-            client: Client::new(),
+            client,
             patch_ver: patch_ver.unwrap_or("4.5.1.1.4").to_string(),
             game,
         }
@@ -57,25 +66,7 @@ impl CdnBundleLoader {
         };
         let url = format!("https://{}/{}/Bundles2/{}", host, self.patch_ver, bundle_name);
 
-        println!("[CDN] Downloading: {}", url);
-        let resp = self.client.get(&url).send()?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            if status.as_u16() == 404 {
-                return Err(format!(
-                    "CDN 404 Not Found: {} — patch version '{}' may be incorrect or the bundle doesn't exist on CDN",
-                    url, self.patch_ver
-                ).into());
-            }
-            return Err(format!(
-                "CDN Request Failed: {} ({}) — using patch version '{}'",
-                url, status, self.patch_ver
-            ).into());
-        }
-
-        let bytes = resp.bytes()?;
-        let data = bytes.to_vec();
+        let data = self.download(&url)?;
 
         // 3. Save to Cache
         let _ = fs::create_dir_all(&cache_dir);
@@ -83,6 +74,33 @@ impl CdnBundleLoader {
         f.write_all(&data)?;
         
         Ok(data)
+    }
+
+    fn download(&self, url: &str) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut last = String::new();
+        for attempt in 1..=ATTEMPTS {
+            println!("[CDN] Downloading: {}", url);
+            match self.client.get(url).send() {
+                Ok(resp) if resp.status().as_u16() == 404 => {
+                    return Err(format!(
+                        "CDN 404 Not Found: {} — patch version '{}' may be incorrect or the bundle doesn't exist on CDN",
+                        url, self.patch_ver
+                    ).into());
+                }
+                Ok(resp) if !resp.status().is_success() => {
+                    last = format!("CDN Request Failed: {} ({}) — using patch version '{}'", url, resp.status(), self.patch_ver);
+                }
+                Ok(resp) => match resp.bytes() {
+                    Ok(bytes) => return Ok(bytes.to_vec()),
+                    Err(e) => last = format!("{}: {}", url, describe(&e)),
+                },
+                Err(e) => last = format!("{}: {}", url, describe(&e)),
+            }
+            if attempt < ATTEMPTS {
+                println!("[CDN] Attempt {} failed ({}); trying again", attempt, last);
+            }
+        }
+        Err(last.into())
     }
 
     pub fn set_patch_version(&mut self, ver: &str) {
@@ -98,4 +116,16 @@ impl CdnBundleLoader {
         let decompressed = bundle.decompress(&mut cursor)?;
         Ok(crate::bundles::index::Index::read(&decompressed)?)
     }
+}
+
+/// reqwest hides the cause (a timeout, a reset) behind "error decoding response body".
+fn describe(e: &reqwest::Error) -> String {
+    let mut text = e.to_string();
+    let mut source = e.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }

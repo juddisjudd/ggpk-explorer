@@ -763,6 +763,7 @@ fn export_single_file(
                     }
                 }
 
+                let mut cdn_error = None;
                 if raw_bundle_data.is_none() {
                     if let Some(cdn) = cdn_loader {
                         let fetch_name = if bundle_info.name.ends_with(".bundle.bin") {
@@ -770,14 +771,17 @@ fn export_single_file(
                         } else {
                             format!("{}.bundle.bin", bundle_info.name)
                         };
-                        if let Ok(data) = cdn.fetch_bundle(&fetch_name) {
-                            raw_bundle_data = Some(RawBundleData::Owned(data));
+                        match cdn.fetch_bundle(&fetch_name) {
+                            Ok(data) => raw_bundle_data = Some(RawBundleData::Owned(data)),
+                            Err(e) => cdn_error = Some(e.to_string()),
                         }
                     }
                 }
 
-                let raw_bundle_data =
-                    raw_bundle_data.ok_or("Failed to load bundle data (local, Steam, or CDN)")?;
+                let raw_bundle_data = raw_bundle_data.ok_or_else(|| match &cdn_error {
+                    Some(e) => format!("Failed to load bundle data (local, Steam, or CDN): {}", e),
+                    None => "Failed to load bundle data (local, Steam, or CDN)".to_string(),
+                })?;
                 let data = raw_bundle_data.as_slice();
                 let mut cursor = std::io::Cursor::new(data);
                 let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor)
