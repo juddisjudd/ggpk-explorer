@@ -1018,8 +1018,8 @@ pub fn run_patch_check(args: &[String]) -> Result<(), String> {
                     .filter_map(|e| e.ok())
                     .filter(|e| e.path().is_dir())
                     .filter_map(|e| e.file_name().to_str().map(str::to_string))
-                    .filter(|v| crate::dat::table_store::compare_versions(v, &version).is_lt())
-                    .max_by(|a, b| crate::dat::table_store::compare_versions(a, b))
+                    .filter(|v| crate::dat::table_store::compare_versions(game, v, &version).is_lt())
+                    .max_by(|a, b| crate::dat::table_store::compare_versions(game, a, b))
             })
             .ok()
             .flatten();

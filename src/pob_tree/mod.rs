@@ -46,13 +46,13 @@ pub fn run(
 }
 
 /// The folder PoB keeps a patch's tree in: PoE 1's `3.29.x` is `3_29`, PoE
-/// 2's `4.5.x` (0.5 to players) is `0_5`.
+/// 2's `0.5.x` (numbered `4.5.x` until GGG renumbered it) is `0_5`.
 pub fn tree_version(game: Game, patch: &str) -> Option<String> {
     let mut parts = patch.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
     match (game, major) {
-        (Game::Poe1, 3) => Some(format!("3_{}", minor)),
+        (Game::Poe1, 3 | 4) | (Game::Poe2, 0 | 1) => Some(format!("{}_{}", major, minor)),
         (Game::Poe2, 4) => Some(format!("0_{}", minor)),
         _ => None,
     }
@@ -83,7 +83,11 @@ mod tests {
     #[test]
     fn tree_versions_follow_pob_folder_names() {
         assert_eq!(tree_version(Game::Poe2, "4.5.5.4").as_deref(), Some("0_5"));
+        assert_eq!(tree_version(Game::Poe2, "0.5.5.4").as_deref(), Some("0_5"));
+        assert_eq!(tree_version(Game::Poe2, "1.0.0.1").as_deref(), Some("1_0"));
         assert_eq!(tree_version(Game::Poe1, "3.29.3.3").as_deref(), Some("3_29"));
-        assert_eq!(tree_version(Game::Poe1, "4.5.5.4"), None);
+        assert_eq!(tree_version(Game::Poe1, "4.0.0.1").as_deref(), Some("4_0"));
+        assert_eq!(tree_version(Game::Poe1, "0.5.5.4"), None);
+        assert_eq!(tree_version(Game::Poe2, "3.29.3.3"), None);
     }
 }

@@ -41,19 +41,26 @@ pub fn versions(game: Game) -> Vec<String> {
         .filter(|e| e.path().join(COMPLETE).exists())
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
         .collect();
-    out.sort_by(|a, b| compare_versions(b, a));
+    out.sort_by(|a, b| compare_versions(game, b, a));
     out
 }
 
 /// The newest stored patch older than `current`.
 pub fn previous(game: Game, current: &str) -> Option<String> {
-    versions(game).into_iter().find(|v| compare_versions(v, current) == Ordering::Less)
+    versions(game).into_iter().find(|v| compare_versions(game, v, current) == Ordering::Less)
 }
 
-/// Orders `4.5.5.1.5` before `4.5.5.2`: numerically, segment by segment.
-pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    let parts = |s: &str| s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
-    parts(a).cmp(&parts(b))
+/// Orders patches numerically, segment by segment; PoE 2's old 4.x ones sort just before the 0.x they became.
+pub fn compare_versions(game: Game, a: &str, b: &str) -> Ordering {
+    let key = |s: &str| {
+        let old_poe2 = game == Game::Poe2 && s.starts_with("4.");
+        let mut parts = s.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+        if old_poe2 {
+            parts[0] = 0;
+        }
+        (parts, !old_poe2)
+    };
+    key(a).cmp(&key(b))
 }
 
 /// The top-level table paths `files` holds.
@@ -129,12 +136,22 @@ impl crate::dat::relational::FileSource for StoredTables {
 #[cfg(test)]
 mod tests {
     use super::compare_versions;
+    use crate::settings::Game;
     use std::cmp::Ordering;
 
     #[test]
     fn versions_order_by_number() {
-        assert_eq!(compare_versions("4.5.5.1.5", "4.5.5.2"), Ordering::Less);
-        assert_eq!(compare_versions("4.5.10", "4.5.9"), Ordering::Greater);
-        assert_eq!(compare_versions("3.29.3.3", "3.29.3.3"), Ordering::Equal);
+        assert_eq!(compare_versions(Game::Poe2, "4.5.5.1.5", "4.5.5.2"), Ordering::Less);
+        assert_eq!(compare_versions(Game::Poe2, "0.5.10", "0.5.9"), Ordering::Greater);
+        assert_eq!(compare_versions(Game::Poe1, "3.29.3.3", "3.29.3.3"), Ordering::Equal);
+    }
+
+    #[test]
+    fn old_poe2_numbers_sort_before_what_they_became() {
+        assert_eq!(compare_versions(Game::Poe2, "4.5.5.4", "0.5.5.4"), Ordering::Less);
+        assert_eq!(compare_versions(Game::Poe2, "4.5.5.4", "0.5.5.5"), Ordering::Less);
+        assert_eq!(compare_versions(Game::Poe2, "0.5.5.4", "4.5.5.3"), Ordering::Greater);
+        assert_eq!(compare_versions(Game::Poe2, "4.5.5.4", "1.0.0.1"), Ordering::Less);
+        assert_eq!(compare_versions(Game::Poe1, "4.0.0.1", "3.29.3.3"), Ordering::Greater);
     }
 }
