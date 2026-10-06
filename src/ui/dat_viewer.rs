@@ -152,7 +152,7 @@ fn refit_against(
     let old_bytes = match crate::dat::table_store::StoredTables::open(game, version) {
         Some(stored) => stored.fetch(path),
         None => {
-            let cdn = crate::bundles::cdn::CdnBundleLoader::new(&crate::settings::AppSettings::file_cache_dir(game), Some(version));
+            let cdn = crate::bundles::cdn::CdnBundleLoader::new(&crate::settings::AppSettings::file_cache_dir(game), Some(version), game);
             let index = cdn.fetch_index().map_err(|e| format!("could not read patch {}: {}", version, e))?;
             crate::data_export::source::GameFiles::new(None, Arc::new(index), None, Some(cdn)).fetch(path)
         }

@@ -277,7 +277,7 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
     let cdn = cdn_version.map(|explicit| {
         let version = explicit.unwrap_or_else(|| settings.patch_version(game).to_string());
         println!("Using patch CDN version {}", version);
-        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version))
+        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version), game)
     });
 
     // The patch names the output folder: taken from the CDN version when one
@@ -460,7 +460,7 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
     settings.is_poe2 = game.is_poe2();
     let cdn = cdn_version.map(|explicit| {
         let version = explicit.unwrap_or_else(|| saved.patch_version(game).to_string());
-        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version))
+        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version), game)
     });
     let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref(), game)?;
 
@@ -571,11 +571,11 @@ fn sync_caches_to_install(ggpk: Option<&str>, steam: Option<&str>, game: crate::
     }
 }
 
-/// The game to read: what was asked for, else what the CDN version or the
-/// install's client log says, else PoE 2.
+/// The game to read: what was asked for, else what the CDN version (PoE 1
+/// patches are 3.x) or the install's client log says, else PoE 2.
 fn resolve_game(requested: Option<Game>, ggpk: Option<&str>, steam: Option<&str>, cdn_version: Option<&str>) -> Game {
     requested
-        .or_else(|| cdn_version.map(|v| Game::from_is_poe2(v.starts_with("4."))))
+        .or_else(|| cdn_version.map(|v| Game::from_is_poe2(!v.starts_with("3."))))
         .or_else(|| install_root(ggpk, steam).as_deref().and_then(crate::data_export::detect_game))
         .unwrap_or_default()
 }
@@ -745,7 +745,7 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
     let new_version = cdn_version
         .clone()
         .or_else(|| install_root(ggpk.as_deref(), steam.as_deref()).as_deref().and_then(crate::data_export::detect_version));
-    let new_cdn = cdn_version.map(|v| crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&v)));
+    let new_cdn = cdn_version.map(|v| crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&v), game));
     let (reader, steam_loader, index) = open_source(ggpk, steam, new_cdn.as_ref(), game)?;
     let new_files = GameFiles::new(reader, Arc::new(index), steam_loader, new_cdn);
     keep_tables(&new_files, game, new_version.as_deref());
@@ -790,7 +790,7 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
         }
         (None, None) => {
             println!("Reading patch {} from the CDN to compare against", old_version);
-            let cdn = crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&old_version));
+            let cdn = crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&old_version), game);
             let old_index = cdn.fetch_index().map_err(|e| format!("Failed to fetch the CDN index: {}", e))?;
             Box::new(GameFiles::new(None, Arc::new(old_index), None, Some(cdn)))
         }
@@ -993,7 +993,7 @@ pub fn run_patch_check(args: &[String]) -> Result<(), String> {
         .ok_or("Could not tell which patch this install is on; pass --cdn <VERSION>")?;
     println!("Checking {} patch {}", game.label(), version);
 
-    let cdn = cdn_version.map(|v| crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&v)));
+    let cdn = cdn_version.map(|v| crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&v), game));
     let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref(), game)?;
     let files = GameFiles::new(reader, Arc::new(index), steam_loader, cdn);
 
@@ -1212,4 +1212,17 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cdn_version_picks_the_game() {
+        assert_eq!(resolve_game(None, None, None, Some("3.29.3.3")), Game::Poe1);
+        assert_eq!(resolve_game(None, None, None, Some("4.5.5.4")), Game::Poe2);
+        assert_eq!(resolve_game(None, None, None, Some("0.5.5.4")), Game::Poe2);
+        assert_eq!(resolve_game(None, None, None, Some("1.0.0.1")), Game::Poe2);
+    }
 }

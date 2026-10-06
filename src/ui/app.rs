@@ -130,7 +130,7 @@ impl ExplorerApp {
             let _ = std::fs::create_dir_all(&cache_root);
         }
         
-        let cdn = crate::bundles::cdn::CdnBundleLoader::new(&cache_root, Some(patch_ver));
+        let cdn = crate::bundles::cdn::CdnBundleLoader::new(&cache_root, Some(patch_ver), crate::settings::Game::Poe2);
         content_view.set_cdn_loader(cdn);
 
         let mut app = Self {
@@ -1373,6 +1373,7 @@ impl eframe::App for ExplorerApp {
                             let cdn = crate::bundles::cdn::CdnBundleLoader::new(
                                 &crate::settings::AppSettings::file_cache_dir(game),
                                 Some(&cdn_version),
+                                game,
                             );
                             let index = cdn.fetch_index().map_err(|e| format!("could not read patch {} from the CDN: {}", cdn_version, e))?;
                             Ok(crate::data_export::source::GameFiles::new(None, Arc::new(index), None, Some(cdn)))

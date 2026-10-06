@@ -3,16 +3,18 @@ use std::path::{Path, PathBuf};
 use std::io::Write;
 use reqwest::blocking::Client;
 use std::error::Error;
+use crate::settings::Game;
 
 #[derive(Clone)]
 pub struct CdnBundleLoader {
     cache_dir: PathBuf,
     client: Client,
     patch_ver: String,
+    game: Game,
 }
 
 impl CdnBundleLoader {
-    pub fn new(cache_root: &Path, patch_ver: Option<&str>) -> Self {
+    pub fn new(cache_root: &Path, patch_ver: Option<&str>, game: Game) -> Self {
         let cache_dir = cache_root.join("Bundles2");
         if !cache_dir.exists() {
             let _ = fs::create_dir_all(&cache_dir);
@@ -21,6 +23,7 @@ impl CdnBundleLoader {
             cache_dir,
             client: Client::new(),
             patch_ver: patch_ver.unwrap_or("4.5.1.1.4").to_string(),
+            game,
         }
     }
 
@@ -47,12 +50,12 @@ impl CdnBundleLoader {
             return Ok(data);
         }
 
-        // 2. Download from CDN
-        let url = if self.patch_ver.starts_with("4.") {
-             format!("https://patch-poe2.poecdn.com/{}/Bundles2/{}", self.patch_ver, bundle_name)
-        } else {
-             format!("https://patch.poecdn.com/{}/Bundles2/{}", self.patch_ver, bundle_name)
+        // 2. Download from CDN. The game picks the host; PoE2 versions no longer start with 4.
+        let host = match self.game {
+            Game::Poe2 => "patch-poe2.poecdn.com",
+            Game::Poe1 => "patch.poecdn.com",
         };
+        let url = format!("https://{}/{}/Bundles2/{}", host, self.patch_ver, bundle_name);
 
         println!("[CDN] Downloading: {}", url);
         let resp = self.client.get(&url).send()?;
