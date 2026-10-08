@@ -54,6 +54,8 @@ pub struct ContentView {
     curve_viewer_state: HashMap<u64, crate::ui::curve_viewer::CurveViewerState>,
     level_cache: HashMap<u64, Result<std::sync::Arc<crate::parsers::level::DgrGraph>, String>>,
     level_viewer_state: HashMap<u64, crate::ui::level_viewer::LevelViewerState>,
+    room_cache: HashMap<u64, Result<std::sync::Arc<crate::parsers::arm::ArmFile>, String>>,
+    room_viewer_state: HashMap<u64, crate::ui::room_viewer::RoomViewerState>,
     /// JSON body (after any `version` header) of `.mat/.env/.atl/.pet` files; `None` when not JSON.
     structured_json: HashMap<u64, Option<(String, std::sync::Arc<serde_json::Value>)>>,
     /// Downscaled texture previews by path (`None` = could not decode), oldest first in `thumb_order`.
@@ -64,6 +66,7 @@ pub struct ContentView {
     /// Drawable geometry per model file; `None` when the file has no vertices.
     mesh_cache: HashMap<u64, Option<std::sync::Arc<crate::ui::mesh_preview::MeshData>>>,
     mesh_view_state: HashMap<u64, crate::ui::mesh_preview::MeshPreviewState>,
+    skinned_mesh_cache: HashMap<u64, Result<std::sync::Arc<crate::ui::skinned_mesh_viewer::SkinnedMesh>, String>>,
     /// Models the user switched from the 3D preview to the structure summary.
     model_summary_view: std::collections::HashSet<u64>,
     pub dat_viewer: DatViewer,
@@ -166,6 +169,8 @@ impl Default for ContentView {
             curve_viewer_state: HashMap::new(),
             level_cache: HashMap::new(),
             level_viewer_state: HashMap::new(),
+            room_cache: HashMap::new(),
+            room_viewer_state: HashMap::new(),
             structured_json: HashMap::new(),
             thumb_cache: HashMap::new(),
             thumb_order: Vec::new(),
@@ -173,6 +178,7 @@ impl Default for ContentView {
             thumb_rx: None,
             mesh_cache: HashMap::new(),
             mesh_view_state: HashMap::new(),
+            skinned_mesh_cache: HashMap::new(),
             model_summary_view: std::collections::HashSet::new(),
             dat_viewer: DatViewer::default(),
             audio_device: None,
@@ -827,7 +833,41 @@ impl ContentView {
                                                                     }
                                                                 }
                                                             }
+                                                            "arm" => {
+                                                                let parsed = self.room_cache.entry(hash).or_insert_with(|| crate::parsers::arm::parse(&text).map(std::sync::Arc::new)).clone();
+                                                                match parsed {
+                                                                    Ok(room) => {
+                                                                        let state = self.room_viewer_state.entry(hash).or_default();
+                                                                        crate::ui::room_viewer::RoomViewer::show(ui, hash, &room, state)
+                                                                    }
+                                                                    Err(e) => {
+                                                                        ui.colored_label(egui::Color32::from_rgb(245, 158, 11), format!("Could not read the room: {}", e));
+                                                                        self.show_linked_text(ui, hash, &text)
+                                                                    }
+                                                                }
+                                                            }
                                                             "trl" => self.show_curves(ui, hash, &text),
+                                                            "sm" => {
+                                                                if !self.skinned_mesh_cache.contains_key(&hash) {
+                                                                    let steam = self.steam_loader.as_ref();
+                                                                    let mut loader = |p: &str| -> Option<Vec<u8>> {
+                                                                        let fi = find_file_info_by_path(index, p)?;
+                                                                        extract_bundle_file_sync(fi, index, reader.as_deref(), steam)
+                                                                    };
+                                                                    let loaded = crate::ui::skinned_mesh_viewer::SkinnedMesh::load(&text, &mut loader).map(std::sync::Arc::new);
+                                                                    self.skinned_mesh_cache.insert(hash, loaded);
+                                                                }
+                                                                match self.skinned_mesh_cache[&hash].clone() {
+                                                                    Ok(sm) => {
+                                                                        let state = self.mesh_view_state.entry(hash).or_default();
+                                                                        crate::ui::skinned_mesh_viewer::SkinnedMeshViewer::show(ui, hash, &sm, state)
+                                                                    }
+                                                                    Err(e) => {
+                                                                        ui.colored_label(egui::Color32::from_rgb(245, 158, 11), format!("Could not read the skinned mesh: {}", e));
+                                                                        self.show_linked_text(ui, hash, &text)
+                                                                    }
+                                                                }
+                                                            }
                                                             "mat" => match self.structured_json(hash, &text) {
                                                                 Some((_, doc)) => crate::ui::material_viewer::MaterialViewer::show(ui, hash, &doc, &self.thumb_cache, &mut wanted_thumbs),
                                                                 None => self.show_linked_text(ui, hash, &text),
@@ -2568,33 +2608,22 @@ fn is_text_file(path: &str) -> bool {
     // hex viewer despite being fully readable (confirmed against real game data).
     p.ends_with(".tdt") || p.ends_with(".tmd") || p.ends_with(".epk") ||
     p.ends_with(".it") || p.ends_with(".fgp") || p.ends_with(".tgr") ||
-    p.ends_with(".atl") || p.ends_with(".geal") || is_shader_source(&p)
+    p.ends_with(".atl") || p.ends_with(".geal") || p.ends_with(".gcf") || p.ends_with(".mtd") ||
+    p.ends_with(".toy") || p.ends_with(".tst") || is_shader_source(&p)
 }
 
 /// Text formats with a dedicated view: JSON-bodied materials, environments, timelines
-/// and v5 emitters; keyword trails/emitters; dungeon graphs.
+/// and v5 emitters; keyword trails/emitters; dungeon graphs; rooms; skinned meshes.
 fn is_structured_text(path: &str) -> bool {
     let p = path.to_lowercase();
-    p.ends_with(".mat") || p.ends_with(".env") || p.ends_with(".atl") || p.ends_with(".pet") || p.ends_with(".trl") || p.ends_with(".dgr")
+    p.ends_with(".mat") || p.ends_with(".env") || p.ends_with(".atl") || p.ends_with(".pet") || p.ends_with(".trl") || p.ends_with(".dgr") || p.ends_with(".arm") || p.ends_with(".sm")
 }
 
 /// Splits a file into its plain-text header (`version 5`, …) and the JSON document that follows.
 fn json_body(text: &str) -> Option<(String, serde_json::Value)> {
-    let mut header = Vec::new();
-    let mut offset = 0;
-    for line in text.split_inclusive('\n') {
-        let t = line.trim_start();
-        if t.starts_with('{') || t.starts_with('[') {
-            break;
-        }
-        header.push(line.trim().to_string());
-        offset += line.len();
-    }
-    if offset >= text.len() {
-        return None;
-    }
-    let value = serde_json::from_str::<serde_json::Value>(&text[offset..]).ok()?;
-    Some((header.into_iter().filter(|h| !h.is_empty()).collect::<Vec<_>>().join(" · "), value))
+    let (header, body) = crate::parsers::utils::split_json_body(text)?;
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    Some((header.join(" · "), value))
 }
 
 /// Small RGBA previews for texture paths, decoded without touching the on-disk art cache.

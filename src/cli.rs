@@ -82,6 +82,7 @@ USAGE:
     ggpk-explorer export-data [OPTIONS]    Write RePoE-style semantic JSON dumps
     ggpk-explorer export-pob [OPTIONS]     Write Path of Building's data files as pob-data JSON
     ggpk-explorer export-tree [OPTIONS]    Write Path of Building's passive tree folders (src/TreeData)
+    ggpk-explorer export-tables [OPTIONS]  Write every DAT table whole, as JSON and/or CSV
     ggpk-explorer refit [OPTIONS]          Re-derive drifted table layouts from an earlier patch
     ggpk-explorer lint [OPTIONS]           Check the schema.s references and enums against the game files
     ggpk-explorer patch-check [OPTIONS]    Check a patch, re-fit the tables it moved, compare exports
@@ -92,6 +93,8 @@ EXPORT OPTIONS:
         --audio <FMT>      ogg (default) or wav
         --data <FMT>       original (default) or json for .dat/.csd
         --psg <FMT>        original (default), json, or tree for the web-export layout
+        --parsed <FMT>     original (default) or json for files with a parser (.ao, .mat, .fmt, .arm, ...),
+                           written beside the path as <file>.json
         --dry-run          Count the files instead of writing them
         --poe1 / --poe2    Which game to read (default: the one the install's log names)
     Plus the source options below (--ggpk / --steam / --cdn / --schema).
@@ -128,6 +131,17 @@ EXPORT-TREE OPTIONS:
     -l, --list             List module names and exit
     Plus --ggpk / --steam / --cdn / --schema / --flat / --version / --poe1 / --poe2 as above.
 
+EXPORT-TABLES OPTIONS:
+    Every table in the install's data folder, one file per table. A foreign key
+    is written as {TableName, Id}, naming the target row by its unique key,
+    or {TableName, RowIndex} when the target has none. Tables whose layout
+    no longer matches the schema are left out and listed in export_report.json.
+    -o, --out <DIR>        Output folder (default: ./tables)
+        --format <FMT>     json (default), csv or both
+        --only <A,B,...>   Only these tables
+        --strip-null       Leave out keys with no value
+    Plus --ggpk / --steam / --cdn / --schema / --flat / --version / --poe1 / --poe2 as above.
+
 LINT OPTIONS:
         --schema <FILE>    Schema to check (default: the cached schema.min.json)
         --suggest          Also rank target tables for references the schema leaves untargeted
@@ -161,7 +175,7 @@ REFIT OPTIONS:
     GGPK_EXPLORER_OVERRIDES=<FILE> keeps the overrides in that file instead of the app's.
     -l, --list             List module names and exit
         --ls <PREFIX>      List indexed game files under a path prefix and exit
-        --cat <PATH>       Write one game file to stdout (text) and exit
+        --cat <PATH>       Write one game file to stdout (text as UTF-8, binary as-is) and exit
 ";
 
 /// Which set of files an export command writes.
@@ -173,6 +187,8 @@ enum DataKind {
     Pob,
     /// Path of Building's `src/TreeData` folders.
     Tree,
+    /// Every DAT table, whole.
+    Tables,
 }
 
 /// Parses `export-data` arguments and runs the export, reporting to stdout.
@@ -190,6 +206,10 @@ pub fn run_tree_export(args: &[String]) -> Result<(), String> {
     run_export_command(args, DataKind::Tree)
 }
 
+pub fn run_table_export(args: &[String]) -> Result<(), String> {
+    run_export_command(args, DataKind::Tables)
+}
+
 fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
     use crate::data_export::{source::GameFiles, DataExportOptions};
     use std::path::PathBuf;
@@ -199,6 +219,7 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
         DataKind::Semantic => "data",
         DataKind::Pob => "pob-data",
         DataKind::Tree => "pob-tree",
+        DataKind::Tables => "tables",
     });
     let mut ggpk: Option<String> = None;
     let mut steam: Option<String> = None;
@@ -234,8 +255,14 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
             }
             "--ls" => ls = Some(value(&mut i)?),
             "--cat" => cat = Some(value(&mut i)?),
-            "--images" | "--trade-stats" | "--strip-null" if kind != DataKind::Semantic => {
+            "--images" | "--trade-stats" if kind != DataKind::Semantic => {
                 return Err(format!("{} applies to export-data only", arg))
+            }
+            "--strip-null" if !matches!(kind, DataKind::Semantic | DataKind::Tables) => {
+                return Err(format!("{} applies to export-data and export-tables only", arg))
+            }
+            "--format" if kind == DataKind::Tables => {
+                options.table_formats = crate::table_export::Formats::parse(&value(&mut i)?)?
             }
             "--images" => options.images = true,
             "--trade-stats" => options.trade_stats = true,
@@ -249,6 +276,7 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
                     DataKind::Semantic => crate::data_export::module_names(),
                     DataKind::Pob => crate::pob_export::module_names(),
                     DataKind::Tree => crate::pob_tree::module_names(),
+                    DataKind::Tables => return Err("export-tables has no modules; --only takes table names".to_string()),
                 };
                 for name in names {
                     println!("{}", name);
@@ -274,11 +302,13 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
     let game = resolve_game(requested_game, ggpk.as_deref(), steam.as_deref(), cdn_version.as_ref().and_then(|v| v.as_deref()));
     println!("Reading {}", game.label());
 
-    let cdn = cdn_version.map(|explicit| {
-        let version = explicit.unwrap_or_else(|| settings.patch_version(game).to_string());
-        println!("Using patch CDN version {}", version);
-        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version), game)
-    });
+    let cdn = cdn_version
+        .map(|explicit| {
+            let version = cdn_patch_version(explicit, &settings, game)?;
+            println!("Using patch CDN version {}", version);
+            Ok::<_, String>(crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version), game))
+        })
+        .transpose()?;
 
     // The patch names the output folder: taken from the CDN version when one
     // was asked for, otherwise from the install's own client log. A tree is
@@ -321,11 +351,21 @@ fn run_export_command(args: &[String], kind: DataKind) -> Result<(), String> {
                 format!("{} is not in the index", path)
             }
         })?;
-        print!("{}", crate::parsers::utils::decode_text_lossy(&bytes));
+        std::io::Write::write_all(&mut std::io::stdout().lock(), &cat_bytes(&bytes))
+            .map_err(|e| format!("Could not write {}: {}", path, e))?;
         return Ok(());
     }
     keep_tables(&files, game, patch.as_deref());
     drive_export(kind, files, schema, game, out, options)
+}
+
+/// What `--cat` writes: a text file as UTF-8, anything that does not decode as text byte for byte.
+fn cat_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let text = crate::parsers::utils::decode_text_lossy(bytes);
+    match text.contains('\u{FFFD}') {
+        true => std::borrow::Cow::Borrowed(bytes),
+        false => std::borrow::Cow::Owned(text.into_bytes()),
+    }
 }
 
 /// Runs an export on a worker thread and prints its progress.
@@ -348,6 +388,7 @@ fn drive_export(
         DataKind::Semantic => crate::data_export::run(files, schema, game.is_poe2(), out, options, tx),
         DataKind::Pob => crate::pob_export::run(files, schema, game.is_poe2(), out, options, tx),
         DataKind::Tree => crate::pob_tree::run(files, schema, game.is_poe2(), out, options, tx),
+        DataKind::Tables => crate::table_export::run(files, schema, game.is_poe2(), out, options, tx),
     });
 
     let mut failed = 0;
@@ -364,7 +405,8 @@ fn drive_export(
         }
     }
     if failed > 0 {
-        return Err(format!("{} module(s) failed — see {}/data_export_errors.log", failed, out_display));
+        let unit = if kind == DataKind::Tables { "table(s)" } else { "module(s)" };
+        return Err(format!("{} {} failed — see {}/data_export_errors.log", failed, unit, out_display));
     }
     Ok(())
 }
@@ -426,6 +468,13 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
                     other => return Err(format!("--data takes original or json, not {}", other)),
                 }
             }
+            "--parsed" => {
+                settings.parsed_format = match value(&mut i)?.to_ascii_lowercase().as_str() {
+                    "original" => DataFormat::Original,
+                    "json" => DataFormat::Json,
+                    other => return Err(format!("--parsed takes original or json, not {}", other)),
+                }
+            }
             "--psg" => {
                 settings.psg_format = match value(&mut i)?.to_ascii_lowercase().as_str() {
                     "original" => PsgFormat::Original,
@@ -458,10 +507,12 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
     let steam = steam.or_else(|| if ggpk.is_some() || cdn_requested { None } else { saved.steam_path_for(defaults).cloned() });
     let game = resolve_game(requested_game, ggpk.as_deref(), steam.as_deref(), cdn_version.as_ref().and_then(|v| v.as_deref()));
     settings.is_poe2 = game.is_poe2();
-    let cdn = cdn_version.map(|explicit| {
-        let version = explicit.unwrap_or_else(|| saved.patch_version(game).to_string());
-        crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version), game)
-    });
+    let cdn = cdn_version
+        .map(|explicit| {
+            let version = cdn_patch_version(explicit, &saved, game)?;
+            Ok::<_, String>(crate::bundles::cdn::CdnBundleLoader::new(&AppSettings::file_cache_dir(game), Some(&version), game))
+        })
+        .transpose()?;
     let (reader, steam_loader, index) = open_source(ggpk, steam, cdn.as_ref(), game)?;
 
     // A path with no extension is a folder; everything under it comes along.
@@ -580,6 +631,18 @@ fn resolve_game(requested: Option<Game>, ggpk: Option<&str>, steam: Option<&str>
         .unwrap_or_default()
 }
 
+/// The patch `--cdn` reads: the one named, else the one saved for the game, else the one live now.
+fn cdn_patch_version(explicit: Option<String>, settings: &AppSettings, game: Game) -> Result<String, String> {
+    if let Some(version) = explicit {
+        return Ok(version);
+    }
+    match settings.patch_version(game) {
+        "" => AppSettings::fetch_latest_patch_version(game, &settings.patch_version_source_url)
+            .map_err(|e| format!("Could not ask which {} patch is live: {}", game.label(), e)),
+        saved => Ok(saved.to_string()),
+    }
+}
+
 fn install_root(ggpk: Option<&str>, steam: Option<&str>) -> Option<std::path::PathBuf> {
     let path = ggpk.or(steam)?;
     std::path::Path::new(path).parent().map(|p| p.to_path_buf())
@@ -634,8 +697,14 @@ fn open_source(
 
     if let Some(path) = ggpk {
         println!("Opening GGPK at {}", path);
-        sync_caches_to_install(Some(&path), None, game);
         let reader = Arc::new(GgpkReader::open(&path).map_err(|e| format!("Failed to open GGPK: {}", e))?);
+        // The caches describe the bundled install beside it, not an old GGPK.
+        if !reader.has_bundle_index() {
+            println!("No bundle index: reading the GGPK's own file records");
+            let index = crate::bundles::index::Index::from_ggpk_records(&reader);
+            return Ok((Some(reader), None, index));
+        }
+        sync_caches_to_install(Some(&path), None, game);
         let cache = AppSettings::index_cache_path(game);
         if let Ok(mut index) = crate::bundles::index::Index::load_from_cache(&cache) {
             println!("Index loaded from cache");
@@ -673,7 +742,7 @@ fn open_source(
     Err("No data source. Pass --ggpk, --steam or --cdn, or set one in the GUI first.".to_string())
 }
 
-fn read_index_bundle(data: &[u8]) -> Result<crate::bundles::index::Index, String> {
+pub(crate) fn read_index_bundle(data: &[u8]) -> Result<crate::bundles::index::Index, String> {
     let mut cursor = std::io::Cursor::new(data);
     let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor)
         .map_err(|e| format!("Bundle header error: {}", e))?;
@@ -976,7 +1045,7 @@ pub fn run_patch_check(args: &[String]) -> Result<(), String> {
     // `--cdn` alone means the patch that is live right now.
     let cdn_version = match cdn_version {
         Some(None) => Some(Some(
-            AppSettings::fetch_latest_patch_version(&settings.patch_version_source_url)
+            AppSettings::fetch_latest_patch_version(requested_game.unwrap_or_default(), &settings.patch_version_source_url)
                 .map_err(|e| format!("Could not ask which patch is live: {}", e))?,
         )),
         other => other,
@@ -1217,6 +1286,62 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ggpk_name(name: &str) -> (u32, Vec<u8>) {
+        let units: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        (units.len() as u32, units.iter().flat_map(|u| u.to_le_bytes()).collect())
+    }
+
+    fn ggpk_file(name: &str, data: &[u8]) -> Vec<u8> {
+        let (chars, name) = ggpk_name(name);
+        let len = (8 + 4 + 32 + name.len() + data.len()) as u32;
+        [&len.to_le_bytes()[..], b"FILE", &chars.to_le_bytes(), &[0; 32], &name, data].concat()
+    }
+
+    fn ggpk_dir(name: &str, children: &[u64]) -> Vec<u8> {
+        let (chars, name) = ggpk_name(name);
+        let len = (8 + 4 + 4 + 32 + name.len() + 12 * children.len()) as u32;
+        let entries: Vec<u8> = children.iter().flat_map(|o| [&0u32.to_le_bytes()[..], &o.to_le_bytes()].concat()).collect();
+        [&len.to_le_bytes()[..], b"PDIR", &chars.to_le_bytes(), &(children.len() as u32).to_le_bytes(), &[0; 32], &name, &entries].concat()
+    }
+
+    /// A GGPK laid out the way PoE 1 shipped before bundles: every file a record of its own.
+    fn pre_bundle_ggpk() -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut place = |record: Vec<u8>| {
+            let at = 28 + body.len() as u64;
+            body.extend(record);
+            at
+        };
+        let mods = place(ggpk_file("Mods.dat", b"rows"));
+        let dds = place(ggpk_file("x.dds", b"DDS "));
+        let readme = place(ggpk_file("README.txt", b"hi"));
+        let data = place(ggpk_dir("Data", &[mods]));
+        let art = place(ggpk_dir("Art", &[dds]));
+        let root = place(ggpk_dir("", &[data, art, readme]));
+        [&28u32.to_le_bytes()[..], b"GGPK", &3u32.to_le_bytes(), &root.to_le_bytes(), &0u64.to_le_bytes(), &body].concat()
+    }
+
+    #[test]
+    fn opens_a_ggpk_with_no_bundles() {
+        let path = std::env::temp_dir().join(format!("ggpk-explorer-pre-bundle-{}.ggpk", std::process::id()));
+        std::fs::write(&path, pre_bundle_ggpk()).unwrap();
+        let (reader, _, index) = open_source(Some(path.to_string_lossy().into_owned()), None, None, Game::Poe1).unwrap();
+        assert!(index.is_pre_bundle());
+        let files = crate::data_export::source::GameFiles::new(reader, std::sync::Arc::new(index), None, None);
+        assert_eq!(files.list_dir(""), vec!["Art/x.dds", "Data/Mods.dat", "README.txt"]);
+        assert_eq!(crate::dat::relational::FileSource::fetch(&files, "data/mods.dat"), Some(b"rows".to_vec()));
+        drop(files);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cat_decodes_text_and_passes_binary_through() {
+        let utf16: Vec<u8> = "version 5".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        assert_eq!(&*cat_bytes(&utf16), b"version 5");
+        let dds = [0x44, 0x44, 0x53, 0x20, 0x7C, 0x00, 0x00, 0x00, 0x07, 0x10, 0x0A, 0x00, 0xFF, 0x80];
+        assert_eq!(&*cat_bytes(&dds), &dds);
+    }
 
     #[test]
     fn cdn_version_picks_the_game() {

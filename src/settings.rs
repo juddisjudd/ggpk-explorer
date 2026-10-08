@@ -178,9 +178,9 @@ impl AppSettings {
         }
     }
 
-    pub fn fetch_latest_patch_version(source_url: &str) -> Result<String, String> {
+    pub fn fetch_latest_patch_version(game: Game, source_url: &str) -> Result<String, String> {
         // Try direct patch server protocol first (most reliable)
-        match Self::fetch_patch_version_direct() {
+        match Self::fetch_patch_version_direct(game) {
             Ok(version) => {
                 println!("[PatchVersion] Got version from patch server: {}", version);
                 return Ok(version);
@@ -206,26 +206,35 @@ impl AppSettings {
             .json::<serde_json::Value>()
             .map_err(|e| format!("JSON Parse Error: {}", e))?;
 
-        json.get("poe2")
+        let key = match game {
+            Game::Poe2 => "poe2",
+            Game::Poe1 => "poe",
+        };
+        // The source answers "error" in place of a version when it cannot reach the patch server.
+        json.get(key)
             .and_then(|value| value.as_str())
+            .filter(|value| Self::looks_like_version(value))
             .map(|value| value.to_string())
-            .ok_or_else(|| "JSON missing 'poe2' field".to_string())
+            .ok_or_else(|| format!("JSON has no version under '{}'", key))
     }
 
-    /// Fetch PoE2 patch version directly from the game's patch server.
+    /// Fetch a game's patch version directly from its patch server.
     /// Protocol ported from poe-get-version (Go reference implementation).
     ///
     /// Protocol:
-    /// 1. Connect TCP to patch.pathofexile2.com:13060
-    /// 2. Send handshake bytes [0x01, 0x07]
+    /// 1. Connect TCP to patch.pathofexile2.com:13060 (PoE 1: patch.pathofexile.com:12995)
+    /// 2. Send handshake bytes [0x01, 0x07] (PoE 1: [0x01, 0x06])
     /// 3. Read response: 1 byte proto_ver + 32 bytes unknown + N bytes payload
     /// 4. Payload contains two UTF-16LE length-prefixed strings (CDN URLs)
     /// 5. Parse version from URL: https://patch-poe2.poecdn.com/{VERSION}/
-    fn fetch_patch_version_direct() -> Result<String, String> {
+    fn fetch_patch_version_direct(game: Game) -> Result<String, String> {
         use std::net::{TcpStream, ToSocketAddrs};
         use std::time::Duration;
 
-        let addr = "patch.pathofexile2.com:13060";
+        let (addr, handshake) = match game {
+            Game::Poe2 => ("patch.pathofexile2.com:13060", [0x01, 0x07]),
+            Game::Poe1 => ("patch.pathofexile.com:12995", [0x01, 0x06]),
+        };
         // Resolve DNS first — connect_timeout only accepts SocketAddr (IP:port)
         let socket_addr = addr.to_socket_addrs()
             .map_err(|e| format!("DNS resolve failed for {}: {}", addr, e))?
@@ -240,8 +249,7 @@ impl AppSettings {
         stream.set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|e| format!("Set timeout failed: {}", e))?;
 
-        // Handshake: send [0x01, 0x07] for PoE2
-        stream.write_all(&[0x01, 0x07])
+        stream.write_all(&handshake)
             .map_err(|e| format!("Write handshake failed: {}", e))?;
 
         // Read response
@@ -308,15 +316,11 @@ impl AppSettings {
             return None;
         };
         let version = s.trim_end_matches('/');
-        if version.is_empty() {
-            return None;
-        }
-        // Sanity: should look like a version (contains dots and digits)
-        if version.contains('.') && version.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            Some(version.to_string())
-        } else {
-            None
-        }
+        Self::looks_like_version(version).then(|| version.to_string())
+    }
+
+    fn looks_like_version(s: &str) -> bool {
+        s.contains('.') && s.chars().all(|c| c.is_ascii_digit() || c == '.')
     }
 
     pub fn get_app_data_dir() -> PathBuf {

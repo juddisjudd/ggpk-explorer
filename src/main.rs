@@ -13,6 +13,7 @@ pub mod export;
 pub mod data_export;
 pub mod pob_export;
 pub mod pob_tree;
+pub mod table_export;
 pub mod skill_tree;
 pub mod patch_check;
 pub mod skill_tree_export;
@@ -110,6 +111,13 @@ fn main() -> eframe::Result<()> {
         }
         Some("export-tree") => {
             if let Err(e) = cli::run_tree_export(&args[2..]) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some("export-tables") => {
+            if let Err(e) = cli::run_table_export(&args[2..]) {
                 eprintln!("{}", e);
                 std::process::exit(1);
             }

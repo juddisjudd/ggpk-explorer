@@ -134,6 +134,24 @@ mod tests {
     }
 }
 
+/// A file's plain-text header lines (`version 5`, ...) and the JSON document after them.
+pub fn split_json_body(text: &str) -> Option<(Vec<String>, &str)> {
+    let mut header = Vec::new();
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let t = line.trim_start();
+        if t.starts_with('{') || t.starts_with('[') {
+            break;
+        }
+        header.push(line.trim().to_string());
+        offset += line.len();
+    }
+    if offset >= text.len() {
+        return None;
+    }
+    Some((header.into_iter().filter(|h| !h.is_empty()).collect(), &text[offset..]))
+}
+
 /// Text of a game file: BOM-marked UTF-16 (either endian) or UTF-8, and BOM-less
 /// UTF-16LE (many `.mat` files) recognised by the zero high bytes of ASCII.
 pub fn decode_text_lossy(data: &[u8]) -> String {

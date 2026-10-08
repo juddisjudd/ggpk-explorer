@@ -4,9 +4,13 @@ pub mod model;
 pub mod object_dsl;
 pub mod curves;
 pub mod level;
+pub mod arm;
+pub mod sm;
 pub mod graphics;
 pub mod skeletal;
 pub mod text_config;
+pub mod text_formats;
+pub mod translate;
 pub mod types;
 pub mod utils;
 
@@ -53,6 +57,38 @@ pub fn get_parser(format: FileFormat) -> Box<dyn FileFormatParser> {
 pub fn parse(format: FileFormat, bytes: &[u8]) -> Result<ParsedContent, String> {
     let parser = get_parser(format);
     parser.parse(bytes)
+}
+
+/// The configured install's GGPK and bundle index, for `#[ignore]`d real-data tests.
+#[cfg(test)]
+pub fn real_source() -> (crate::ggpk::reader::GgpkReader, crate::bundles::index::Index) {
+    let settings = crate::settings::AppSettings::load();
+    let reader = crate::ggpk::reader::GgpkReader::open(settings.ggpk_path.expect("no ggpk_path configured")).unwrap();
+    let cache = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
+    // A CLI run on a new patch deletes the cache, and only the GUI writes it back.
+    let index = crate::bundles::index::Index::load_from_cache(&cache).unwrap_or_else(|_| {
+        let record = reader.read_file_by_path("Bundles2/_.index.bin").unwrap().expect("the GGPK has no bundle index");
+        crate::cli::read_index_bundle(reader.get_data_slice(record.data_offset, record.data_length).unwrap()).unwrap()
+    });
+    (reader, index)
+}
+
+/// Up to `n` files with extension `ext`, spread across the configured install's index, for `#[ignore]`d real-data tests.
+#[cfg(test)]
+pub fn real_files(ext: &str, n: usize) -> Vec<(String, Vec<u8>)> {
+    let (reader, index) = real_source();
+    let suffix = format!(".{}", ext.to_ascii_lowercase());
+    let mut files: Vec<_> = index.files.values().filter(|f| f.path.to_ascii_lowercase().ends_with(&suffix)).collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    let step = (files.len() / n.max(1)).max(1);
+    files
+        .iter()
+        .step_by(step)
+        .take(n)
+        .filter_map(|f| {
+            crate::bundles::extract::extract_bundle_file_sync(f, &index, Some(&reader), None).map(|b| (f.path.clone(), b))
+        })
+        .collect()
 }
 
 #[cfg(test)]

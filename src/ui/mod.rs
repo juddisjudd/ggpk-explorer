@@ -28,9 +28,11 @@ pub mod csd_viewer;
 pub mod object_viewer;
 pub mod curve_viewer;
 pub mod level_viewer;
+pub mod room_viewer;
 pub mod material_viewer;
 pub mod timeline_viewer;
 pub mod mesh_preview;
+pub mod skinned_mesh_viewer;
 
 fn load_icon() -> eframe::egui::IconData {
     let (icon_rgba, icon_width, icon_height) = {

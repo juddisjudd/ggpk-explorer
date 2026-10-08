@@ -54,12 +54,31 @@ fn empty() -> MeshData {
     MeshData { positions: Vec::new(), indices: Vec::new(), lines: Vec::new(), shapes: Vec::new(), min: [0.0; 3], max: [0.0; 3] }
 }
 
-/// Adds the most detailed LOD (the one with the most triangles).
-fn append_dolm(out: &mut MeshData, dolm: &Dolm) {
-    let Some(lod) = dolm.lods.iter().max_by_key(|l| l.indices.len()) else { return };
+/// Adds the most detailed LOD and returns its shapes as `(first triangle, triangle count)`.
+fn append_dolm(out: &mut MeshData, dolm: &Dolm) -> Vec<(usize, usize)> {
+    let Some(lod) = dolm.lods.iter().max_by_key(|l| l.indices.len()) else { return Vec::new() };
     let base = out.positions.len() as u32;
+    let first = out.indices.len() / 3;
     out.positions.extend(lod.vertices.iter().map(|v| v.pos));
     out.indices.extend(indices_of(&lod.indices).into_iter().map(|i| i + base));
+    let total = out.indices.len() / 3 - first;
+    lod.shape_extents
+        .iter()
+        .map(|ext| {
+            let start = (ext.start_index as usize / 3).min(total);
+            (first + start, (ext.count_index as usize / 3).min(total - start))
+        })
+        .collect()
+}
+
+/// Triangle ranges for shapes that record only where each one starts.
+fn ranges_from_starts(starts: impl Iterator<Item = usize>, total: usize) -> Vec<(usize, usize)> {
+    let starts: Vec<usize> = starts.map(|s| s.min(total)).collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| (start, starts.get(i + 1).copied().unwrap_or(total).clamp(start, total) - start))
+        .collect()
 }
 
 /// Geometry the preview can draw, or `None` when the file has no vertices.
@@ -67,19 +86,17 @@ pub fn extract(model: &ModelFile) -> Option<MeshData> {
     let mut out = empty();
     match model {
         ModelFile::Fmt(f) => {
-            match &f.section {
+            // v9 shapes carry no triangle start; their ranges are the DOLm LOD's shape extents.
+            let ranges = match &f.section {
                 fmt::Section::V8(s) => {
                     out.positions.extend(s.vertex_buffer.iter().map(|v| v.pos));
                     out.indices = indices_of(&s.index_buffer);
+                    ranges_from_starts(f.shapes.iter().map(|s| s.triangle_start as usize), out.indices.len() / 3)
                 }
                 fmt::Section::V9(d) => append_dolm(&mut out, d),
-            }
-            let total = out.indices.len() / 3;
-            let starts: Vec<usize> = f.shapes.iter().map(|s| s.triangle_start as usize).collect();
-            for (i, s) in f.shapes.iter().enumerate() {
-                let start = starts[i].min(total);
-                let end = starts.get(i + 1).copied().unwrap_or(total).clamp(start, total);
-                out.shapes.push((if s.name.is_empty() { s.material.clone() } else { s.name.clone() }, start, end - start));
+            };
+            for (s, (start, count)) in f.shapes.iter().zip(ranges) {
+                out.shapes.push((if s.name.is_empty() { s.material.clone() } else { s.name.clone() }, start, count));
             }
         }
         ModelFile::Tgm(t) => match &t.section {
@@ -104,24 +121,15 @@ pub fn extract(model: &ModelFile) -> Option<MeshData> {
             smd::Section::V2(v2) => {
                 out.positions.extend(v2.vertex_buffer.iter().map(|v| v.pos));
                 out.indices = indices_of(&v2.index_buffer);
-                let total = out.indices.len() / 3;
-                let starts: Vec<usize> = v2.shape_extents.iter().map(|s| s.triangle_index as usize).collect();
-                for (i, s) in v2.shape_extents.iter().enumerate() {
-                    let start = starts[i].min(total);
-                    let end = starts.get(i + 1).copied().unwrap_or(total).clamp(start, total);
-                    out.shapes.push((s.name.clone(), start, end - start));
+                let ranges = ranges_from_starts(v2.shape_extents.iter().map(|s| s.triangle_index as usize), out.indices.len() / 3);
+                for (s, (start, count)) in v2.shape_extents.iter().zip(ranges) {
+                    out.shapes.push((s.name.clone(), start, count));
                 }
             }
             smd::Section::V3(v3) => {
-                append_dolm(&mut out, &v3.dolm);
-                let total = out.indices.len() / 3;
-                if let Some(lod) = v3.dolm.lods.first() {
-                    for (i, ext) in lod.shape_extents.iter().enumerate() {
-                        let name = v3.shape_names.get(i).cloned().unwrap_or_else(|| format!("shape {}", i));
-                        let start = (ext.start_index as usize / 3).min(total);
-                        let count = (ext.count_index as usize / 3).min(total - start);
-                        out.shapes.push((name, start, count));
-                    }
+                for (i, (start, count)) in append_dolm(&mut out, &v3.dolm).into_iter().enumerate() {
+                    let name = v3.shape_names.get(i).cloned().unwrap_or_else(|| format!("shape {}", i));
+                    out.shapes.push((name, start, count));
                 }
             }
         },
@@ -436,6 +444,35 @@ mod tests {
         assert!((z - 10.0).abs() < 1e-6);
         assert!((p.x - 60.0).abs() < 1e-4 && (p.y - 30.0).abs() < 1e-4);
         assert!(cam.project([0.0, 0.0, -20.0]).is_none());
+    }
+
+    #[test]
+    fn dolm_shapes_come_from_the_drawn_lod() {
+        use crate::parsers::model::dolm::{Mesh, ShapeExtents};
+        let lod = |tris: u16, extents: &[(u32, u32)]| Mesh {
+            shape_extents: extents.iter().map(|&(start_index, count_index)| ShapeExtents { start_index, count_index }).collect(),
+            indices: IndexBuffer::U16(vec![0; tris as usize * 3]),
+            vertices: Vec::new(),
+        };
+        let dolm = Dolm {
+            c0h: 0,
+            vertex_format: 0,
+            lod_extents: Vec::new(),
+            lods: vec![lod(2, &[(0, 6)]), lod(5, &[(0, 6), (6, 9)])],
+            extra_vformat_6: None,
+            extra_vformat_6_c0h_2: None,
+            extra_c0h_4: None,
+        };
+        let mut out = empty();
+        out.indices = vec![0; 3];
+        assert_eq!(append_dolm(&mut out, &dolm), vec![(1, 2), (3, 3)]);
+        assert_eq!(out.triangle_count(), 6);
+    }
+
+    #[test]
+    fn shape_starts_become_ranges() {
+        assert_eq!(ranges_from_starts([0, 4, 4].into_iter(), 10), vec![(0, 4), (4, 0), (4, 6)]);
+        assert_eq!(ranges_from_starts([0, 20].into_iter(), 10), vec![(0, 10), (10, 0)]);
     }
 
     #[test]

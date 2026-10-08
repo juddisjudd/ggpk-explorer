@@ -342,11 +342,7 @@ impl<'a> RelationalReader<'a> {
 
     fn load(&self, name: &str) -> Option<LoadedTable> {
         let def = self.schema.find_table(name, self.is_poe2)?.clone();
-        let lower = name.to_ascii_lowercase();
-        let (path, bytes) = DAT_DIRS.iter().find_map(|dir| {
-            let p = format!("{}{}{}", dir, lower, DAT_EXT);
-            self.source.fetch(&p).map(|b| (p, b))
-        })?;
+        let (path, bytes) = fetch_table(self.source, name)?;
         match DatReader::new(bytes, &path) {
             Ok(reader) => Some(LoadedTable::new(name, def, reader)),
             Err(e) => {
@@ -404,8 +400,17 @@ impl<'a> RelationalReader<'a> {
 }
 
 /// Where PoE 2 keeps its tables; PoE 1 GGPKs use the flat `data/` folder.
-const DAT_DIRS: [&str; 2] = ["data/balance/", "data/"];
-const DAT_EXT: &str = ".datc64";
+pub const DAT_DIRS: [&str; 2] = ["data/balance/", "data/"];
+pub const DAT_EXT: &str = ".datc64";
+
+/// A table's path and bytes, from whichever of `DAT_DIRS` holds it.
+pub fn fetch_table(source: &dyn FileSource, name: &str) -> Option<(String, Vec<u8>)> {
+    let lower = name.to_ascii_lowercase();
+    DAT_DIRS.iter().find_map(|dir| {
+        let p = format!("{}{}{}", dir, lower, DAT_EXT);
+        source.fetch(&p).map(|b| (p, b))
+    })
+}
 
 #[cfg(test)]
 mod tests {

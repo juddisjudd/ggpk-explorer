@@ -10,6 +10,7 @@ A Path of Exile asset explorer for the standalone (GGPK) and Steam (Bundles2) in
 
 ### Data Sources
 - **Standalone (GGPK)**: Open `content.ggpk` from the GGG standalone launcher install.
+- **Old GGPKs**: A PoE 1 `content.ggpk` from before bundles (before 3.11.2) opens too. Its files are read straight from their GGPK records, and the caches of your current install are left alone.
 - **Steam**: Point directly at the `Bundles2/` directory from your Steam install, with no GGPK required. Loose files (e.g. `Art/Videos/`) are discovered and merged automatically.
 - **CDN Fallback**: Bundles not found locally are fetched automatically from the official CDN. You can also read a patch you do not have installed.
 - **Session Memory**: The last-used data source (GGPK path or Steam directory) is remembered and reopened on launch.
@@ -37,10 +38,12 @@ Every file reference inside any viewer is a link that opens that file: a `.dds` 
 - **Timelines** (`.atl`): Each animation's events on a time strip and in a table, with the effect packs and sounds they trigger as links.
 - **Particles & trails** (`.pet`, `.trl`): Every keyframe and sampled curve plotted per emitter or trail block.
 - **Dungeon graphs** (`.dgr`): The room grid drawn with its nodes and connections; click a node for its details and room sets.
+- **Rooms** (`.arm`): The slot grid with ground types, doodads, decals, zones and points of interest; click a doodad or decal to open its file, or a slot for its edge and ground files.
+- **Skinned meshes** (`.sm`): The `.smd` it wraps in the 3D preview, with the material for each run of shapes (click a shape to isolate it), the bounding box and the bone groups.
 - **PSG (skill trees)**: Renders the character, atlas, Chayula and Royale skill graphs the way the game lays them out, with every asset taken from the GGPK: centre ring and class illustration, class-start plates, ascendancy plates relocated onto the outer ring (with a class/ascendancy picker that dims the others), textured orbit arcs and connectors from the game's sprite sheets, per-context node frames (character/ascendancy/atlas/Breach, plus per-node overrides), group backgrounds, atlas subtree art and blockers. Hover any node for its name, stats and flavour text.
 - **JSON**: Interactive, collapsible tree viewer (`.json`, `.hideout`, `.env`, JSON-bodied `.pet`) with file links, colour swatches and inline plots for `points` curves.
 - **Shaders**: Syntax-highlighted view for `.hlsl`, `.fx`, `.vshader`, `.pshader`.
-- **Text / Config**: Every other PoE text format (`.tst`, `.rs`, `.mtd`, `.tsi`, `.arm`, `.sm`, `.amd`, `.ui`, …) in a filterable view with file references as links and a Raw toggle for the plain editor; UTF-16 with or without a BOM.
+- **Text / Config**: Every other PoE text format (`.tst`, `.rs`, `.mtd`, `.tsi`, `.amd`, `.ui`, …) in a filterable view with file references as links and a Raw toggle for the plain editor; UTF-16 with or without a BOM.
 - **Models**: `.fmt` / `.tgm` meshes and `.smd` skinned meshes in a 3D preview (orbit, zoom, pan, wireframe, per-shape selection), `.ast` skeletons as bone lines, plus the structured summary with geometry stats and full JSON export.
 - **DDS headers**: PoE 2 `.dds.header` streaming stubs render as thumbnails.
 - **Hex Viewer**: Adaptive layout for raw binary inspection of any file.
@@ -50,10 +53,11 @@ The **Diff** button records a snapshot of the current bundle index and compares 
 
 ### Export
 - Right-click any file or folder in the tree to export it.
-- Convert while exporting: textures to PNG or WebP, audio to WAV, DAT tables and stat descriptions to JSON.
+- Convert while exporting: textures to PNG or WebP, audio to WAV, DAT tables and stat descriptions to JSON, and any file with a parser (`.ao`, `.mat`, `.fmt`, `.dgr`, `.pet`, ...) to JSON beside its path as `<file>.json`.
 - Progress tracking with per-file status for large folder exports.
 - **Skill trees**: The PSG viewer's **Export tree…** button writes a tree in GGG's official web export layout: `data.json`, WebP sprite sheets, and a standalone `index.html` viewer.
 - **Game data**: **File → Export Game Data…** writes RePoE-style JSON, one file per game concept rather than one per DAT table: `mods.json`, `skills.json`, `base_items.json`, `unique_details.json`, `stat_translations/`, and 27 others. A table whose layout no longer matches the schema is refused instead of exported wrong, and the run reports what it left out.
+- **DAT tables**: **File → Export DAT Tables…** (or `export-tables`) writes every table whole, one file each, as JSON, CSV or both. A foreign key names its target row by that row's unique key (`{"TableName": "Stats", "Id": "additional_strength"}`), so a reference still reads right after a patch reorders the target. Tables whose layout no longer matches the schema are left out and listed in `export_report.json`.
 - **Path of Building data**: **File → Export PoB Data…** writes Path of Building's data files — bases, skills and gems, mods, minions and spectres, stat descriptions and the rest — as the JSON repoe-fork publishes as pob-data, for either game. They are built from the installed patch by ports of PoB's own export scripts, so they do not wait for a PoB release. Files PoB writes by hand (ModCache, SkillStatMap, uniques, trade data) are listed in the report instead.
 - **Path of Building trees**: `export-tree` writes PoB's `src/TreeData` folders for either game: PoE 2's `0_X` through a port of PoB-PoE2's tree exporter (its `tree.lua`, `tree.json` and `.dds.zst` sheets come out byte-identical to PoB's), PoE 1's `3_X` and `3_X_ruthless` through the steps PoB runs on GGG's web export. See `docs/PoB-Tree-Export.md`.
 
@@ -67,10 +71,11 @@ The same binary runs without the GUI:
 | `ggpk-explorer export-data -o data` | Write the RePoE-style JSON dumps. |
 | `ggpk-explorer export-pob -o pob-data` | Write Path of Building's data files as pob-data JSON. |
 | `ggpk-explorer export-tree -o pob-tree` | Write Path of Building's passive tree folders (`src/TreeData`). |
+| `ggpk-explorer export-tables -o tables --format both` | Write every DAT table whole as JSON and CSV, each foreign key named by the key of the row it points at. |
 | `ggpk-explorer refit --old 4.5.4.11 --write` | Rebuild the table layouts a patch broke, using the patch before it. |
 | `ggpk-explorer lint` | Check the schema's foreign keys and enum indices against the game files. |
 
-`lint --schema <file>` checks a candidate schema, which is the way to test a dat-schema change before proposing it. `refit` runs without an install too: `--cdn <patch>` reads the new patch from the CDN, and since the CDN only serves recent patches, `--save <dir>` keeps a patch's tables for `--old-dir <dir>` to refit the next one against. `--strict` fails unless every table re-fits with every column placed, and `GGPK_EXPLORER_OVERRIDES=<file>` keeps the result out of the app's own overrides. `export-data --ls <prefix>` lists indexed paths and `--cat <path>` prints one file, which is the quickest way to check a format by hand. Pass `--help` to any subcommand for its full options.
+`lint --schema <file>` checks a candidate schema, which is the way to test a dat-schema change before proposing it. `refit` runs without an install too: `--cdn <patch>` reads the new patch from the CDN, and since the CDN only serves recent patches, `--save <dir>` keeps a patch's tables for `--old-dir <dir>` to refit the next one against. `--strict` fails unless every table re-fits with every column placed, and `GGPK_EXPLORER_OVERRIDES=<file>` keeps the result out of the app's own overrides. `export-data --ls <prefix>` lists indexed paths and `--cat <path>` prints one file (text decoded, binary byte for byte), which is the quickest way to check a format by hand. `export <path> --parsed json` writes every file that has a parser as JSON. In `export-tables`, a foreign key is `{"TableName", "Id"}` when the target table has a unique key and `{"TableName", "RowIndex"}` when it does not; the shape matches poe_data_tools' `dump-tables`. Pass `--help` to any subcommand for its full options.
 
 ### UI
 - Collapsible sidebar, resizable panels.

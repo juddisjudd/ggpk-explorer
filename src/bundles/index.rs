@@ -134,6 +134,18 @@ impl Index {
         Ok(Self { bundles, files: files_map })
     }
 
+    /// The index of a GGPK with no bundles: every file is a record of its own.
+    pub fn from_ggpk_records(reader: &crate::ggpk::reader::GgpkReader) -> Self {
+        let mut index = Self { bundles: Vec::new(), files: HashMap::new() };
+        index.add_ggpk_loose_files(reader);
+        index
+    }
+
+    /// Whether this index came from a GGPK with no bundles.
+    pub fn is_pre_bundle(&self) -> bool {
+        self.bundles.is_empty() && !self.files.is_empty()
+    }
+
     /// Injects loose GGPK FILE records (FMOD/, Media/, root files, ...) into
     /// the index with `bundle_index = GGPK_LOOSE_FILE_SENTINEL` so they appear
     /// in the tree and can be viewed/exported. Idempotent: files already in

@@ -51,6 +51,7 @@ impl ExportWindow {
         let is_ogg = self.target_name.ends_with(".ogg");
         let is_dat = self.target_name.contains(".dat") || self.target_name.ends_with(".csd");
         let is_psg = self.target_name.ends_with(".psg");
+        let is_parsed = crate::parsers::translate::handles(&self.target_name);
         let show_all = self.is_folder;
 
         egui::Window::new("Export")
@@ -99,6 +100,15 @@ impl ExportWindow {
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.data_format, DataFormat::Original, "Original");
                         ui.radio_value(&mut self.settings.data_format, DataFormat::Json, "JSON");
+                    });
+                }
+
+                if show_all || is_parsed {
+                    ui.separator();
+                    modal_section(ui, "GAME FILES (.ao, .mat, .fmt, ...)");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut self.settings.parsed_format, DataFormat::Original, "Original");
+                        ui.radio_value(&mut self.settings.parsed_format, DataFormat::Json, "JSON");
                     });
                 }
 

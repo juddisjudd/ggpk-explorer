@@ -50,6 +50,7 @@ pub struct ExplorerApp {
     pub export_window: crate::ui::export_window::ExportWindow,
     pub data_export_window: crate::ui::data_export_window::DataExportWindow,
     pub pob_export_window: crate::ui::data_export_window::DataExportWindow,
+    pub table_export_window: crate::ui::data_export_window::DataExportWindow,
     pub diff_window: crate::ui::diff_window::DiffWindow,
     pub show_about: bool,
     pub update_state: crate::update::UpdateState,
@@ -157,6 +158,9 @@ impl ExplorerApp {
             pob_export_window: crate::ui::data_export_window::DataExportWindow::new(
                 crate::ui::data_export_window::ExportKind::Pob,
             ),
+            table_export_window: crate::ui::data_export_window::DataExportWindow::new(
+                crate::ui::data_export_window::ExportKind::Tables,
+            ),
             diff_window: crate::ui::diff_window::DiffWindow::default(),
             show_about: false,
             update_state: crate::update::UpdateState::new(),
@@ -255,7 +259,7 @@ impl ExplorerApp {
         self.patch_version_rx = Some(rx);
 
         thread::spawn(move || {
-            let _ = tx.send(crate::settings::AppSettings::fetch_latest_patch_version(&url));
+            let _ = tx.send(crate::settings::AppSettings::fetch_latest_patch_version(crate::settings::Game::Poe2, &url));
         });
     }
 
@@ -319,7 +323,9 @@ impl ExplorerApp {
                         .parent()
                         .and_then(crate::data_export::detect_game)
                         .unwrap_or(fallback_game);
-                    if let Some(version) = path_clone.parent().and_then(crate::data_export::detect_version) {
+                    // The caches belong to the bundled install of this game, never to an old GGPK with no bundles.
+                    let pre_bundle = !reader.has_bundle_index();
+                    if let Some(version) = path_clone.parent().and_then(crate::data_export::detect_version).filter(|_| !pre_bundle) {
                         match crate::settings::AppSettings::sync_cache_to_patch(&version, game) {
                             Ok(true) => println!("Patch {} — cleared caches built for an earlier patch", version),
                             Ok(false) => {}
@@ -335,7 +341,10 @@ impl ExplorerApp {
                     let cache_path = crate::settings::AppSettings::index_cache_path(game);
                     let mut loaded_from_cache = false;
 
-                    if cache_path.exists() {
+                    if pre_bundle {
+                        raw_index = Some(crate::bundles::index::Index::from_ggpk_records(&reader));
+                        extra_status = " (no bundles)".to_string();
+                    } else if cache_path.exists() {
                          eprintln!("Found cache file, attempting to load...");
                          let start_cache = std::time::Instant::now();
                          match crate::bundles::index::Index::load_from_cache(&cache_path) {
@@ -354,7 +363,7 @@ impl ExplorerApp {
                     }
 
 
-                    if !loaded_from_cache {
+                    if !loaded_from_cache && !pre_bundle {
                         let start_scan = std::time::Instant::now();
                         eprintln!("Cache missing or invalid. Parsing Bundles2/_.index.bin...");
                         
@@ -448,9 +457,11 @@ impl ExplorerApp {
                         // Inject loose GGPK records (FMOD/*.bank, Media/*.bk2, ...)
                         // so they show up in the tree. Runs after enrichment and
                         // is never persisted to the index cache (idempotent).
-                        let start_loose = std::time::Instant::now();
-                        let loose_added = index.add_ggpk_loose_files(&reader);
-                        println!("Injected {} loose GGPK files into index in {:?}", loose_added, start_loose.elapsed());
+                        if !pre_bundle {
+                            let start_loose = std::time::Instant::now();
+                            let loose_added = index.add_ggpk_loose_files(&reader);
+                            println!("Injected {} loose GGPK files into index in {:?}", loose_added, start_loose.elapsed());
+                        }
 
                         if hide_shader_cache {
                             let dropped = index.drop_shader_cache();
@@ -502,7 +513,9 @@ impl ExplorerApp {
                             let built_tv = TreeView::new_bundled(Some(reader.clone()), idx);
                             let tree_cache_path = crate::settings::AppSettings::tree_cache_path(game, hide_shader_cache);
                             eprintln!("Saving TreeView to cache...");
-                            if let Err(e) = built_tv.save_nodes_to_cache(&tree_cache_path) {
+                            if pre_bundle {
+                                println!("Tree cache skipped: it belongs to the bundled install");
+                            } else if let Err(e) = built_tv.save_nodes_to_cache(&tree_cache_path) {
                                 println!("Failed to save tree cache: {}", e);
                             } else {
                                 println!("Tree cache saved successfully.");
@@ -752,6 +765,7 @@ impl ExplorerApp {
         match kind {
             crate::ui::data_export_window::ExportKind::Semantic => self.data_export_window.open_with(version, game),
             crate::ui::data_export_window::ExportKind::Pob => self.pob_export_window.open_with(version, game),
+            crate::ui::data_export_window::ExportKind::Tables => self.table_export_window.open_with(version, game),
         }
     }
 
@@ -775,6 +789,7 @@ impl ExplorerApp {
             .set_title(match kind {
                 crate::ui::data_export_window::ExportKind::Semantic => "Choose a folder for the game data export",
                 crate::ui::data_export_window::ExportKind::Pob => "Choose a folder for the PoB data export",
+                crate::ui::data_export_window::ExportKind::Tables => "Choose a folder for the table export",
             })
             .pick_folder()
         else {
@@ -798,6 +813,9 @@ impl ExplorerApp {
             }
             crate::ui::data_export_window::ExportKind::Pob => {
                 crate::pob_export::run(files, schema, is_poe2, out_dir, options, tx)
+            }
+            crate::ui::data_export_window::ExportKind::Tables => {
+                crate::table_export::run(files, schema, is_poe2, out_dir, options, tx)
             }
         });
     }
@@ -1106,7 +1124,9 @@ impl eframe::App for ExplorerApp {
                                  self.is_poe2 = is_poe2;
                                  // What was opened decides the game, and the log beside it the patch.
                                  let game = crate::settings::Game::from_is_poe2(is_poe2);
-                                 let version = path.parent().and_then(crate::data_export::detect_version);
+                                 // An old GGPK with no bundles has no patch to check, and its log must not move the saved patch.
+                                 let pre_bundle = self.bundle_index.as_deref().is_some_and(|i| i.is_pre_bundle());
+                                 let version = path.parent().and_then(crate::data_export::detect_version).filter(|_| !pre_bundle);
                                  let known = self.settings.patch_version(game).to_string();
                                  if let (Some(version), Some(index)) = (version.clone(), self.bundle_index.clone()) {
                                      let files = crate::data_export::source::GameFiles::new(
@@ -1181,6 +1201,9 @@ impl eframe::App for ExplorerApp {
         if chrome_actions.export_pob {
             self.open_data_export(crate::ui::data_export_window::ExportKind::Pob);
         }
+        if chrome_actions.export_tables {
+            self.open_data_export(crate::ui::data_export_window::ExportKind::Tables);
+        }
         if self.data_export_window.show(ctx) {
             let options = self.data_export_window.options();
             self.start_data_export(options, crate::ui::data_export_window::ExportKind::Semantic);
@@ -1188,6 +1211,10 @@ impl eframe::App for ExplorerApp {
         if self.pob_export_window.show(ctx) {
             let options = self.pob_export_window.options();
             self.start_data_export(options, crate::ui::data_export_window::ExportKind::Pob);
+        }
+        if self.table_export_window.show(ctx) {
+            let options = self.table_export_window.options();
+            self.start_data_export(options, crate::ui::data_export_window::ExportKind::Tables);
         }
         if chrome_actions.open_settings {
             self.settings_window.open();

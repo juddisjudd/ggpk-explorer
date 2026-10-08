@@ -171,6 +171,11 @@ impl GgpkReader {
         }
     }
 
+    /// Whether files live in bundles; a GGPK from before PoE 1 3.11.2 keeps every file as its own record.
+    pub fn has_bundle_index(&self) -> bool {
+        matches!(self.read_file_by_path("Bundles2/_.index.bin"), Ok(Some(_)))
+    }
+
     pub fn read_file_by_path(&self, path: &str) -> io::Result<Option<FileRecord>> {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {

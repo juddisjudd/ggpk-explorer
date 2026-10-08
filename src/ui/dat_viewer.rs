@@ -1620,7 +1620,7 @@ impl DatViewer {
         out.push_str("_rid");
         for (j, col) in table.columns.iter().enumerate() {
             out.push(',');
-            out.push_str(&csv_escape(&col_name(col, j)));
+            out.push_str(&crate::dat::dump::csv_escape(&col_name(col, j)));
         }
         out.push('\n');
         for (i, vals) in self.output_rows(table).into_iter().enumerate() {
@@ -1632,7 +1632,7 @@ impl DatViewer {
                     Some(v) => scalar_text(v),
                     None => String::new(),
                 };
-                out.push_str(&csv_escape(&cell));
+                out.push_str(&crate::dat::dump::csv_escape(&cell));
             }
             out.push('\n');
         }
@@ -1703,13 +1703,5 @@ impl DatViewer {
             }
         }
         serde_json::to_string_pretty(&all_rows).ok()
-    }
-}
-
-fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-        format!("\"{}\"", s.replace('"', "\"\""))
-    } else {
-        s.to_string()
     }
 }

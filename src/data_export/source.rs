@@ -122,6 +122,11 @@ impl GameFiles {
 impl FileSource for GameFiles {
     fn fetch(&self, path: &str) -> Option<Vec<u8>> {
         let info = self.lookup(path)?;
+        if info.bundle_index == crate::bundles::index::GGPK_LOOSE_FILE_SENTINEL {
+            let reader = self.reader.as_deref()?;
+            let record = reader.read_file_by_path(&info.path).ok()??;
+            return reader.get_data_slice(record.data_offset, record.data_length).ok().map(<[u8]>::to_vec);
+        }
         let data = self.bundle(info.bundle_index)?;
         let start = info.file_offset as usize;
         let end = start.checked_add(info.file_size as usize)?;

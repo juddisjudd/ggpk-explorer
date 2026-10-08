@@ -1,6 +1,6 @@
 //! Options for the data exports: which dumps to write, whether to pull the
-//! art with them, and where they land. One dialog serves both the RePoE-style
-//! dumps and Path of Building's data files.
+//! art with them, and where they land. One dialog serves the RePoE-style
+//! dumps, Path of Building's data files and the whole-table dump.
 
 use crate::data_export::DataExportOptions;
 use crate::settings::Game;
@@ -23,6 +23,8 @@ pub enum ExportKind {
     Semantic,
     /// Path of Building's `src/Data` files, as pob-data JSON.
     Pob,
+    /// Every DAT table, whole.
+    Tables,
 }
 
 impl ExportKind {
@@ -30,6 +32,7 @@ impl ExportKind {
         match self {
             ExportKind::Semantic => crate::data_export::registry(),
             ExportKind::Pob => crate::pob_export::registry(),
+            ExportKind::Tables => Vec::new(),
         }
     }
 }
@@ -49,6 +52,9 @@ pub struct DataExportWindow {
     versioned: bool,
     /// Patch read from the install, if the client log named one.
     version: Option<String>,
+    table_formats: crate::table_export::Formats,
+    /// Table names to limit the table export to, comma separated; empty writes them all.
+    only_tables: String,
 }
 
 impl Default for DataExportWindow {
@@ -73,6 +79,8 @@ impl DataExportWindow {
             strip_null: false,
             versioned: true,
             version: None,
+            table_formats: Default::default(),
+            only_tables: String::new(),
         }
     }
 
@@ -99,7 +107,9 @@ impl DataExportWindow {
     pub fn options(&self) -> DataExportOptions {
         let all = self.available().all(|m| m.on);
         DataExportOptions {
-            only: if all {
+            only: if self.kind == ExportKind::Tables {
+                self.only_tables.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect()
+            } else if all {
                 Vec::new()
             } else {
                 self.available().filter(|m| m.on).map(|m| m.name.to_string()).collect()
@@ -108,7 +118,8 @@ impl DataExportWindow {
             trade_stats: self.trade_stats && self.kind == ExportKind::Semantic,
             version: self.versioned.then(|| self.version.clone()).flatten(),
             flat: !self.versioned,
-            strip_null: self.strip_null && self.kind == ExportKind::Semantic,
+            strip_null: self.strip_null && self.kind != ExportKind::Pob,
+            table_formats: self.table_formats,
         }
     }
 
@@ -133,6 +144,10 @@ impl DataExportWindow {
             ExportKind::Pob => (
                 "Export PoB Data",
                 "Path of Building's data files — bases, skills, gems, mods, minions, stat descriptions —                  as the JSON repoe-fork publishes as pob-data. Files PoB writes by hand are listed in                  export_report.json.",
+            ),
+            ExportKind::Tables => (
+                "Export DAT Tables",
+                "Every table in the install, one file each. A foreign key names its target row by that row's unique key.                  Tables whose layout no longer matches the schema are left out and listed in export_report.json.",
             ),
         };
         let kind = self.kind;
@@ -202,34 +217,54 @@ impl DataExportWindow {
                         );
                 }
 
-                ui.separator();
-                ui.horizontal(|ui| {
-                    modal_section(ui, "DUMPS");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("None").clicked() {
-                            self.modules.iter_mut().for_each(|m| m.on = false);
-                        }
-                        if ui.small_button("All").clicked() {
-                            self.modules.iter_mut().for_each(|m| m.on = m.skipped.is_none());
+                if kind == ExportKind::Tables {
+                    ui.separator();
+                    modal_section(ui, "FORMAT");
+                    ui.horizontal(|ui| {
+                        use crate::table_export::Formats;
+                        ui.radio_value(&mut self.table_formats, Formats { json: true, csv: false }, "JSON");
+                        ui.radio_value(&mut self.table_formats, Formats { json: false, csv: true }, "CSV");
+                        ui.radio_value(&mut self.table_formats, Formats { json: true, csv: true }, "Both");
+                    });
+                    ui.checkbox(&mut self.strip_null, "Leave out keys with no value");
+                    modal_section(ui, "TABLES");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.only_tables)
+                            .hint_text("All tables, or names like Mods, Stats")
+                            .desired_width(f32::INFINITY),
+                    );
+                }
+
+                if kind != ExportKind::Tables {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        modal_section(ui, "DUMPS");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("None").clicked() {
+                                self.modules.iter_mut().for_each(|m| m.on = false);
+                            }
+                            if ui.small_button("All").clicked() {
+                                self.modules.iter_mut().for_each(|m| m.on = m.skipped.is_none());
+                            }
+                        });
+                    });
+
+                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        for module in &mut self.modules {
+                            let enabled = module.skipped.is_none();
+                            ui.add_enabled(enabled, egui::Checkbox::new(&mut module.on, module.name))
+                                .on_hover_text(module.skipped.unwrap_or(module.summary));
                         }
                     });
-                });
 
-                egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                    for module in &mut self.modules {
-                        let enabled = module.skipped.is_none();
-                        ui.add_enabled(enabled, egui::Checkbox::new(&mut module.on, module.name))
-                            .on_hover_text(module.skipped.unwrap_or(module.summary));
-                    }
-                });
-
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(format!("SELECTED · {} of {}", self.selected(), self.available().count()))
-                        .monospace()
-                        .size(10.5)
-                        .color(muted),
-                );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("SELECTED · {} of {}", self.selected(), self.available().count()))
+                            .monospace()
+                            .size(10.5)
+                            .color(muted),
+                    );
+                }
 
                 ui.add_space(6.0);
                 ui.separator();
@@ -239,7 +274,7 @@ impl DataExportWindow {
                         should_close = true;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let ready = self.selected() > 0;
+                        let ready = kind == ExportKind::Tables || self.selected() > 0;
                         if ui
                             .add_enabled(ready, egui::Button::new("Choose folder and export"))
                             .clicked()
@@ -317,6 +352,19 @@ mod tests {
         let options = w.options();
         assert!(!options.images && !options.strip_null, "the extras belong to the RePoE export");
         assert!(options.only.is_empty());
+    }
+
+    #[test]
+    fn the_table_dialog_passes_formats_and_table_names() {
+        let mut w = DataExportWindow::new(ExportKind::Tables);
+        w.open_with(Some("0.5.5.4".into()), Game::Poe2);
+        assert!(w.modules.is_empty());
+        w.only_tables = " Mods, ,Stats ".into();
+        w.strip_null = true;
+        w.table_formats = crate::table_export::Formats { json: true, csv: true };
+        let options = w.options();
+        assert_eq!(options.only, vec!["Mods".to_string(), "Stats".to_string()]);
+        assert!(options.strip_null && options.table_formats.csv && options.table_formats.json);
     }
 
     #[test]

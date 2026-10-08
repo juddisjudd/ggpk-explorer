@@ -39,6 +39,8 @@ pub struct ExportSettings {
     pub audio_format: AudioFormat,
     pub data_format: DataFormat,
     pub psg_format: PsgFormat,
+    /// Files with a parser (`.ao`, `.mat`, `.fmt`, ...) as written, or as JSON.
+    pub parsed_format: DataFormat,
     pub recursive: bool,
     pub is_poe2: bool,
 }
@@ -50,6 +52,7 @@ impl Default for ExportSettings {
             audio_format: AudioFormat::Original,
             data_format: DataFormat::Original,
             psg_format: PsgFormat::Original,
+            parsed_format: DataFormat::Original,
             recursive: true,
             is_poe2: false,
         }
@@ -928,46 +931,26 @@ fn export_file_data(
     {
         match settings.data_format {
             DataFormat::Json => {
-                let mut converted = false;
-                if let Some(schema) = schema {
-                    let stem = std::path::Path::new(&path_str)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-                    if let Some(table_def) = schema.find_table(stem, settings.is_poe2) {
-                        if let Ok(r) =
-                            crate::dat::reader::DatReader::new(file_data.to_vec(), path_str)
-                        {
-                            use serde_json::{Map, Value};
-
-                            let mut rows = Vec::new();
-                            for i in 0..r.row_count {
-                                if let Ok(vals) = r.read_row(i, table_def) {
-                                    let mut map = Map::new();
-                                    for (j, val) in vals.iter().enumerate() {
-                                        if let Some(col) = table_def.columns.get(j) {
-                                            let col_name = col
-                                                .name
-                                                .clone()
-                                                .unwrap_or_else(|| format!("Col{}", j));
-                                            let v = r.value_to_json(val, col);
-                                            map.insert(col_name, v);
-                                        }
-                                    }
-                                    rows.push(Value::Object(map));
-                                }
-                            }
-                            let json_out = Value::Array(rows);
-                            let dest = full_path.with_extension("json");
-                            let s = serde_json::to_string_pretty(&json_out)
-                                .map_err(|e| e.to_string())?;
-                            std::fs::write(dest, s).map_err(|e| e.to_string())?;
-                            converted = true;
+                let stem = std::path::Path::new(&path_str)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let table = schema.as_ref().and_then(|s| Some((s, s.find_table(stem, settings.is_poe2)?)));
+                let reader = table.and_then(|_| crate::dat::reader::DatReader::new(file_data.to_vec(), path_str).ok());
+                match (table, reader) {
+                    (Some((schema, table_def)), Some(reader)) => {
+                        let fit = crate::dat::analysis::check_fit(&reader, table_def, 40);
+                        if fit.is_broken() {
+                            std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                            return Err(format!("{} kept as a table file: {}", path_str, fit.summary()));
                         }
+                        // One file at a time has no other tables to read keys from, so references stay row indices.
+                        let no_keys = |_: &str| -> Option<std::rc::Rc<Vec<crate::data_export::json::J>>> { None };
+                        let rows = crate::dat::dump::Dumper::new(schema, settings.is_poe2, &no_keys).table(&reader, table_def);
+                        std::fs::write(full_path.with_extension("json"), crate::data_export::json::pretty(&rows))
+                            .map_err(|e| e.to_string())?;
                     }
-                }
-                if !converted {
-                    std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                    _ => std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?,
                 }
             }
             DataFormat::Original => {
@@ -1011,6 +994,20 @@ fn export_file_data(
             }
             DataFormat::Original => {
                 std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+            }
+        }
+    } else if let Some(converted) =
+        (settings.parsed_format == DataFormat::Json).then(|| crate::parsers::translate::to_json(path_str, file_data)).flatten()
+    {
+        match converted {
+            Ok(json) => {
+                let mut dest = full_path.clone().into_os_string();
+                dest.push(".json");
+                std::fs::write(dest, json).map_err(|e| e.to_string())?;
+            }
+            Err(e) => {
+                std::fs::write(&full_path, file_data).map_err(|e| e.to_string())?;
+                return Err(format!("{} kept as written, it did not parse: {}", path_str, e));
             }
         }
     } else if path_lower.ends_with(".png")

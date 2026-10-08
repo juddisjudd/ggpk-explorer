@@ -36,6 +36,8 @@ pub struct DataExportOptions {
     /// Drop null-valued keys from every dump, so an entry lists only what it
     /// has. Off by default — the published files keep them.
     pub strip_null: bool,
+    /// Which files the table dump writes for each table.
+    pub table_formats: crate::table_export::Formats,
 }
 
 impl DataExportOptions {

@@ -260,7 +260,7 @@ impl SettingsWindow {
                             self.fetch_rx = Some(rx);
                             let url = settings.patch_version_source_url.clone();
                             thread::spawn(move || {
-                                let _ = tx.send(AppSettings::fetch_latest_patch_version(&url));
+                                let _ = tx.send(AppSettings::fetch_latest_patch_version(Game::Poe2, &url));
                             });
                         }
                         if let Some(msg) = &self.fetch_status_msg {
