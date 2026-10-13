@@ -46,6 +46,8 @@ pub struct ContentView {
     /// Decoded text of loaded text files, so viewers don't re-decode every frame.
     text_cache: HashMap<u64, std::sync::Arc<String>>,
     text_filters: HashMap<u64, String>,
+    /// Lines to open text files on, as when a search match is opened.
+    text_focus: HashMap<u64, crate::ui::linked_text_viewer::LineFocus>,
     /// Files the user switched to the plain editor view.
     raw_text_view: std::collections::HashSet<u64>,
     object_cache: HashMap<u64, std::sync::Arc<crate::parsers::object_dsl::ObjectFile>>,
@@ -75,6 +77,10 @@ pub struct ContentView {
     audio_sink: Option<rodio::Player>,
     pub last_error: Option<String>,
     pub failed_loads: std::collections::HashSet<u64>,
+    /// Files that end like a DAT table but are not one, with what is known of each.
+    not_tables: HashMap<u64, Vec<String>>,
+    /// Files with no viewer whose bytes were asked for.
+    bytes_shown: std::collections::HashSet<u64>,
     /// The file being read and decoded off the UI thread, by path hash.
     loading: Option<(u64, std::sync::mpsc::Receiver<LoadedFile>)>,
     image_view_states: HashMap<u64, ImageViewState>,
@@ -162,6 +168,7 @@ impl Default for ContentView {
             json_cache: HashMap::new(),
             text_cache: HashMap::new(),
             text_filters: HashMap::new(),
+            text_focus: HashMap::new(),
             raw_text_view: std::collections::HashSet::new(),
             object_cache: HashMap::new(),
             object_viewer_state: HashMap::new(),
@@ -185,6 +192,8 @@ impl Default for ContentView {
             audio_sink: None,
             last_error: None,
             failed_loads: std::collections::HashSet::new(),
+            not_tables: HashMap::new(),
+            bytes_shown: std::collections::HashSet::new(),
             loading: None,
             image_view_states: HashMap::new(),
 
@@ -404,8 +413,8 @@ impl ContentView {
                                      perform_load = true;
                                  }
                              } else {
-                                 // For other files, auto load into raw cache for Hex View?
-                                 if !self.raw_data_cache.contains_key(&hash) && file_info.file_size < 1024 * 1024 { // Only auto load small files < 1MB
+                                 // A file with no viewer is read only once its bytes are asked for.
+                                 if self.bytes_shown.contains(&hash) && !self.raw_data_cache.contains_key(&hash) {
                                      perform_load = true;
                                  }
                              }
@@ -450,24 +459,17 @@ impl ContentView {
                               if file_info.path.ends_with(".dat") || file_info.path.ends_with(".dat64") || file_info.path.ends_with(".datc64") || file_info.path.ends_with(".datl") || file_info.path.ends_with(".datl64") {
                                    // DatViewer handles its own scrolling via TableBuilder
                                    // If dat viewer has error, show generic hex views?
-                                   if self.is_loading(hash) {
+                                   if let Some(lines) = self.not_tables.get(&hash).cloned() {
+                                       self.show_unreadable(ui, hash, &lines, false);
+                                   } else if self.is_loading(hash) {
                                        ui.spinner();
                                    } else if self.dat_viewer.error_msg.is_some() || self.dat_viewer.reader.is_none() {
-                                       egui::ScrollArea::vertical().show(ui, |ui| {
-                                           if let Some(last_err) = &self.last_error {
-                                               ui.horizontal(|ui| {
-                                                   ui.colored_label(egui::Color32::from_rgb(239, 68, 68), "❌ Failed to load DAT:");
-                                               });
-                                               ui.label(last_err);
-                                               ui.add_space(8.0);
+                                       match self.last_error.clone() {
+                                           Some(why) => self.show_unreadable(ui, hash, &["This table cannot be read.".to_string(), why], false),
+                                           None => {
+                                               egui::ScrollArea::vertical().show(ui, |ui| self.dat_viewer.show(ui, is_poe2, None));
                                            }
-                                           if let Some(data) = self.raw_data_cache.get(&hash) {
-                                               ui.label("Showing raw hex view:");
-                                               crate::ui::hex_viewer::HexViewer::show(ui, data);
-                                           } else if self.last_error.is_none() {
-                                               self.dat_viewer.show(ui, is_poe2, None); // Show failed state
-                                           }
-                                       });
+                                       }
                                    } else {
                                        let index_arc = index.clone();
                                        let reader_arc = reader.clone();
@@ -600,14 +602,9 @@ impl ContentView {
                                          }
                                          _ => crate::ui::model_viewer::ModelViewer::show(ui, &file_info.path, &model, &summary),
                                      }
-                                 } else if let Some(data) = self.raw_data_cache.get(&hash) {
-                                     egui::ScrollArea::vertical().show(ui, |ui| {
-                                         if let Some(err) = &self.last_error {
-                                             ui.colored_label(egui::Color32::from_rgb(239, 68, 68), format!("❌ {}", err));
-                                         }
-                                         ui.label("Showing raw hex view:");
-                                         crate::ui::hex_viewer::HexViewer::show(ui, data);
-                                     });
+                                 } else if self.raw_data_cache.contains_key(&hash) {
+                                     let why = self.last_error.clone().unwrap_or_else(|| "The app has no reader for the way this model is laid out.".to_string());
+                                     self.show_unreadable(ui, hash, &["This model cannot be shown.".to_string(), why], false);
                                  } else if self.failed_loads.contains(&hash) {
                                      ui.colored_label(egui::Color32::RED, self.last_error.as_deref().unwrap_or("Failed to load."));
                                  } else {
@@ -913,10 +910,7 @@ impl ContentView {
                                                         }
                                                     });
                                                     let opened = if raw {
-                                                        let mut filter = self.text_filters.remove(&hash).unwrap_or_default();
-                                                        let o = crate::ui::linked_text_viewer::LinkedTextViewer::show(ui, hash, &text, &mut filter);
-                                                        self.text_filters.insert(hash, filter);
-                                                        o
+                                                        self.show_linked_text(ui, hash, &text)
                                                     } else {
                                                         let doc = self.object_cache.entry(hash).or_insert_with(|| std::sync::Arc::new(crate::parsers::object_dsl::parse(&text))).clone();
                                                         let index_arc = index.clone();
@@ -970,9 +964,7 @@ impl ContentView {
                                                             );
                                                         });
                                                     } else {
-                                                        let mut filter = self.text_filters.remove(&hash).unwrap_or_default();
-                                                        let opened = crate::ui::linked_text_viewer::LinkedTextViewer::show(ui, hash, &text, &mut filter);
-                                                        self.text_filters.insert(hash, filter);
+                                                        let opened = self.show_linked_text(ui, hash, &text);
                                                         if let Some(p) = opened {
                                                             self.open_path(index, &p);
                                                         }
@@ -983,17 +975,7 @@ impl ContentView {
                                                 }
                                            }
                                       } else {
-                                          egui::ScrollArea::vertical().show(ui, |ui| {
-                                              if let Some(data) = self.raw_data_cache.get(&hash) {
-                                                  crate::ui::hex_viewer::HexViewer::show(ui, data);
-                                              } else {
-                                                  if file_info.file_size >= 1024 * 1024 {
-                                                      ui.label("File too large for auto-preview. Click Reload Content to force load.");
-                                                  } else {
-                                                      ui.label("Loading...");
-                                                  }
-                                              }
-                                          });
+                                          self.show_unreadable(ui, hash, &no_viewer_note(&file_info.path), true);
                                       }
                              }
 
@@ -1165,12 +1147,8 @@ impl ContentView {
                         let (hash, file_info) = files[file_index];
 
                         row.col(|ui| {
-                            ui.label(
-                                egui::RichText::new("·")
-                                    .monospace()
-                                    .size(10.0)
-                                    .color(egui::Color32::from_rgb(113, 113, 122)),
-                            );
+                            let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                            crate::ui::file_kind::dot(ui.painter(), rect.center(), crate::ui::file_kind::FileKind::of(&file_info.path), ui.visuals().dark_mode);
                         });
 
                         row.col(|ui| {
@@ -1190,7 +1168,7 @@ impl ContentView {
                                 egui::RichText::new(file_kind_label(&file_info.path).to_uppercase())
                                     .monospace()
                                     .size(10.0)
-                                    .color(egui::Color32::from_rgb(120, 170, 210)),
+                                    .color(crate::ui::file_kind::FileKind::of(&file_info.path).colour(ui.visuals().dark_mode)),
                             );
                         });
 
@@ -1366,7 +1344,7 @@ impl ContentView {
                             egui::RichText::new(file_kind_label(&file_info.path).to_uppercase())
                                 .monospace()
                                 .size(10.0)
-                                .color(egui::Color32::from_rgb(120, 170, 210)),
+                                .color(crate::ui::file_kind::FileKind::of(&file_info.path).colour(ui.visuals().dark_mode)),
                         );
                     });
 
@@ -2111,9 +2089,66 @@ impl ContentView {
 
     fn show_linked_text(&mut self, ui: &mut egui::Ui, hash: u64, text: &str) -> Option<String> {
         let mut filter = self.text_filters.remove(&hash).unwrap_or_default();
-        let opened = crate::ui::linked_text_viewer::LinkedTextViewer::show(ui, hash, text, &mut filter);
+        let opened = crate::ui::linked_text_viewer::LinkedTextViewer::show(ui, hash, text, &mut filter, self.text_focus.get_mut(&hash));
         self.text_filters.insert(hash, filter);
         opened
+    }
+
+    /// What a file that cannot be shown gets: a short note saying so. Its bytes are drawn only when asked for, and read then if `can_load`.
+    fn show_unreadable(&mut self, ui: &mut egui::Ui, hash: u64, lines: &[String], can_load: bool) {
+        crate::ui::components::card(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (i, line) in lines.iter().enumerate() {
+                match i {
+                    0 => ui.label(egui::RichText::new(line).strong()),
+                    _ => ui.label(egui::RichText::new(line).weak()),
+                };
+            }
+        });
+        if !can_load && !self.raw_data_cache.contains_key(&hash) {
+            return;
+        }
+        ui.add_space(6.0);
+        let mut shown = self.bytes_shown.contains(&hash);
+        if ui.toggle_value(&mut shown, "Show bytes").on_hover_text("The file as hexadecimal").changed() {
+            match shown {
+                true => self.bytes_shown.insert(hash),
+                false => self.bytes_shown.remove(&hash),
+            };
+        }
+        if !shown {
+            return;
+        }
+        ui.add_space(4.0);
+        match self.raw_data_cache.get(&hash) {
+            Some(data) => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| crate::ui::hex_viewer::HexViewer::show(ui, data));
+            }
+            None if self.failed_loads.contains(&hash) => {
+                ui.label(egui::RichText::new(self.last_error.as_deref().unwrap_or("The file could not be read.")).weak());
+            }
+            None => {
+                ui.spinner();
+            }
+        }
+    }
+
+    /// Opens a file where a search found `text`: a text file on its line, a table or stat file filtered to the text.
+    pub fn focus_match(&mut self, hash: u64, path: &str, line: u32, text: &str) {
+        let lower = path.to_ascii_lowercase();
+        if line == 0 {
+            self.dat_viewer.filter_table(path, text);
+        } else if lower.ends_with(".csd") {
+            self.csd_viewer_state.entry(hash).or_default().filter = text.to_string();
+        } else {
+            // Files with a dedicated view show their text only in raw mode; plain text files show it unless raw.
+            match is_structured_text(path) || crate::parsers::object_dsl::is_object_path(path) {
+                true => self.raw_text_view.insert(hash),
+                false => self.raw_text_view.remove(&hash),
+            };
+            self.text_filters.remove(&hash);
+            self.text_focus.insert(hash, crate::ui::linked_text_viewer::LineFocus { line: line as usize, pending: true });
+        }
     }
 
     fn show_curves(&mut self, ui: &mut egui::Ui, hash: u64, text: &str) -> Option<String> {
@@ -2394,6 +2429,13 @@ impl ContentView {
     fn store_decoded(&mut self, ctx: &egui::Context, path: &str, hash: u64, decoded: Decoded) {
         println!("Loaded content for: {}", path);
         match decoded {
+            Decoded::Dat(data) if memchr::memmem::find(&data, &[0xBB; 8]).is_none() => {
+                // Every DAT table has the row marker, so a file without it only shares the ending.
+                self.not_tables.insert(hash, describe_not_a_table(&data));
+                self.failed_loads.insert(hash);
+                self.last_error = None;
+                self.insert_raw(hash, data);
+            }
             Decoded::Dat(data) => {
                 println!("Loading DAT: {} ({} bytes)", path, data.len());
                 self.dat_viewer.load_from_bytes(data, path);
@@ -2767,25 +2809,34 @@ fn format_file_size(size: u64) -> String {
     }
 }
 
-fn file_kind_label(path: &str) -> &'static str {
-    let p = path.to_lowercase();
-    if is_image_path(&p) {
-        "IMAGE"
-    } else if p.ends_with(".bk2") || p.ends_with(".mp4") {
-        "VIDEO"
-    } else if p.ends_with(".ogg") || p.ends_with(".wem") || p.ends_with(".wav") || p.ends_with(".mp3") || p.ends_with(".bank") {
-        "AUDIO"
-    } else if p.ends_with(".dat") || p.ends_with(".dat64") || p.ends_with(".datc64") || p.ends_with(".datl") || p.ends_with(".datl64") {
-        "DATA"
-    } else if is_json_path(&p) || is_text_file(&p) {
-        "TEXT"
-    } else if crate::parsers::model::is_model_path(&p) {
-        "MODEL"
-    } else if p.ends_with(".psg") || p.ends_with(".fxgraph") {
-        "GRAPH"
-    } else {
-        "BINARY"
+/// What to say about a file that ends like a DAT table but has no row marker.
+fn describe_not_a_table(data: &[u8]) -> Vec<String> {
+    use crate::ui::components::thousands;
+    match crate::parsers::mat_table::parse(data) {
+        Ok(table) => {
+            let combinations: std::collections::HashSet<u64> = table.keys.iter().map(|(_, combination)| *combination).collect();
+            vec![
+                "Not a data table. This is the game client's \"mat table\", a lookup that saves it recompiling shaders.".to_string(),
+                format!("Version {}. {} entries lead to {} graph combinations, and {} of those have parameters inlined into their shader, {} in all.", table.version, thousands(table.keys.len()), thousands(combinations.len()), thousands(table.records.len()), thousands(table.inlined())),
+                "Entries and combinations are named by hashes the client works out at run time, not by file paths, so they cannot be matched to files.".to_string(),
+            ]
+        }
+        Err(_) => vec!["Not a data table. The file ends like one but has no row marker, so it has no rows or columns to show.".to_string()],
     }
+}
+
+/// What to say about a file whose kind has no viewer.
+fn no_viewer_note(path: &str) -> Vec<String> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let why = match name.rsplit_once('.') {
+        Some((_, ending)) if !ending.is_empty() => format!("The app has no reader for .{} files.", ending.to_ascii_lowercase()),
+        _ => "The app has no reader for this kind of file.".to_string(),
+    };
+    vec!["This file cannot be shown.".to_string(), why]
+}
+
+fn file_kind_label(path: &str) -> &'static str {
+    crate::ui::file_kind::FileKind::of(path).label()
 }
 
 fn is_supported_format(path: &str) -> Option<crate::parsers::FileFormat> {
@@ -3067,6 +3118,38 @@ fn render_parsed_content(ui: &mut egui::Ui, file_name: &str, parsed: &crate::par
         _ => {
             TextConfigViewer::show(ui, file_name, parsed);
         }
+    }
+}
+
+#[cfg(test)]
+mod unreadable_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_with_no_viewer_shows_a_note_and_its_bytes_only_when_asked() {
+        let lines = no_viewer_note("Art/Thing.XYZ");
+        assert_eq!(lines, ["This file cannot be shown.", "The app has no reader for .xyz files."]);
+        assert_eq!(no_viewer_note("folder.with.dots/noending")[1], "The app has no reader for this kind of file.");
+
+        let view = std::cell::RefCell::new(ContentView::default());
+        view.borrow_mut().insert_raw(7, vec![0xAB; 64]);
+        let draw = |ui: &mut egui::Ui| view.borrow_mut().show_unreadable(ui, 7, &lines, false);
+        let text = crate::ui::patch_page::painted_text(draw);
+        assert!(text.contains("This file cannot be shown.") && text.contains("Show bytes") && !text.contains("AB AB"), "{}", text);
+        view.borrow_mut().bytes_shown.insert(7);
+        assert!(crate::ui::patch_page::painted_text(draw).contains("AB AB AB"));
+
+        let nothing_kept = crate::ui::patch_page::painted_text(|ui| view.borrow_mut().show_unreadable(ui, 8, &lines, false));
+        assert!(nothing_kept.contains("This file cannot be shown.") && !nothing_kept.contains("Show bytes"), "{}", nothing_kept);
+        let on_request = crate::ui::patch_page::painted_text(|ui| view.borrow_mut().show_unreadable(ui, 8, &lines, true));
+        assert!(on_request.contains("Show bytes"));
+    }
+
+    #[test]
+    fn a_file_that_only_ends_like_a_table_is_described_without_its_bytes() {
+        let lines = describe_not_a_table(&[1, 2, 3]);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("Not a data table.") && !lines[0].contains("below"));
     }
 }
 

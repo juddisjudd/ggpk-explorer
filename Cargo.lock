@@ -1994,14 +1994,17 @@ dependencies = [
  "egui_extras",
  "env_logger",
  "hound",
+ "iced-x86",
  "image",
  "image_dds",
  "lewton",
  "libc",
  "log",
  "lru",
+ "memchr",
  "memmap2",
  "open",
+ "rayon",
  "regex",
  "reqwest",
  "rfd",
@@ -2435,6 +2438,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]

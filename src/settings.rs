@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
 
 /// Filename for the cached, parsed `Bundles2/_.index.bin` (bincode).
 pub const INDEX_CACHE_FILENAME: &str = "bundles2.cache";
@@ -63,8 +62,6 @@ pub struct AppSettings {
     pub recent_files: Vec<String>,
     #[serde(default = "default_patch_version")]
     pub poe2_patch_version: String,
-    #[serde(default = "default_patch_source")]
-    pub patch_version_source_url: String,
     #[serde(default = "default_auto_detect_patch_version")]
     pub auto_detect_patch_version: bool,
     #[serde(default = "default_auto_update_schema")]
@@ -99,10 +96,6 @@ fn default_patch_version() -> String {
     "4.5.1.1.4".to_string()
 }
 
-fn default_patch_source() -> String {
-    "https://poe-versions.obsoleet.org".to_string()
-}
-
 fn default_auto_detect_patch_version() -> bool {
     true
 }
@@ -118,7 +111,6 @@ impl Default for AppSettings {
             steam_path: None,
             recent_files: Vec::new(),
             poe2_patch_version: default_patch_version(),
-            patch_version_source_url: default_patch_source(),
             auto_detect_patch_version: default_auto_detect_patch_version(),
             auto_update_schema: default_auto_update_schema(),
             schema_local_path: None,
@@ -178,149 +170,18 @@ impl AppSettings {
         }
     }
 
-    pub fn fetch_latest_patch_version(game: Game, source_url: &str) -> Result<String, String> {
-        // Try direct patch server protocol first (most reliable)
-        match Self::fetch_patch_version_direct(game) {
-            Ok(version) => {
-                println!("[PatchVersion] Got version from patch server: {}", version);
-                return Ok(version);
-            },
-            Err(e) => {
-                println!("[PatchVersion] Direct patch server failed: {}. Falling back to HTTP.", e);
-            }
-        }
-
-        // Fallback to HTTP endpoint
-        let client = reqwest::blocking::Client::new();
-        let resp = client
-            .get(source_url)
-            .header("User-Agent", "ggpk-explorer/1.2.5")
-            .send()
-            .map_err(|e| format!("Network Error: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("HTTP Error: {}", resp.status()));
-        }
-
-        let json = resp
-            .json::<serde_json::Value>()
-            .map_err(|e| format!("JSON Parse Error: {}", e))?;
-
-        let key = match game {
-            Game::Poe2 => "poe2",
-            Game::Poe1 => "poe",
-        };
-        // The source answers "error" in place of a version when it cannot reach the patch server.
-        json.get(key)
-            .and_then(|value| value.as_str())
-            .filter(|value| Self::looks_like_version(value))
-            .map(|value| value.to_string())
-            .ok_or_else(|| format!("JSON has no version under '{}'", key))
+    fn install_root(&self, game: Game) -> Option<&std::path::Path> {
+        std::path::Path::new(self.ggpk_path_for(game).or(self.steam_path_for(game))?).parent()
     }
 
-    /// Fetch a game's patch version directly from its patch server.
-    /// Protocol ported from poe-get-version (Go reference implementation).
-    ///
-    /// Protocol:
-    /// 1. Connect TCP to patch.pathofexile2.com:13060 (PoE 1: patch.pathofexile.com:12995)
-    /// 2. Send handshake bytes [0x01, 0x07] (PoE 1: [0x01, 0x06])
-    /// 3. Read response: 1 byte proto_ver + 32 bytes unknown + N bytes payload
-    /// 4. Payload contains two UTF-16LE length-prefixed strings (CDN URLs)
-    /// 5. Parse version from URL: https://patch-poe2.poecdn.com/{VERSION}/
-    fn fetch_patch_version_direct(game: Game) -> Result<String, String> {
-        use std::net::{TcpStream, ToSocketAddrs};
-        use std::time::Duration;
-
-        let (addr, handshake) = match game {
-            Game::Poe2 => ("patch.pathofexile2.com:13060", [0x01, 0x07]),
-            Game::Poe1 => ("patch.pathofexile.com:12995", [0x01, 0x06]),
-        };
-        // Resolve DNS first — connect_timeout only accepts SocketAddr (IP:port)
-        let socket_addr = addr.to_socket_addrs()
-            .map_err(|e| format!("DNS resolve failed for {}: {}", addr, e))?
-            .next()
-            .ok_or_else(|| format!("No addresses found for {}", addr))?;
-
-        let mut stream = TcpStream::connect_timeout(
-            &socket_addr,
-            Duration::from_secs(5),
-        ).map_err(|e| format!("TCP connect failed to {}: {}", addr, e))?;
-
-        stream.set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|e| format!("Set timeout failed: {}", e))?;
-
-        stream.write_all(&handshake)
-            .map_err(|e| format!("Write handshake failed: {}", e))?;
-
-        // Read response
-        let mut buf = vec![0u8; 1024];
-        let n = stream.read(&mut buf)
-            .map_err(|e| format!("Read response failed: {}", e))?;
-
-        if n < 35 {
-            return Err(format!("Response too short: {} bytes", n));
-        }
-
-        let data = &buf[..n];
-
-        // Verify protocol version
-        let proto_ver = data[0];
-        if proto_ver != 2 {
-            return Err(format!("Unexpected protocol version: {}", proto_ver));
-        }
-
-        // Skip header: 1 byte proto + 32 bytes unknown = 33 bytes
-        let mut pos = 33;
-
-        // Read two length-prefixed UTF-16LE strings
-        // We want the second one (or either — they should be the same URL)
-        let mut version_str = None;
-        for _ in 0..2 {
-            if pos + 2 > data.len() { break; }
-
-            // Length is big-endian u16 (number of UTF-16 code units)
-            let str_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-            pos += 2;
-
-            let byte_len = str_len * 2;
-            if pos + byte_len > data.len() { break; }
-
-            // Decode UTF-16LE
-            let u16s: Vec<u16> = data[pos..pos + byte_len]
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                .collect();
-            let s = String::from_utf16_lossy(&u16s);
-            pos += byte_len;
-
-            // Parse version from URL: https://patch-poe2.poecdn.com/4.5.1.1.4/
-            if let Some(ver) = Self::extract_version_from_cdn_url(&s) {
-                version_str = Some(ver);
-            }
-        }
-
-        version_str.ok_or_else(|| "Could not extract version from patch server response".to_string())
+    /// The patch the saved install of `game` is on, by its client log.
+    pub fn installed_patch(&self, game: Game) -> Option<String> {
+        crate::data_export::detect_version(self.install_root(game)?)
     }
 
-    /// Extract version string from a CDN URL like
-    /// "https://patch-poe2.poecdn.com/4.5.1.1.4/"
-    fn extract_version_from_cdn_url(url: &str) -> Option<String> {
-        let s = url.trim_start_matches("https://");
-        let s = s.trim_start_matches("http://");
-        // Remove host: "patch-poe2.poecdn.com/" or "patch.poecdn.com/"
-        let s = if let Some(rest) = s.strip_prefix("patch-poe2.poecdn.com/") {
-            rest
-        } else if let Some(rest) = s.strip_prefix("patch.poecdn.com/") {
-            rest
-        } else {
-            return None;
-        };
-        let version = s.trim_end_matches('/');
-        Self::looks_like_version(version).then(|| version.to_string())
-    }
-
-    fn looks_like_version(s: &str) -> bool {
-        s.contains('.') && s.chars().all(|c| c.is_ascii_digit() || c == '.')
+    /// The protocol number the saved install of `game` last sent its patch server.
+    pub fn patch_protocol(&self, game: Game) -> Option<u8> {
+        crate::patch_server::logged_protocol(self.install_root(game)?)
     }
 
     pub fn get_app_data_dir() -> PathBuf {
@@ -507,5 +368,36 @@ mod cache_stamp_tests {
     fn without_a_stamp_the_saved_version_decides() {
         assert!(cache_matches_patch(None, "4.5.5.1", "4.5.5.1"));
         assert!(!cache_matches_patch(None, "4.5.5.2", "4.5.5.1"));
+    }
+}
+
+#[cfg(test)]
+mod saved_settings_tests {
+    use super::{AppSettings, Game};
+
+    #[test]
+    fn settings_saved_by_an_earlier_version_still_load() {
+        let saved = r#"{
+            "ggpk_path": "D:/PoE2/Content.ggpk",
+            "steam_path": null,
+            "recent_files": ["data/balance/mods.datc64"],
+            "poe2_patch_version": "0.5.5.4",
+            "auto_detect_patch_version": true,
+            "auto_update_schema": false,
+            "schema_local_path": null,
+            "patch_version_source_url": "https://example.invalid",
+            "theme": "dark",
+            "hide_shader_cache": true,
+            "game": "Poe1",
+            "poe1_ggpk_path": "D:/PoE1/Content.ggpk",
+            "poe1_steam_path": null,
+            "poe1_patch_version": "3.29.3.3"
+        }"#;
+        let settings: AppSettings = serde_json::from_str(saved).expect("a field that was removed must not stop the file loading");
+        assert_eq!(settings.game, Game::Poe1);
+        assert_eq!(settings.ggpk_path_for(Game::Poe2).map(String::as_str), Some("D:/PoE2/Content.ggpk"));
+        assert_eq!(settings.ggpk_path_for(Game::Poe1).map(String::as_str), Some("D:/PoE1/Content.ggpk"));
+        assert_eq!((settings.patch_version(Game::Poe2), settings.patch_version(Game::Poe1)), ("0.5.5.4", "3.29.3.3"));
+        assert!(!settings.auto_update_schema && settings.theme == "dark");
     }
 }

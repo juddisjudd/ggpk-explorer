@@ -40,10 +40,16 @@ semver = "1.0"
 open = "5"
 lru = "0.18"
 regex = "1.12"
+rayon = "1.11"
+memchr = "2.7"
 serde_with = "3.18"
 anyhow = "1.0"
 webp = "0.3"
 zstd = "0.13"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
+
+[dev-dependencies]
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 
 [build-dependencies]
 cc = "1.2"

@@ -4,6 +4,7 @@ pub mod model;
 pub mod object_dsl;
 pub mod curves;
 pub mod level;
+pub mod mat_table;
 pub mod arm;
 pub mod sm;
 pub mod graphics;

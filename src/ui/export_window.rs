@@ -1,6 +1,7 @@
 use eframe::egui;
 use crate::export::{AudioFormat, DataFormat, ExportSettings, PsgFormat, TextureFormat};
-use crate::ui::components::modal_section;
+use crate::ui::components::button::{action, Kind};
+use crate::ui::components::{modal, modal_section};
 
 pub struct ExportWindow {
     open: bool,
@@ -54,15 +55,8 @@ impl ExportWindow {
         let is_parsed = crate::parsers::translate::handles(&self.target_name);
         let show_all = self.is_folder;
 
-        egui::Window::new("Export")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(360.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 5.0;
-
+        let close = modal::show(ctx, "export", "Export", 400.0, |ui| {
+            modal::body(ui, |ui| {
                 let name_color = if ui.visuals().dark_mode {
                     egui::Color32::from_rgb(228, 228, 231)
                 } else {
@@ -76,7 +70,6 @@ impl ExportWindow {
                 );
 
                 if show_all || is_dds {
-                    ui.separator();
                     modal_section(ui, "TEXTURE");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.texture_format, TextureFormat::OriginalDds, "DDS");
@@ -86,7 +79,6 @@ impl ExportWindow {
                 }
 
                 if show_all || is_ogg {
-                    ui.separator();
                     modal_section(ui, "AUDIO");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.audio_format, AudioFormat::Original, "OGG / WAV");
@@ -95,7 +87,6 @@ impl ExportWindow {
                 }
 
                 if show_all || is_dat {
-                    ui.separator();
                     modal_section(ui, "DATA (.dat / .csd)");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.data_format, DataFormat::Original, "Original");
@@ -104,7 +95,6 @@ impl ExportWindow {
                 }
 
                 if show_all || is_parsed {
-                    ui.separator();
                     modal_section(ui, "GAME FILES (.ao, .mat, .fmt, ...)");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.parsed_format, DataFormat::Original, "Original");
@@ -113,7 +103,6 @@ impl ExportWindow {
                 }
 
                 if show_all || is_psg {
-                    ui.separator();
                     modal_section(ui, "PSG");
                     ui.horizontal(|ui| {
                         ui.radio_value(&mut self.settings.psg_format, PsgFormat::Original, "Original");
@@ -125,7 +114,6 @@ impl ExportWindow {
                 }
 
                 if self.is_folder {
-                    ui.separator();
                     modal_section(ui, "OPTIONS");
                     ui.checkbox(&mut self.settings.recursive, "Include subfolders");
 
@@ -150,25 +138,20 @@ impl ExportWindow {
                     );
                 }
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(2.0);
-
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        should_close = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Export").clicked() {
-                            self.confirmed = true;
-                            confirmed_now = true;
-                            should_close = true;
-                        }
-                    });
-                });
             });
+            modal::footer(ui, |ui| {
+                if action(ui, "Export", Kind::Primary, true).clicked() {
+                    self.confirmed = true;
+                    confirmed_now = true;
+                    should_close = true;
+                }
+                if action(ui, "Cancel", Kind::Secondary, true).clicked() {
+                    should_close = true;
+                }
+            });
+        });
 
-        if should_close {
+        if close || should_close {
             open = false;
         }
         self.open = open;

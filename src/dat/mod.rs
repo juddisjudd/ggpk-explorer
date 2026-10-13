@@ -8,6 +8,7 @@ pub mod stat_translation;
 pub mod analysis;
 pub mod overrides;
 pub mod refit;
+pub mod exe_layout;
 pub mod table_store;
 pub mod dump;
 

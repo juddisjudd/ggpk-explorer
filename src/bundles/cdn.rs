@@ -59,12 +59,8 @@ impl CdnBundleLoader {
             return Ok(data);
         }
 
-        // 2. Download from CDN. The game picks the host; PoE2 versions no longer start with 4.
-        let host = match self.game {
-            Game::Poe2 => "patch-poe2.poecdn.com",
-            Game::Poe1 => "patch.poecdn.com",
-        };
-        let url = format!("https://{}/{}/Bundles2/{}", host, self.patch_ver, bundle_name);
+        // 2. Download from CDN.
+        let url = format!("https://{}/{}/Bundles2/{}", self.host(), self.patch_ver, bundle_name);
 
         let data = self.download(&url)?;
 
@@ -74,6 +70,15 @@ impl CdnBundleLoader {
         f.write_all(&data)?;
         
         Ok(data)
+    }
+
+    fn host(&self) -> &'static str {
+        host(self.game)
+    }
+
+    /// This patch's game client, which sits at the patch root. Not cached: it is about 80 MB and read once.
+    pub fn fetch_client(&self) -> Result<Vec<u8>, Box<dyn Error>> {
+        self.download(&format!("https://{}/{}/PathOfExile.exe", self.host(), self.patch_ver))
     }
 
     fn download(&self, url: &str) -> Result<Vec<u8>, Box<dyn Error>> {
@@ -115,6 +120,14 @@ impl CdnBundleLoader {
         let bundle = crate::bundles::bundle::Bundle::read_header(&mut cursor)?;
         let decompressed = bundle.decompress(&mut cursor)?;
         Ok(crate::bundles::index::Index::read(&decompressed)?)
+    }
+}
+
+/// The host each game's patches are served from; the patch servers name the same one (`patch_server::live`).
+pub fn host(game: Game) -> &'static str {
+    match game {
+        Game::Poe2 => "patch-poe2.poecdn.com",
+        Game::Poe1 => "patch.poecdn.com",
     }
 }
 

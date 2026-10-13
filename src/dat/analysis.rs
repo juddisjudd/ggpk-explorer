@@ -833,13 +833,11 @@ impl FitReport {
             .take(4)
             .map(|(name, share)| format!("{} ({:.0}% of rows)", name, share * 100.0))
             .collect();
-        format!(
-            "the schema describes a {}-byte row but the file's rows are {} bytes, and {} read impossible values: {}",
-            self.schema_len,
-            self.row_len,
-            self.impossible.len(),
-            cols.join(", ")
-        )
+        let widths = match self.schema_len == self.row_len {
+            true => format!("the schema's columns add up to the file's {}-byte rows, but", self.row_len),
+            false => format!("the schema describes a {}-byte row but the file's rows are {} bytes, and", self.schema_len, self.row_len),
+        };
+        format!("{} {} read impossible values: {}", widths, self.impossible.len(), cols.join(", "))
     }
 }
 

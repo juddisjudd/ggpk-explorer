@@ -23,6 +23,10 @@ pub struct TreeView {
     match_count: usize,
     is_searching: bool,
     search_generation: u64,
+    /// The index the filter searches: the nodes hold names, the index whole paths.
+    search_index: Option<Arc<Index>>,
+    typed: String,
+    typed_at: Option<std::time::Instant>,
     // Display State
     render_limit: std::cell::Cell<usize>,
 }
@@ -33,6 +37,24 @@ pub struct FlatNode {
     pub children: Vec<usize>,
     pub file_hash: Option<u64>,
     pub parent: Option<usize>,
+}
+
+/// What a filter keeps of the tree: per node, whether it is a matching file and whether one lies below it; then the match count and the files, best first.
+fn filter_nodes(nodes: &[(usize, Option<u64>)], index: &Index, query: &crate::search::Query) -> (Vec<bool>, Vec<bool>, usize, Vec<u64>) {
+    let (hits, _) = crate::search::matches(index, query, crate::search::Mode::Exact, &|_| 0);
+    let count = hits.len();
+    let matched_hashes: Vec<u64> = crate::search::rank(index, hits, 20_000).iter().map(|hit| hit.hash).collect();
+    let matched: std::collections::HashSet<u64> = matched_hashes.iter().copied().collect();
+    let results: Vec<bool> = nodes.iter().map(|(_, hash)| hash.is_some_and(|hash| matched.contains(&hash))).collect();
+    let mut descendants = vec![false; nodes.len()];
+    for id in (1..nodes.len()).rev() {
+        if results[id] || descendants[id] {
+            if let Some(parent) = descendants.get_mut(nodes[id].0) {
+                *parent = true;
+            }
+        }
+    }
+    (results, descendants, count, matched_hashes)
 }
 
 pub enum TreeViewAction {
@@ -62,6 +84,9 @@ impl Default for TreeView {
             match_count: 0,
             is_searching: false,
             search_generation: 0,
+            search_index: None,
+            typed: String::new(),
+            typed_at: None,
             render_limit: std::cell::Cell::new(2000),
         }
     }
@@ -70,6 +95,17 @@ impl Default for TreeView {
 impl TreeView {
     pub fn is_searching(&self) -> bool {
         self.is_searching
+    }
+
+    pub fn set_search_index(&mut self, index: Option<Arc<Index>>) {
+        self.search_index = index;
+    }
+
+    /// Puts `text` in the filter box and runs it on the next frame.
+    pub fn set_filter(&mut self, text: &str) {
+        self.search_term = text.to_string();
+        self.typed = self.search_term.clone();
+        self.typed_at = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(1));
     }
 
     pub fn new(reader: Arc<GgpkReader>) -> Self {
@@ -122,25 +158,6 @@ impl TreeView {
         let mut reader = std::io::BufReader::new(file);
         bincode::deserialize_from(&mut reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-    }
-
-    pub fn command_palette_items(&self, max_items: usize) -> Vec<crate::ui::command_palette::CommandPaletteItem> {
-        if self.nodes.is_empty() {
-            return Vec::new();
-        }
-
-        let mut items = Vec::new();
-        for idx in 0..self.nodes.len() {
-            let node = &self.nodes[idx];
-            if let Some(hash) = node.file_hash {
-                let label = self.node_path(idx);
-                items.push(crate::ui::command_palette::CommandPaletteItem { label, hash });
-                if items.len() >= max_items {
-                    break;
-                }
-            }
-        }
-        items
     }
 
     fn node_path(&self, node_idx: usize) -> String {
@@ -327,7 +344,7 @@ impl TreeView {
                 egui::TextEdit::singleline(&mut self.search_term)
                     .id(ui.make_persistent_id("search_box"))
                     .hint_text(
-                        egui::RichText::new("Search... (press enter)")
+                        egui::RichText::new("name  *.ext  folder/  !word")
                             .color(if ui.visuals().dark_mode {
                                 egui::Color32::from_rgb(82, 82, 91)
                             } else {
@@ -340,6 +357,19 @@ impl TreeView {
                 trigger_search = true;
             }
         });
+
+        // A pause in typing searches too, so Enter is not needed.
+        if self.search_term != self.typed {
+            self.typed = self.search_term.clone();
+            self.typed_at = Some(std::time::Instant::now());
+        }
+        let wanted = self.search_term.trim();
+        if wanted != self.active_search_term && !trigger_search && (wanted.is_empty() || wanted.len() >= 2) {
+            match self.typed_at.is_some_and(|at| at.elapsed() >= std::time::Duration::from_millis(350)) {
+                true => trigger_search = true,
+                false => ui.ctx().request_repaint_after(std::time::Duration::from_millis(120)),
+            }
+        }
 
         if self.is_searching {
             ui.horizontal(|ui| {
@@ -383,68 +413,24 @@ impl TreeView {
         }
 
         if trigger_search {
-             self.active_search_term = self.search_term.clone();
-             let term_lower = self.active_search_term.to_lowercase();
-             self.search_generation += 1;
-             self.render_limit.set(2000);
+            self.active_search_term = self.search_term.trim().to_string();
+            self.search_generation += 1;
+            self.render_limit.set(2000);
+            let query = crate::search::Query::parse(&self.active_search_term);
 
-             if !term_lower.is_empty() {
-                 if let Some(tx) = &self.search_tx {
-                     // Prepare Search Data (Clone needed data to thread)
-                     let tx = tx.clone();
-                     let gen_id = self.search_generation;
-                     
-                     // We need a thread-safe copy of the index for searching.
-                     // The FlatNode structure is basically the index. we can just clone the names and parents?
-                     // Or just pass the nodes? `nodes` is owned by `self`.
-                     // Cloning `nodes` is expensive (Memory).
-                     // But we only need (id, name, parent_id).
-                     // Let's create a lightweight search index on the fly or cached?
-                     // For now, let's just clone the basic data: Vec<(bool, String, usize)> -> (is_file, name, parent)
-                     
-                     let search_data: Vec<(bool, String, usize, Option<u64>)> = self.nodes.iter().enumerate().map(|(_i, n)| {
-                         (n.file_hash.is_some(), n.name.to_lowercase(), n.parent.unwrap_or(0), n.file_hash)
-                     }).collect();
+            if let (false, Some(tx), Some(index)) = (query.is_empty(), &self.search_tx, &self.search_index) {
+                let (tx, index, gen_id, ctx) = (tx.clone(), Arc::clone(index), self.search_generation, ui.ctx().clone());
+                let nodes: Vec<(usize, Option<u64>)> = self.nodes.iter().map(|node| (node.parent.unwrap_or(0), node.file_hash)).collect();
+                self.is_searching = true;
 
-                     self.is_searching = true;
-
-                     thread::spawn(move || {
-                         let start_time = std::time::Instant::now();
-                         let max_id = search_data.len();
-                         let mut results = vec![false; max_id];
-                         let mut count = 0;
-
-                         for (id, (_is_file, name_lower, _, _)) in search_data.iter().enumerate() {
-                             if name_lower.contains(&term_lower) {
-                                 results[id] = true;
-                                 count += 1;
-                             }
-                         }
-
-                         let mut descendants = vec![false; max_id];
-                         for id in (1..max_id).rev() {
-                             if results[id] || descendants[id] {
-                                 let parent = search_data[id].2;
-                                 if parent < descendants.len() {
-                                     descendants[parent] = true;
-                                 }
-                             }
-                         }
-
-                         // Flat list of matching files (not folders) for the
-                         // uncapped results view in the main content area.
-                         let matched_hashes: Vec<u64> = search_data.iter().enumerate()
-                             .filter(|(id, _)| results[*id])
-                             .filter_map(|(_, (_, _, _, hash))| *hash)
-                             .collect();
-
-                         println!("Search Finished (Gen {}) in {:?}. Found {} matches.", gen_id, start_time.elapsed(), count);
-                         let _ = tx.send((results, descendants, count, gen_id, matched_hashes));
-                     });
-                 }
-             }
+                thread::spawn(move || {
+                    let (results, descendants, count, matched_hashes) = filter_nodes(&nodes, &index, &query);
+                    let _ = tx.send((results, descendants, count, gen_id, matched_hashes));
+                    ctx.request_repaint();
+                });
+            }
         }
-        
+
         if let Some(root_id) = self.root_id {
             if !self.nodes.is_empty() {
                 let mut render_count = 0;
@@ -485,23 +471,35 @@ impl TreeView {
         let use_filter_expand = !self.active_search_term.is_empty() && self.match_count < 500;
 
         if let Some(hash) = node.file_hash {
-            let mut label = egui::RichText::new(&node.name);
+            // The leading spaces leave room for the dot that says what kind of file this is.
+            let mut label = egui::RichText::new(format!("    {}", node.name));
             let is_selected = matches!(selected_file, Some(crate::ui::app::FileSelection::BundleFile(selected_hash)) if *selected_hash == hash);
             
-            // Red Filename Logic
-            if node.name.ends_with(".dat") || node.name.ends_with(".datc64") || node.name.ends_with(".datl") || node.name.ends_with(".datl64") {
+            // A table the schema lacks is amber when its columns are guessed, and dim when it has no rows to guess from.
+            let mut note = None;
+            if crate::ui::file_kind::is_table(&node.name) {
                 if let Some(s) = schema {
                     let stem = std::path::Path::new(&node.name).file_stem().and_then(|s| s.to_str());
-                    // Check if table exists in schema
                     let in_schema = stem.map(|name| s.tables.iter().any(|t| t.name.eq_ignore_ascii_case(name))).unwrap_or(false);
                     if !in_schema {
-                        label = label.color(egui::Color32::RED);
+                        let empty = self.search_index.as_ref().and_then(|index| index.files.get(&hash)).is_some_and(|file| file.file_size <= 12);
+                        let dark_mode = ui.visuals().dark_mode;
+                        (label, note) = match empty {
+                            true => (label.color(if dark_mode { egui::Color32::from_rgb(110, 110, 120) } else { egui::Color32::from_rgb(150, 150, 160) }), Some("An empty table that is not in the schema")),
+                            false => (label.color(if dark_mode { egui::Color32::from_rgb(245, 158, 11) } else { egui::Color32::from_rgb(180, 110, 0) }), Some("Not in the schema: its columns are guessed from the data")),
+                        };
                     }
                 }
             }
 
             ui.push_id(hash, |ui| {
                 let response = ui.selectable_label(is_selected, label);
+                let response = match note {
+                    Some(note) => response.on_hover_text(note),
+                    None => response,
+                };
+                let kind = crate::ui::file_kind::FileKind::of(&node.name);
+                crate::ui::file_kind::dot(ui.painter(), egui::pos2(response.rect.left() + 12.0, response.rect.center().y), kind, ui.visuals().dark_mode);
 
                 if response.clicked() {
                      *selected_file = Some(crate::ui::app::FileSelection::BundleFile(hash));
@@ -738,3 +736,33 @@ impl TreeView {
     }
 }
 
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::bundles::index::FileInfo;
+
+    #[test]
+    fn a_filter_keeps_matching_files_and_the_folders_above_them() {
+        let paths = ["art/items/sword.dds", "art/items/axe.dds", "metadata/items/sword.ot", "readme.txt"];
+        let files = paths.iter().enumerate().map(|(i, path)| (i as u64, FileInfo { path_hash: i as u64, bundle_index: 0, file_offset: 0, file_size: 0, path: path.to_string() })).collect();
+        let index = Index { bundles: Vec::new(), files };
+        let tree = TreeView::build_flat_tree(&index);
+        let nodes: Vec<(usize, Option<u64>)> = tree.iter().map(|node| (node.parent.unwrap_or(0), node.file_hash)).collect();
+        let named = |flags: &[bool]| -> Vec<String> {
+            let mut names: Vec<String> = tree.iter().zip(flags).filter(|(_, kept)| **kept).map(|(node, _)| node.name.clone()).collect();
+            names.sort();
+            names
+        };
+
+        let (results, above, count, hashes) = filter_nodes(&nodes, &index, &crate::search::Query::parse("sword art/"));
+        assert_eq!((count, hashes), (1, vec![0]));
+        assert_eq!(named(&results), ["sword.dds"]);
+        assert!(named(&above).contains(&"art".to_string()) && named(&above).contains(&"items".to_string()));
+        assert!(!named(&above).contains(&"metadata".to_string()));
+
+        let (results, _, count, hashes) = filter_nodes(&nodes, &index, &crate::search::Query::parse("*.dds"));
+        assert_eq!(count, 2);
+        assert_eq!(named(&results), ["axe.dds", "sword.dds"]);
+        assert_eq!(hashes, [1, 0], "the shorter name ranks first");
+    }
+}

@@ -48,6 +48,12 @@ impl GameFiles {
         self.lookup(path).is_some()
     }
 
+    /// The folder the game is installed in, when these files come from one.
+    pub fn install_root(&self) -> Option<std::path::PathBuf> {
+        let beside_ggpk = self.reader.as_deref().and_then(|r| r.path().parent().map(|p| p.to_path_buf()));
+        beside_ggpk.or_else(|| self.steam.as_ref().map(|s| s.game_root()))
+    }
+
     /// Every indexed path under `prefix` (case-insensitive), sorted.
     pub fn list_dir(&self, prefix: &str) -> Vec<String> {
         let lower = prefix.to_ascii_lowercase();

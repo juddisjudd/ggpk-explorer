@@ -45,8 +45,8 @@ pub struct SettingsWindow {
     open: bool,
     section: Section,
     fetch_rx: Option<Receiver<Result<String, String>>>,
-    is_fetching: bool,
-    fetch_status_msg: Option<String>,
+    fetching: Option<Game>,
+    fetch_status_msg: Option<(Game, String)>,
     pub request_update_schema: bool,
     pub schema_status_msg: Option<String>,
     pub schema_update_status: SchemaUpdateStatus,
@@ -64,7 +64,7 @@ impl Default for SettingsWindow {
             open: false,
             section: Section::Games,
             fetch_rx: None,
-            is_fetching: false,
+            fetching: None,
             fetch_status_msg: None,
             request_update_schema: false,
             schema_status_msg: None,
@@ -86,6 +86,16 @@ impl SettingsWindow {
         self.open
     }
 
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    /// Opens on the section where each game's install path is set.
+    pub fn open_games(&mut self) {
+        self.section = Section::Games;
+        self.open();
+    }
+
     pub fn open(&mut self) {
         self.open = true;
         self.cache_status_msg = None;
@@ -105,28 +115,21 @@ impl SettingsWindow {
     }
 
     fn poll(&mut self, settings: &mut AppSettings) {
-        if self.is_fetching {
-            if let Some(rx) = &self.fetch_rx {
-                match rx.try_recv() {
-                    Ok(Ok(version)) => {
-                        settings.set_patch_version(Game::Poe2, version);
-                        settings.save();
-                        self.fetch_status_msg = Some("Updated".to_string());
-                        self.is_fetching = false;
-                        self.fetch_rx = None;
-                    }
-                    Ok(Err(e)) => {
-                        self.fetch_status_msg = Some(format!("Error: {}", e));
-                        self.is_fetching = false;
-                        self.fetch_rx = None;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        self.fetch_status_msg = Some("Thread died".to_string());
-                        self.is_fetching = false;
-                        self.fetch_rx = None;
-                    }
+        if let (Some(game), Some(rx)) = (self.fetching, &self.fetch_rx) {
+            let outcome = match rx.try_recv() {
+                Ok(Ok(version)) => {
+                    settings.set_patch_version(game, version);
+                    settings.save();
+                    Some("Updated".to_string())
                 }
+                Ok(Err(e)) => Some(format!("Error: {}", e)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some("Thread died".to_string()),
+            };
+            if let Some(message) = outcome {
+                self.fetch_status_msg = Some((game, message));
+                self.fetching = None;
+                self.fetch_rx = None;
             }
         }
         if let Some(rx) = &self.cache_rx {
@@ -188,7 +191,7 @@ impl SettingsWindow {
 
     fn games(&mut self, ui: &mut egui::Ui, settings: &mut AppSettings, loaded: Option<Game>) {
         modal_section(ui, "GAMES");
-        note(ui, "Each game keeps its own install paths, caches and exports. Opening one switches what the app reads.");
+        note(ui, "Each game keeps its own install paths, caches and exports. Opening one switches what the app reads, as does the PoE 1 / PoE 2 switch in the title bar.");
         for game in GAMES {
             ui.add_space(4.0);
             card(ui, |ui| {
@@ -249,25 +252,21 @@ impl SettingsWindow {
                     if ui.text_edit_singleline(&mut version).changed() {
                         settings.set_patch_version(game, version);
                     }
-                    // The version source is PoE 2's; PoE 1's patch comes from its install log.
-                    if game == Game::Poe2 {
-                        if self.is_fetching {
-                            ui.spinner();
-                        } else if ui.button("Auto Detect").clicked() {
-                            self.is_fetching = true;
-                            self.fetch_status_msg = Some("Fetching...".to_string());
-                            let (tx, rx) = channel();
-                            self.fetch_rx = Some(rx);
-                            let url = settings.patch_version_source_url.clone();
-                            thread::spawn(move || {
-                                let _ = tx.send(AppSettings::fetch_latest_patch_version(Game::Poe2, &url));
-                            });
-                        }
-                        if let Some(msg) = &self.fetch_status_msg {
-                            note(ui, msg);
-                        }
-                    } else {
-                        note(ui, "read from the install's client log");
+                    if self.fetching == Some(game) {
+                        ui.spinner();
+                    } else if ui.add_enabled(self.fetching.is_none(), egui::Button::new("Auto Detect")).on_hover_text("Ask the game's patch server which patch is live").clicked() {
+                        self.fetching = Some(game);
+                        self.fetch_status_msg = Some((game, "Fetching...".to_string()));
+                        let (tx, rx) = channel();
+                        self.fetch_rx = Some(rx);
+                        let logged = settings.patch_protocol(game);
+                        thread::spawn(move || {
+                            let _ = tx.send(crate::patch_server::live(game, logged).map(|patch| patch.version));
+                        });
+                    }
+                    match &self.fetch_status_msg {
+                        Some((asked, msg)) if *asked == game => note(ui, msg),
+                        _ => note(ui, "set from the install's client log when it opens"),
                     }
                 });
 
@@ -318,12 +317,8 @@ impl SettingsWindow {
 
     fn network(&mut self, ui: &mut egui::Ui, settings: &mut AppSettings) {
         modal_section(ui, "NETWORK & CDN");
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Version Source").size(12.5));
-            ui.text_edit_singleline(&mut settings.patch_version_source_url);
-        });
-        ui.checkbox(&mut settings.auto_detect_patch_version, "Auto-detect latest patch version on startup");
-        note(ui, "The source is PoE 2's patch server. Each game's patch is on its card under Games.");
+        ui.checkbox(&mut settings.auto_detect_patch_version, "Ask which patch is live on startup");
+        note(ui, "The game's own patch server is asked, the way the game client asks it. Each game's patch is on its card under Games.");
     }
 
     fn schema(&mut self, ui: &mut egui::Ui, settings: &mut AppSettings, schema_date: Option<&str>) {

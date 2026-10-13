@@ -108,7 +108,7 @@ impl CsdViewer {
 
         ui.horizontal(|ui| {
             ui.label("🔍");
-            ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text("Filter by stat id or text").desired_width(260.0));
+            ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text(crate::ui::components::hint(ui, "Filter by stat id or text")).desired_width(260.0));
             if !state.filter.is_empty() && ui.small_button("✕").clicked() {
                 state.filter.clear();
             }
@@ -168,7 +168,7 @@ impl CsdViewer {
                     ui.label(RichText::new("Preview").strong());
                     ui.horizontal(|ui| {
                         ui.label(format!("{} value{}", entry.ids.len(), if entry.ids.len() == 1 { "" } else { "s" }));
-                        ui.add(egui::TextEdit::singleline(&mut state.values).hint_text("e.g. 10, -5").desired_width(160.0));
+                        ui.add(egui::TextEdit::singleline(&mut state.values).hint_text(crate::ui::components::hint(ui, "e.g. 10, -5")).desired_width(160.0));
                     });
                     let values = parse_values(&state.values, entry.ids.len());
                     let mut shown: Vec<Option<String>> = vec![None];

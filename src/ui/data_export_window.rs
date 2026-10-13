@@ -4,7 +4,8 @@
 
 use crate::data_export::DataExportOptions;
 use crate::settings::Game;
-use crate::ui::components::modal_section;
+use crate::ui::components::button::{action, Kind};
+use crate::ui::components::{card, modal, modal_section};
 use eframe::egui;
 
 /// One dump in the list: its name, what it holds, whether it is ticked, and
@@ -139,41 +140,34 @@ impl DataExportWindow {
         let (title, blurb) = match self.kind {
             ExportKind::Semantic => (
                 "Export Game Data",
-                "Joined JSON for mods, skills, base items and stat text — the shape RePoE publishes.",
+                "Joined JSON for mods, skills, base items and stat text, in the shape RePoE publishes.",
             ),
             ExportKind::Pob => (
                 "Export PoB Data",
-                "Path of Building's data files — bases, skills, gems, mods, minions, stat descriptions —                  as the JSON repoe-fork publishes as pob-data. Files PoB writes by hand are listed in                  export_report.json.",
+                "Path of Building's data files: bases, skills, gems, mods, minions and stat descriptions, as the JSON repoe-fork publishes as pob-data. Files PoB writes by hand are listed in export_report.json.",
             ),
             ExportKind::Tables => (
                 "Export DAT Tables",
-                "Every table in the install, one file each. A foreign key names its target row by that row's unique key.                  Tables whose layout no longer matches the schema are left out and listed in export_report.json.",
+                "Every table in the install, one file each. A foreign key names its target row by that row's unique key. Tables whose layout no longer matches the schema are left out and listed in export_report.json.",
             ),
         };
         let kind = self.kind;
-        egui::Window::new(title)
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .default_width(420.0)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 5.0;
+        let close = modal::show(ctx, title, title, 460.0, |ui| {
+            modal::body(ui, |ui| {
                 let muted = if ui.visuals().dark_mode {
                     egui::Color32::from_rgb(113, 113, 122)
                 } else {
                     egui::Color32::from_rgb(80, 80, 90)
                 };
 
-                ui.label(egui::RichText::new(blurb).size(11.5).color(muted));
+                modal::lead(ui, blurb);
                 let skipped = self.modules.len() - self.available().count();
                 let reading = match skipped {
                     0 => format!("Reading {}", self.game.label()),
-                    n => format!("Reading {} — {} dumps are the other game's", self.game.label(), n),
+                    n => format!("Reading {}. {} dumps belong to the other game.", self.game.label(), n),
                 };
-                ui.label(egui::RichText::new(reading).size(11.5).color(muted));
+                ui.label(egui::RichText::new(reading).size(12.0).color(muted));
 
-                ui.separator();
                 modal_section(ui, "DESTINATION");
                 match &self.version {
                     Some(version) => {
@@ -195,7 +189,6 @@ impl DataExportWindow {
                 }
 
                 if kind == ExportKind::Semantic {
-                    ui.separator();
                     modal_section(ui, "EXTRAS");
                     ui.checkbox(&mut self.images, "Include item, skill and buff icons")
                         .on_hover_text(
@@ -218,7 +211,6 @@ impl DataExportWindow {
                 }
 
                 if kind == ExportKind::Tables {
-                    ui.separator();
                     modal_section(ui, "FORMAT");
                     ui.horizontal(|ui| {
                         use crate::table_export::Formats;
@@ -230,13 +222,12 @@ impl DataExportWindow {
                     modal_section(ui, "TABLES");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.only_tables)
-                            .hint_text("All tables, or names like Mods, Stats")
+                            .hint_text(crate::ui::components::hint(ui, "All tables, or names like Mods, Stats"))
                             .desired_width(f32::INFINITY),
                     );
                 }
 
                 if kind != ExportKind::Tables {
-                    ui.separator();
                     ui.horizontal(|ui| {
                         modal_section(ui, "DUMPS");
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -249,12 +240,15 @@ impl DataExportWindow {
                         });
                     });
 
-                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                        for module in &mut self.modules {
-                            let enabled = module.skipped.is_none();
-                            ui.add_enabled(enabled, egui::Checkbox::new(&mut module.on, module.name))
-                                .on_hover_text(module.skipped.unwrap_or(module.summary));
-                        }
+                    let room = (ui.ctx().screen_rect().height() - 540.0).clamp(130.0, 320.0);
+                    card(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(room).auto_shrink([false, true]).show(ui, |ui| {
+                            for module in &mut self.modules {
+                                let enabled = module.skipped.is_none();
+                                ui.add_enabled(enabled, egui::Checkbox::new(&mut module.on, module.name))
+                                    .on_hover_text(module.skipped.unwrap_or(module.summary));
+                            }
+                        });
                     });
 
                     ui.add_space(4.0);
@@ -266,27 +260,20 @@ impl DataExportWindow {
                     );
                 }
 
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        should_close = true;
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let ready = kind == ExportKind::Tables || self.selected() > 0;
-                        if ui
-                            .add_enabled(ready, egui::Button::new("Choose folder and export"))
-                            .clicked()
-                        {
-                            confirmed = true;
-                            should_close = true;
-                        }
-                    });
-                });
             });
+            modal::footer(ui, |ui| {
+                let ready = kind == ExportKind::Tables || self.selected() > 0;
+                if action(ui, "Choose folder and export", Kind::Primary, ready).clicked() {
+                    confirmed = true;
+                    should_close = true;
+                }
+                if action(ui, "Cancel", Kind::Secondary, true).clicked() {
+                    should_close = true;
+                }
+            });
+        });
 
-        if should_close {
+        if close || should_close {
             open = false;
         }
         self.open = open;

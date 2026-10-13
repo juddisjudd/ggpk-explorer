@@ -2,17 +2,19 @@ use super::record::{GgpkRecord, RecordHeader, RecordTag, DirectoryRecord, FileRe
 use memmap2::Mmap;
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct GgpkReader {
     mmap: Mmap,
+    path: PathBuf,
     pub root_offset: u64,
     pub version: u32,
 }
 
 impl GgpkReader {
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = File::open(path)?;
+        let path = path.as_ref().to_path_buf();
+        let file = File::open(&path)?;
         let mmap = unsafe { Mmap::map(&file)? };
 
 
@@ -31,9 +33,14 @@ impl GgpkReader {
         
         Ok(Self {
             mmap,
+            path,
             root_offset: ggpk_rec.root_offset,
             version: ggpk_rec.version,
         })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn read_record_header(&self, offset: u64) -> io::Result<RecordHeader> {

@@ -40,6 +40,24 @@ fn update_chip(ui: &mut egui::Ui, tag: &str, url: &str) {
     response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("A newer release is out — open it on GitHub");
 }
 
+/// How the open patch stands, as a chip that opens the patch page.
+fn patch_chip(ui: &mut egui::Ui, health: &crate::ui::patch_page::Health) -> bool {
+    let dark_mode = ui.visuals().dark_mode;
+    let (fill, border, text_color) = match dark_mode {
+        true => (egui::Color32::from_rgb(31, 31, 35), egui::Color32::from_rgb(42, 42, 46), egui::Color32::from_rgb(228, 228, 231)),
+        false => (egui::Color32::from_rgb(236, 236, 240), egui::Color32::from_rgb(200, 200, 210), egui::Color32::from_rgb(40, 40, 50)),
+    };
+    let dot_color = health.tone.color(dark_mode);
+    let galley = ui.painter().layout_no_wrap(health.label.clone(), egui::FontId::monospace(10.0), text_color);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(galley.size().x + 26.0, 18.0), egui::Sense::click());
+    let border = if response.hovered() { dot_color } else { border };
+    ui.painter().rect_filled(rect, egui::Rounding::same(3.0), fill);
+    ui.painter().rect_stroke(rect, egui::Rounding::same(3.0), egui::Stroke::new(1.0_f32, border));
+    ui.painter().circle_filled(egui::pos2(rect.min.x + 10.0, rect.center().y), 3.0, dot_color);
+    ui.painter().galley(egui::pos2(rect.min.x + 19.0, rect.center().y - galley.size().y / 2.0), galley, text_color);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Open the patch report").clicked()
+}
+
 pub struct StatusBar;
 
 impl StatusBar {
@@ -52,7 +70,9 @@ impl StatusBar {
         poe_version: &str,
         schema_date: &str,
         update: Option<(&str, &str)>,
-    ) {
+        patch: Option<&crate::ui::patch_page::Health>,
+    ) -> bool {
+        let mut open_patch = false;
         egui::TopBottomPanel::bottom("status_panel")
             .frame(egui::Frame {
                 inner_margin: egui::Margin::same(0.0),
@@ -120,6 +140,10 @@ impl StatusBar {
                             );
                             ui.add_space(6.0);
                         }
+                        if let Some(health) = patch {
+                            open_patch = patch_chip(ui, health);
+                            ui.add_space(6.0);
+                        }
 
                         // Status message / loading
                         if !status_msg.is_empty() {
@@ -143,12 +167,15 @@ impl StatusBar {
                                 );
                                 ui.add_space(2.0);
                             }
-                            ui.label(
-                                egui::RichText::new(status_msg)
-                                    .monospace()
-                                    .size(11.0)
-                                    .color(text_color),
-                            );
+                            // The message is cut short rather than drawn over what sits on the right of the bar.
+                            let meta = format!("Schema {} · Patch {} · {} · v{}", schema_date, poe_version, game, env!("CARGO_PKG_VERSION"));
+                            let meta_width = ui.painter().layout_no_wrap(meta, egui::FontId::monospace(10.5), text_color).size().x;
+                            let reserved = meta_width + 56.0 + if update.is_some() { 150.0 } else { 0.0 };
+                            let room = (ui.available_width() - reserved).max(60.0);
+                            ui.allocate_ui_with_layout(egui::vec2(room, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                let text = egui::RichText::new(status_msg).monospace().size(11.0).color(text_color);
+                                ui.add(egui::Label::new(text).truncate()).on_hover_text(status_msg);
+                            });
                         }
                         if is_loading {
                             ui.spinner();
@@ -209,6 +236,7 @@ impl StatusBar {
                     },
                 );
             });
+        open_patch
     }
 }
 
@@ -216,21 +244,27 @@ impl StatusBar {
 mod tests {
     use super::*;
 
-    fn painted_text(update: Option<(&str, &str)>) -> String {
+    /// Every piece of text the bar paints, with where it sits and whether it was cut short.
+    fn painted(update: Option<(&str, &str)>, message: &str, input: egui::RawInput) -> Vec<(String, egui::Rect, bool)> {
         let ctx = egui::Context::default();
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            StatusBar::show(ctx, "Ready", false, true, "PoE 2", "4.5.5.2", "2026-09-17", update);
+        let output = ctx.run(input, |ctx| {
+            let health = crate::ui::patch_page::Health { label: "2 tables re-fitted".to_string(), tone: crate::ui::patch_page::Tone::Warn };
+            StatusBar::show(ctx, message, false, true, "PoE 2", "4.5.5.2", "2026-09-17", update, Some(&health));
         });
-        fn walk(shape: &egui::Shape, out: &mut String) {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect, bool)>) {
             match shape {
-                egui::Shape::Text(text) => out.push_str(text.galley.text()),
+                egui::Shape::Text(text) => out.push((text.galley.text().to_string(), text.visual_bounding_rect(), text.galley.elided)),
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
                 _ => {}
             }
         }
-        let mut out = String::new();
+        let mut out = Vec::new();
         output.shapes.iter().for_each(|s| walk(&s.shape, &mut out));
         out
+    }
+
+    fn painted_text(update: Option<(&str, &str)>) -> String {
+        painted(update, "Ready", egui::RawInput::default()).into_iter().map(|(text, _, _)| text).collect()
     }
 
     /// The chip is the only thing a release adds; the rest of the bar is the same.
@@ -239,7 +273,20 @@ mod tests {
         let quiet = painted_text(None);
         let announced = painted_text(Some(("v9.9.9", "https://example.invalid/releases/latest")));
         assert!(quiet.contains("Patch 4.5.5.2"), "the bar should still say what it always says");
+        assert!(quiet.contains("2 tables re-fitted"), "the patch chip should say how the patch stands");
         assert!(!quiet.contains("available"));
         assert!(announced.contains("v9.9.9 available"));
+    }
+
+    #[test]
+    fn a_long_message_is_cut_short_before_the_right_side_of_the_bar() {
+        let message = "Patch 3.29.3.3: 849 tables checked, 1 moved, 1 still broken, 32 read differently by the client, and more besides";
+        let narrow = egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 600.0))), ..Default::default() };
+        let texts = painted(None, message, narrow);
+        let find = |start: &str| texts.iter().find(|(text, _, _)| text.starts_with(start)).unwrap_or_else(|| panic!("no text starting {:?}", start));
+        let (_, shown, cut) = find("Patch 3.29.3.3: 849");
+        let (_, schema, _) = find("Schema 2026-09-17");
+        assert!(*cut, "the message should be cut short on a 900-pixel bar");
+        assert!(shown.max.x <= schema.min.x, "the message ends at {} but the schema date starts at {}", shown.max.x, schema.min.x);
     }
 }

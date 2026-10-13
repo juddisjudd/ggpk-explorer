@@ -4,11 +4,12 @@
 //! community schema describes those tables again.
 
 use crate::dat::analysis::check_fit;
+use crate::dat::exe_layout::{self, ClientLayouts};
 use crate::dat::overrides::Overrides;
 use crate::dat::reader::DatReader;
-use crate::dat::refit::{is_refit, refit_file, RefitError};
+use crate::dat::refit::{is_refit, refit_file, repair_from_client, RefitError};
 use crate::dat::relational::FileSource;
-use crate::dat::schema::Schema;
+use crate::dat::schema::{game_mask, Schema, Table};
 use crate::dat::table_store::{self, table_paths, StoredTables};
 use crate::data_export::source::GameFiles;
 use crate::settings::Game;
@@ -27,12 +28,20 @@ pub struct Report {
     pub broken: Vec<String>,
     /// Re-fits that read cleanly, with columns they could not place.
     pub refitted: Vec<(String, Vec<String>)>,
+    /// The re-fits that came from the game client's reading alone, with no earlier patch to carry from.
+    pub repaired: Vec<String>,
     /// Broken tables left broken, and why.
     pub unresolved: Vec<(String, String)>,
     /// Re-fits dropped because the community schema reads the table again.
     pub retired: Vec<String>,
     /// Whether the re-fits were stored as overrides.
     pub written: bool,
+    /// How many table layouts were read out of the game client, or why none were.
+    pub client: Option<Result<usize, String>>,
+    /// Tables the client reads differently from the layout in use, with each difference.
+    pub disputed: Vec<(String, Vec<String>)>,
+    /// Tables whose rows are not the size the client expects: the client is from another patch.
+    pub mismatched: usize,
 }
 
 impl Report {
@@ -47,10 +56,14 @@ impl Report {
             (0, _, _) => line.push_str(", nothing moved"),
             (broken, fixed, open) => {
                 line.push_str(&format!(", {} moved", broken));
-                if fixed > 0 {
+                let stored = if self.written { "" } else { " (not saved)" };
+                let carried = fixed - self.repaired.len().min(fixed);
+                if carried > 0 {
                     let from = self.previous.as_deref().unwrap_or("the last patch");
-                    let stored = if self.written { "" } else { " (not saved)" };
-                    line.push_str(&format!(", {} re-fitted from {}{}", fixed, from, stored));
+                    line.push_str(&format!(", {} re-fitted from {}{}", carried, from, stored));
+                }
+                if !self.repaired.is_empty() {
+                    line.push_str(&format!(", {} repaired from the game client{}", self.repaired.len(), stored));
                 }
                 if open > 0 {
                     line.push_str(&format!(", {} still broken", open));
@@ -59,6 +72,9 @@ impl Report {
         }
         if !self.retired.is_empty() {
             line.push_str(&format!(", {} re-fit(s) retired", self.retired.len()));
+        }
+        if !self.disputed.is_empty() {
+            line.push_str(&format!(", {} read differently by the client", self.disputed.len()));
         }
         line
     }
@@ -72,13 +88,26 @@ impl Report {
             out.push(format!("  retired {}: the community schema reads it again", name));
         }
         for (name, lost) in &self.refitted {
+            let how = if self.repaired.contains(name) { "repaired from the game client" } else { "re-fitted" };
             match lost.is_empty() {
-                true => out.push(format!("  re-fitted {}", name)),
-                false => out.push(format!("  re-fitted {}, but could not place {}", name, lost.join(", "))),
+                true => out.push(format!("  {} {}", how, name)),
+                false => out.push(format!("  {} {}, but could not place {}", how, name, lost.join(", "))),
             }
         }
         for (name, why) in &self.unresolved {
             out.push(format!("  still broken {}: {}", name, why));
+        }
+        match &self.client {
+            Some(Ok(n)) => out.push(format!("Read {} table layout(s) out of the game client", n)),
+            Some(Err(why)) => out.push(format!("No table layouts from the game client: {}", why)),
+            None => {}
+        }
+        if self.mismatched > 0 {
+            out.push(format!("  {} table(s) have rows of a size the client does not expect; is it from another patch?", self.mismatched));
+        }
+        for (name, found) in &self.disputed {
+            out.push(format!("  the client reads {} differently:", name));
+            out.extend(found.iter().map(|line| format!("    {}", line)));
         }
         out
     }
@@ -90,11 +119,49 @@ impl Report {
             "checked": self.checked,
             "broken": self.broken,
             "refitted": self.refitted.iter().map(|(n, lost)| serde_json::json!({ "table": n, "lost": lost })).collect::<Vec<_>>(),
+            "repaired": self.repaired,
             "unresolved": self.unresolved.iter().map(|(n, why)| serde_json::json!({ "table": n, "reason": why })).collect::<Vec<_>>(),
             "retired": self.retired,
             "written": self.written,
+            "client_tables": self.client.as_ref().and_then(|c| c.as_ref().ok()),
+            "client_error": self.client.as_ref().and_then(|c| c.as_ref().err()),
+            "client_mismatched": self.mismatched,
+            "disputed": self.disputed.iter().map(|(n, found)| serde_json::json!({ "table": n, "findings": found })).collect::<Vec<_>>(),
         })
     }
+
+    /// Reads a record back; one written before the client's layouts were read simply has none.
+    fn from_json(value: &serde_json::Value) -> Option<Report> {
+        let texts = |v: &serde_json::Value| v.as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+        let rows = |key: &str| value[key].as_array().cloned().unwrap_or_default();
+        let table = |row: &serde_json::Value| row["table"].as_str().unwrap_or_default().to_string();
+        let client = match (value["client_tables"].as_u64(), value["client_error"].as_str()) {
+            (Some(n), _) => Some(Ok(n as usize)),
+            (None, Some(why)) => Some(Err(why.to_string())),
+            (None, None) => None,
+        };
+        Some(Report {
+            version: value["version"].as_str()?.to_string(),
+            previous: value["previous"].as_str().map(str::to_string),
+            kept: None,
+            checked: value["checked"].as_u64()? as usize,
+            broken: texts(&value["broken"]),
+            refitted: rows("refitted").iter().map(|r| (table(r), texts(&r["lost"]))).collect(),
+            repaired: texts(&value["repaired"]),
+            unresolved: rows("unresolved").iter().map(|r| (table(r), r["reason"].as_str().unwrap_or_default().to_string())).collect(),
+            retired: texts(&value["retired"]),
+            written: value["written"].as_bool().unwrap_or(false),
+            client,
+            disputed: rows("disputed").iter().map(|r| (table(r), texts(&r["findings"]))).collect(),
+            mismatched: value["client_mismatched"].as_u64().unwrap_or(0) as usize,
+        })
+    }
+}
+
+/// The last check recorded for a patch.
+pub fn load(game: Game, version: &str) -> Option<Report> {
+    let text = std::fs::read_to_string(report_path(game, version)).ok()?;
+    Report::from_json(&serde_json::from_str(&text).ok()?)
 }
 
 /// Where a patch's check is recorded, beside its kept tables.
@@ -122,8 +189,10 @@ pub fn run(
     let previous = table_store::previous(game, version);
     let old = previous.as_deref().and_then(|v| StoredTables::open(game, v));
     let old = previous.zip(old.as_ref().map(|o| o as &dyn FileSource));
-    let mut report = check(&tables, game, version, community, overrides_path, write, old)?;
+    let client = exe_layout::for_patch(files, game, version);
+    let mut report = check(&tables, game, version, community, overrides_path, write, old, client.as_ref().ok())?;
     report.kept = kept;
+    report.client = Some(client.map(|c| c.tables.len()));
     let record = report_path(game, version);
     if let Some(dir) = record.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -132,8 +201,7 @@ pub fn run(
     Ok(report)
 }
 
-/// The checks and re-fits over one patch's top-level tables (path to bytes),
-/// re-fitting from `old` — a patch version and its tables — when given.
+/// Checks one patch's top-level tables (path to bytes), re-fits the broken ones from `old` (a patch version and its tables) and holds each layout against `client`.
 #[allow(clippy::too_many_arguments)]
 pub fn check(
     tables: &HashMap<String, Vec<u8>>,
@@ -143,6 +211,7 @@ pub fn check(
     overrides_path: &Path,
     write: bool,
     old: Option<(String, &dyn FileSource)>,
+    client: Option<&ClientLayouts>,
 ) -> Result<Report, String> {
     let is_poe2 = game.is_poe2();
     let mut report = Report { version: version.to_string(), written: write, ..Default::default() };
@@ -169,18 +238,29 @@ pub fn check(
 
     let mut schema = community.clone();
     schema.apply_overrides(&overrides.tables);
+    let mut mismatched = 0;
+    let mut disputes = |def: &Table, row_len: Option<usize>| -> Option<(String, Vec<String>)> {
+        let layout = client?.find(&def.name)?;
+        if row_len? != layout.row_size {
+            mismatched += 1;
+            return None;
+        }
+        let found = client?.disagreements(def, layout);
+        (!found.is_empty()).then(|| (def.name.clone(), found))
+    };
     let mut broken = Vec::new();
     for &path in &paths {
         let lower = path.to_ascii_lowercase();
         let stem = lower.rsplit('/').next().unwrap_or(&lower).trim_end_matches(".datc64");
         let Some(def) = schema.find_table(stem, is_poe2) else { continue };
         let Some(reader) = dat(path) else { continue };
-        if reader.row_count < 4 {
-            continue;
-        }
-        report.checked += 1;
-        if check_fit(&reader, def, 40).is_broken() {
+        // The fit check needs a few rows to judge by; the client's layout does not.
+        let judged = reader.row_count >= 4;
+        report.checked += usize::from(judged);
+        if judged && check_fit(&reader, def, 40).is_broken() {
             broken.push((def.clone(), path.clone()));
+        } else {
+            report.disputed.extend(disputes(def, reader.row_length.filter(|_| reader.row_count > 0)));
         }
     }
     report.broken = broken.iter().map(|(d, _)| d.name.clone()).collect();
@@ -188,32 +268,43 @@ pub fn check(
 
     report.previous = old.as_ref().map(|(v, _)| v.clone());
     for (def, path) in broken {
-        let Some((_, old)) = &old else {
-            report.unresolved.push((def.name.clone(), "no earlier patch is kept to re-fit from".to_string()));
-            continue;
+        let new_bytes = tables.get(&path).cloned();
+        let carried = match (&old, new_bytes.clone()) {
+            (None, _) => Err("no earlier patch is kept to re-fit from".to_string()),
+            (Some((_, old)), new_bytes) => match old.fetch(&path).zip(new_bytes).map(|(old_bytes, new_bytes)| refit_file(old_bytes, new_bytes, &path, &def, client)) {
+                None => Err("not in both patches".to_string()),
+                Some(Ok(refitted)) if !refitted.after.is_broken() => Ok(refitted),
+                Some(Ok(refitted)) => Err(format!("the re-fit still misreads: {}", refitted.after.summary())),
+                Some(Err(RefitError::OldDoesNotFit)) => Err(format!("the schema did not fit patch {} either", report.previous.as_deref().unwrap_or("?"))),
+                Some(Err(RefitError::Failed(e))) => Err(e),
+            },
         };
-        let (Some(old_bytes), Some(new_bytes)) = (old.fetch(&path), tables.get(&path).cloned()) else {
-            report.unresolved.push((def.name.clone(), "not in both patches".to_string()));
-            continue;
-        };
-        match refit_file(old_bytes, new_bytes, &path, &def) {
-            Ok(refitted) if !refitted.after.is_broken() => {
+        // With no earlier copy that reads right, the client's own reading of the table is what is left.
+        let refitted = carried.or_else(|why| match client.zip(new_bytes).map(|(client, bytes)| repair_from_client(bytes, &path, &def, client)) {
+            Some(Ok(repaired)) if !repaired.after.is_broken() => {
+                report.repaired.push(def.name.clone());
+                Ok(repaired)
+            }
+            _ => Err(why),
+        });
+        match refitted {
+            Ok(refitted) => {
                 report.refitted.push((def.name.clone(), refitted.report.lost.clone()));
+                report.disputed.extend(disputes(&refitted.report.table, Some(refitted.report.new_row_len)));
                 if write {
-                    overrides.upsert(refitted.report.table);
+                    // A layout worked out from one game's file says nothing about the other game's copy of a shared table.
+                    overrides.upsert(Table { valid_for: Some(game_mask(is_poe2)), ..refitted.report.table });
                     changed = true;
                 }
             }
-            Ok(refitted) => report.unresolved.push((def.name.clone(), format!("the re-fit still misreads: {}", refitted.after.summary()))),
-            Err(RefitError::OldDoesNotFit) => report.unresolved.push((
-                def.name.clone(),
-                format!("the schema did not fit patch {} either", report.previous.as_deref().unwrap_or("?")),
-            )),
-            Err(RefitError::Failed(e)) => report.unresolved.push((def.name.clone(), e)),
+            Err(why) => report.unresolved.push((def.name.clone(), why)),
         }
     }
+    report.repaired.sort();
     report.refitted.sort();
     report.unresolved.sort();
+    report.disputed.sort();
+    report.mismatched = mismatched;
 
     if write && changed {
         overrides.save(overrides_path).map_err(|e| format!("{}: {}", overrides_path.display(), e))?;
@@ -260,6 +351,42 @@ pub fn compare_exports(before: &Path, after: &Path) -> Vec<SizeChange> {
 }
 
 #[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_record_reads_back_as_it_was_written() {
+        let report = Report {
+            version: "0.5.5.4".to_string(),
+            previous: Some("0.5.5.3".to_string()),
+            kept: Some(1023),
+            checked: 823,
+            broken: vec!["Mods".to_string(), "Stats".to_string()],
+            refitted: vec![("MapDeviceLayouts".to_string(), Vec::new()), ("Stats".to_string(), vec!["IsLocal".to_string()])],
+            repaired: vec!["MapDeviceLayouts".to_string()],
+            unresolved: vec![("Mods".to_string(), "not in both patches".to_string())],
+            retired: vec!["WorldAreas".to_string()],
+            written: true,
+            client: Some(Ok(801)),
+            disputed: vec![("NPCTalk".to_string(), vec!["byte 300: the client reads a key to WorldAreas".to_string()])],
+            mismatched: 2,
+        };
+        let back = Report::from_json(&report.to_json()).unwrap();
+        assert_eq!(back.lines(), Report { kept: None, ..report }.lines());
+        assert_eq!((back.checked, back.mismatched, back.written), (823, 2, true));
+        assert!(back.headline().contains("1 re-fitted from 0.5.5.3, 1 repaired from the game client"), "{}", back.headline());
+    }
+
+    #[test]
+    fn a_record_from_before_the_client_was_read_still_loads() {
+        let old = serde_json::json!({ "version": "3.29.3.3", "previous": null, "checked": 849, "broken": ["MapDeviceLayouts"], "refitted": [], "unresolved": [], "retired": [], "written": false });
+        let report = Report::from_json(&old).unwrap();
+        assert_eq!(report.broken, vec!["MapDeviceLayouts".to_string()]);
+        assert!(report.client.is_none() && report.disputed.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod real_data_tests {
     use super::*;
     use crate::settings::AppSettings;
@@ -300,20 +427,51 @@ mod real_data_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let overrides = dir.join("overrides.json");
         let new_patch: HashMap<String, Vec<u8>> = [(file.clone(), moved)].into();
-        let report = check(&new_patch, game, "9.9.9", &community, &overrides, true, Some((version.clone(), &stored as &dyn FileSource))).unwrap();
+        let report = check(&new_patch, game, "9.9.9", &community, &overrides, true, Some((version.clone(), &stored as &dyn FileSource)), None).unwrap();
         for line in report.lines() {
             println!("{}", line);
         }
         assert_eq!(report.broken, vec!["Stats".to_string()]);
         assert_eq!(report.refitted.len(), 1, "Stats should re-fit from {}", version);
         let saved = Overrides::load(&overrides);
-        assert!(saved.tables.iter().any(|t| t.name == "Stats" && is_refit(t)));
+        assert!(saved.tables.iter().any(|t| t.name == "Stats" && is_refit(t) && t.valid_for == Some(game_mask(true))), "the re-fit is saved for PoE 2 alone");
 
         // The community schema reads the unmoved file, so the re-fit retires.
         let caught_up: HashMap<String, Vec<u8>> = [(file, original)].into();
-        let report = check(&caught_up, game, "9.9.10", &community, &overrides, true, None).unwrap();
+        let report = check(&caught_up, game, "9.9.10", &community, &overrides, true, None, None).unwrap();
         assert_eq!(report.retired, vec!["Stats".to_string()]);
         assert!(Overrides::load(&overrides).tables.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `cargo test --release patch_check_holds_layouts_against_the_client -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn patch_check_holds_layouts_against_the_client() {
+        let game = Game::Poe2;
+        let version = table_store::versions(game).into_iter().next().expect("no kept patch; run export-data once");
+        let stored = StoredTables::open(game, &version).unwrap();
+        let settings = AppSettings::load();
+        let exe = settings.ggpk_path_for(game).and_then(|p| Path::new(p).parent().and_then(exe_layout::client_binary));
+        let client = ClientLayouts::read(&std::fs::read(exe.expect("no game client beside the configured GGPK")).unwrap()).unwrap();
+        let path = settings.schema_local_path.map(PathBuf::from).unwrap_or_else(|| AppSettings::get_app_data_dir().join("schema.min.json"));
+        let community: Schema = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let tables: HashMap<String, Vec<u8>> = std::fs::read_dir(stored.dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = format!("{}{}", table_store::table_dir(game), e.file_name().to_str()?.strip_suffix(".zst")?);
+                Some((path.clone(), stored.fetch(&path)?))
+            })
+            .collect();
+
+        let no_overrides = std::env::temp_dir().join(format!("ggpk-patch-check-client-{}.json", std::process::id()));
+        let report = check(&tables, game, &version, &community, &no_overrides, false, None, Some(&client)).unwrap();
+        for line in report.lines() {
+            println!("{}", line);
+        }
+        assert!(report.checked > 500, "only {} tables checked", report.checked);
+        assert!(report.disputed.iter().all(|(_, found)| !found.is_empty()));
+        assert!(report.disputed.len() * 5 < report.checked, "the client disputes {} of {} tables", report.disputed.len(), report.checked);
     }
 }

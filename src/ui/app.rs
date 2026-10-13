@@ -37,12 +37,18 @@ pub struct ExplorerApp {
     
 
     load_rx: Option<Receiver<Result<(Option<Arc<GgpkReader>>, Option<Arc<crate::bundles::index::Index>>, bool, PathBuf, String, TreeView), String>>>,
-    pub patch_version_rx: Option<Receiver<Result<String, String>>>,
+    pub patch_version_rx: Option<Receiver<(crate::settings::Game, Result<String, String>)>>,
     pub schema_update_rx: Option<Receiver<Result<String, String>>>,
     pub schema_check_rx: Option<Receiver<Result<i64, String>>>,
     pub export_status_rx: Option<Receiver<crate::export::ExportStatus>>,
-    pub auto_snapshot_rx: Option<Receiver<Result<String, String>>>,
+    pub auto_snapshot_rx: Option<Receiver<(crate::settings::Game, String, String)>>,
     patch_check_rx: Option<Receiver<Result<crate::patch_check::Report, String>>>,
+    /// The game and patch the running check is for; the CDN check of a new patch is not the open install's.
+    patch_check_for: Option<(crate::settings::Game, String)>,
+    /// The check recorded for the open patch, and when it was written.
+    patch_report: Option<crate::patch_check::Report>,
+    patch_checked_at: Option<String>,
+    patch_page: crate::ui::patch_page::PatchPage,
     is_loading: bool,
 
     pub settings: crate::settings::AppSettings,
@@ -57,8 +63,7 @@ pub struct ExplorerApp {
     pub sidebar_expanded: bool,
     pub inspector_open: bool,
     pub command_palette: crate::ui::command_palette::CommandPalette,
-    pub command_palette_items: Vec<crate::ui::command_palette::CommandPaletteItem>,
-    pub command_palette_needs_refresh: bool,
+    search_page: crate::ui::search_page::SearchPage,
     pub last_theme_dark: Option<bool>,
     pub last_applied_theme: Option<String>,
 }
@@ -150,6 +155,10 @@ impl ExplorerApp {
             export_status_rx: None,
             auto_snapshot_rx: None,
             patch_check_rx: None,
+            patch_check_for: None,
+            patch_report: None,
+            patch_checked_at: None,
+            patch_page: Default::default(),
             is_loading: false,
             settings: settings.clone(),
             settings_window: crate::ui::settings_window::SettingsWindow::new(),
@@ -167,8 +176,7 @@ impl ExplorerApp {
             sidebar_expanded: true,
             inspector_open: true,
             command_palette: crate::ui::command_palette::CommandPalette::default(),
-            command_palette_items: Vec::new(),
-            command_palette_needs_refresh: true,
+            search_page: crate::ui::search_page::SearchPage::default(),
             last_theme_dark: Some(is_dark),
             last_applied_theme: Some(settings.theme.clone()),
         };
@@ -223,30 +231,27 @@ impl ExplorerApp {
     /// switches what the app is reading rather than only what it will read next
     /// time.
     fn switch_game(&mut self, game: crate::settings::Game, ctx: &egui::Context) {
+        let steam = self.settings.steam_path_for(game).map(PathBuf::from).filter(|p| p.join("_.index.bin").exists());
+        let ggpk = self.settings.ggpk_path_for(game).map(PathBuf::from).filter(|p| p.exists());
+        if steam.is_none() && ggpk.is_none() {
+            self.patch_page.close();
+            self.settings_window.open_games();
+            self.status_msg = format!("No {} install found. Set its path here, or open one from File.", game.label());
+            return;
+        }
         self.settings.game = game;
         self.settings.save();
-        if let Some(path) = self.settings.steam_path_for(game).cloned() {
-            let p = PathBuf::from(&path);
-            if p.join("_.index.bin").exists() {
-                self.reader = None;
-                let loader = crate::bundles::steam::SteamBundleLoader::new(p.clone());
-                self.steam_loader = Some(Arc::new(loader.clone()));
-                self.content_view.set_steam_loader(loader);
-                self.open_steam_path(p, ctx);
-                return;
-            }
+        if let Some(p) = steam {
+            self.reader = None;
+            let loader = crate::bundles::steam::SteamBundleLoader::new(p.clone());
+            self.steam_loader = Some(Arc::new(loader.clone()));
+            self.content_view.set_steam_loader(loader);
+            self.open_steam_path(p, ctx);
+        } else if let Some(p) = ggpk {
+            self.steam_loader = None;
+            self.content_view.steam_loader = None;
+            self.open_ggpk_path(p, ctx);
         }
-        if let Some(path) = self.settings.ggpk_path_for(game).cloned() {
-            let p = PathBuf::from(&path);
-            if p.exists() {
-                self.steam_loader = None;
-                self.content_view.steam_loader = None;
-                self.open_ggpk_path(p, ctx);
-                return;
-            }
-        }
-        self.status_msg =
-            format!("No {} install saved — set its path in Settings, or open one from the titlebar", game.label());
     }
 
     fn start_patch_version_refresh(&mut self) {
@@ -254,12 +259,13 @@ impl ExplorerApp {
             return;
         }
 
-        let url = self.settings.patch_version_source_url.clone();
+        let game = self.settings.game;
+        let logged = self.settings.patch_protocol(game);
         let (tx, rx) = channel();
         self.patch_version_rx = Some(rx);
 
         thread::spawn(move || {
-            let _ = tx.send(crate::settings::AppSettings::fetch_latest_patch_version(crate::settings::Game::Poe2, &url));
+            let _ = tx.send((game, crate::patch_server::live(game, logged).map(|patch| patch.version)));
         });
     }
 
@@ -707,6 +713,7 @@ impl ExplorerApp {
         let schema = self.content_view.dat_viewer.community_schema().cloned();
         let (tx, rx) = channel();
         self.patch_check_rx = Some(rx);
+        self.patch_check_for = Some((game, version.clone()));
         self.status_msg = format!("Checking patch {} against the schema…", version);
         thread::spawn(move || {
             let result = source().and_then(|files| match schema {
@@ -729,6 +736,7 @@ impl ExplorerApp {
             Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the patch check stopped without a result".to_string()),
         };
         self.patch_check_rx = None;
+        let checked = self.patch_check_for.take();
         match result {
             Ok(report) => {
                 for line in report.lines() {
@@ -738,9 +746,110 @@ impl ExplorerApp {
                 if report.written && (!report.refitted.is_empty() || !report.retired.is_empty()) {
                     self.content_view.dat_viewer.load_overrides();
                 }
+                if let Some((game, version)) = checked.filter(|c| *c == self.current_patch()) {
+                    self.load_patch_report(game, &version);
+                }
             }
             Err(e) => self.status_msg = format!("Patch check failed: {}", e),
         }
+    }
+
+    /// Acts on the patch a game's server says is live. An install's log decides what its caches hold, so only a game read off the CDN has them cleared here.
+    fn live_patch_found(&mut self, game: crate::settings::Game, version: String) {
+        let installed = self.settings.installed_patch(game);
+        if installed.as_deref() == Some(version.as_str()) {
+            return;
+        }
+        if let Some(installed) = installed {
+            self.status_msg = format!("{} patch {} is live; this install is on {}", game.label(), version, installed);
+            self.check_live_patch(game, version);
+            return;
+        }
+        let old_version = self.settings.patch_version(game).to_string();
+        if old_version == version {
+            return;
+        }
+        self.settings.set_patch_version(game, version.clone());
+        self.settings.save();
+        if self.settings.game == game {
+            self.content_view.update_cdn_version(&version);
+        }
+        self.status_msg = format!("New patch {} — snapshotting previous index...", version);
+        let (tx, rx) = channel();
+        self.auto_snapshot_rx = Some(rx);
+        thread::spawn(move || {
+            let cache_path = crate::settings::AppSettings::index_cache_path(game);
+            let mut snapshot_note = String::new();
+            if !old_version.is_empty() && cache_path.exists() && !crate::diff::has_snapshot_for_version(&old_version, game) {
+                match crate::bundles::index::Index::load_from_cache(&cache_path) {
+                    Ok(mut index) => {
+                        index.drop_shader_cache();
+                        match crate::diff::take_snapshot(&index, &old_version, "auto (pre-patch index cache)", game) {
+                            Ok(_) => snapshot_note = format!(", snapshot of {} saved", old_version),
+                            Err(e) => println!("Auto-snapshot failed: {}", e),
+                        }
+                    }
+                    Err(e) => println!("Auto-snapshot: failed to load index cache: {}", e),
+                }
+            }
+            let message = match crate::settings::AppSettings::clear_cache(game) {
+                Ok(()) => {
+                    println!("Cleared disk cache after patch change: {} -> {}", old_version, version);
+                    let _ = crate::settings::AppSettings::stamp_cache_patch(&version, game);
+                    format!("Updated {} patch version to {} (cache cleared{})", game.label(), version, snapshot_note)
+                }
+                Err(e) => {
+                    println!("Failed to clear cache after patch change: {}", e);
+                    format!("Updated {} patch version to {}{}", game.label(), version, snapshot_note)
+                }
+            };
+            let _ = tx.send((game, version, message));
+        });
+    }
+
+    /// Checks a live patch from the CDN, which has it before the install updates and while the last patch's tables are at hand.
+    fn check_live_patch(&mut self, game: crate::settings::Game, version: String) {
+        if version.is_empty() || crate::patch_check::was_checked(game, &version) {
+            return;
+        }
+        let cdn_version = version.clone();
+        self.start_patch_check(game, version, move || {
+            let cdn = crate::bundles::cdn::CdnBundleLoader::new(&crate::settings::AppSettings::file_cache_dir(game), Some(&cdn_version), game);
+            let index = cdn.fetch_index().map_err(|e| format!("could not read patch {} from the CDN: {}", cdn_version, e))?;
+            Ok(crate::data_export::source::GameFiles::new(None, Arc::new(index), None, Some(cdn)))
+        });
+    }
+
+    /// The game and patch of the install the app is reading.
+    fn current_patch(&self) -> (crate::settings::Game, String) {
+        let game = crate::settings::Game::from_is_poe2(self.is_poe2);
+        (game, self.settings.patch_version(game).to_string())
+    }
+
+    /// Shows the check recorded for a patch, with when its record was written.
+    fn load_patch_report(&mut self, game: crate::settings::Game, version: &str) {
+        let written = std::fs::metadata(crate::patch_check::report_path(game, version)).and_then(|m| m.modified()).ok();
+        self.patch_report = crate::patch_check::load(game, version);
+        self.content_view.dat_viewer.set_client_layouts(crate::dat::exe_layout::kept(game, version));
+        self.patch_checked_at = written.map(|at| chrono::DateTime::<chrono::Local>::from(at).format("%Y-%m-%d %H:%M").to_string());
+    }
+
+    /// Checks the open patch again, on request from the patch page.
+    fn recheck_patch(&mut self) {
+        let (game, version) = self.current_patch();
+        let Some(index) = self.bundle_index.clone().filter(|i| !i.is_pre_bundle() && !version.is_empty()) else {
+            self.status_msg = "This install has no patch to check".to_string();
+            return;
+        };
+        let files = crate::data_export::source::GameFiles::new(self.reader.clone(), index, self.content_view.steam_loader.clone(), None);
+        self.start_patch_check(game, version, move || Ok(files));
+    }
+
+    /// A top-level table in the open install, by its name.
+    fn table_selection(&self, name: &str) -> Option<FileSelection> {
+        let path = format!("{}{}.datc64", crate::dat::table_store::table_dir(self.current_patch().0), name.to_ascii_lowercase());
+        let index = self.bundle_index.as_ref()?;
+        index.files.iter().find(|(_, file)| file.path.eq_ignore_ascii_case(&path)).map(|(hash, _)| FileSelection::BundleFile(*hash))
     }
 
     /// Opens the data export dialog, with the patch the install is on so it
@@ -1128,6 +1237,18 @@ impl eframe::App for ExplorerApp {
                                  let pre_bundle = self.bundle_index.as_deref().is_some_and(|i| i.is_pre_bundle());
                                  let version = path.parent().and_then(crate::data_export::detect_version).filter(|_| !pre_bundle);
                                  let known = self.settings.patch_version(game).to_string();
+                                 // A file the install lacks comes from this game's CDN, at the patch the install is on.
+                                 let cdn_version = version.clone().unwrap_or_else(|| known.clone());
+                                 self.content_view.set_cdn_loader(crate::bundles::cdn::CdnBundleLoader::new(
+                                     &crate::settings::AppSettings::file_cache_dir(game),
+                                     Some(cdn_version.as_str()).filter(|v| !v.is_empty()),
+                                     game,
+                                 ));
+                                 self.patch_report = None;
+                                 self.patch_checked_at = None;
+                                 if let Some(version) = &version {
+                                     self.load_patch_report(game, version);
+                                 }
                                  if let (Some(version), Some(index)) = (version.clone(), self.bundle_index.clone()) {
                                      let files = crate::data_export::source::GameFiles::new(
                                          self.reader.clone(),
@@ -1148,7 +1269,8 @@ impl eframe::App for ExplorerApp {
                                      self.settings.save();
                                  }
                                  self.tree_view = tree_view;
-                                 self.command_palette_needs_refresh = true;
+                                 self.tree_view.set_search_index(self.bundle_index.clone());
+                                 self.search_page.reset();
 
                                  if let Some(reader) = &reader_opt {
                                      let game_ver = if self.is_poe2 { "PoE 2" } else { "PoE 1" };
@@ -1176,9 +1298,24 @@ impl eframe::App for ExplorerApp {
         
     
         let is_loaded = self.reader.is_some() || self.bundle_index.is_some();
-        let location = match self.settings_window.is_open() {
-            true => "Settings".to_string(),
-            false => self.current_location_label(),
+        let selected_before = self.selected_file.clone();
+        let on_home = is_loaded && self.selected_file.is_none();
+        let location = match (self.settings_window.is_open(), self.patch_page.is_open(), self.search_page.is_open()) {
+            (true, _, _) => "Settings".to_string(),
+            (false, true, _) => "Patch".to_string(),
+            (false, false, true) => "Search".to_string(),
+            (false, false, false) if on_home => "Home".to_string(),
+            (false, false, false) => self.current_location_label(),
+        };
+        // A page has no file for the inspector to describe.
+        let on_page = on_home || self.settings_window.is_open() || self.patch_page.is_open() || self.search_page.is_open();
+        // While a game is opening, the switch already shows the one that was asked for.
+        let settled = is_loaded && !self.is_loading;
+        let games = crate::ui::chrome::GameSwitch {
+            game: if settled { crate::settings::Game::from_is_poe2(self.is_poe2) } else { self.settings.game },
+            loaded: is_loaded || self.is_loading,
+            busy: self.is_loading,
+            saved: [crate::settings::Game::Poe1, crate::settings::Game::Poe2].map(|game| self.settings.ggpk_path_for(game).or(self.settings.steam_path_for(game)).is_some()),
         };
         let chrome_actions = crate::ui::chrome::AppChrome::show(
             ctx,
@@ -1187,8 +1324,12 @@ impl eframe::App for ExplorerApp {
             is_loaded,
             self.is_loading,
             &mut self.inspector_open,
+            &games,
         );
 
+        if let Some(game) = chrome_actions.switch_game {
+            self.switch_game(game, ctx);
+        }
         if chrome_actions.open_ggpk {
             self.open_ggpk(ctx);
         }
@@ -1217,7 +1358,23 @@ impl eframe::App for ExplorerApp {
             self.start_data_export(options, crate::ui::data_export_window::ExportKind::Tables);
         }
         if chrome_actions.open_settings {
+            self.patch_page.close();
             self.settings_window.open();
+        }
+        if chrome_actions.open_patch {
+            self.settings_window.close();
+            self.patch_page.open();
+        }
+        if chrome_actions.open_home {
+            self.settings_window.close();
+            self.patch_page.close();
+            self.search_page.close();
+            self.selected_file = None;
+        }
+        if chrome_actions.open_search || ctx.input(|i| i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::F)) {
+            self.settings_window.close();
+            self.patch_page.close();
+            self.search_page.open();
         }
         if chrome_actions.open_diff {
             self.diff_window.open_window();
@@ -1229,10 +1386,6 @@ impl eframe::App for ExplorerApp {
             self.inspector_open = !self.inspector_open;
         }
         if chrome_actions.open_command_palette {
-            if self.command_palette_needs_refresh || self.command_palette_items.is_empty() {
-                self.command_palette_items = self.tree_view.command_palette_items(120_000);
-                self.command_palette_needs_refresh = false;
-            }
             self.command_palette.open();
         }
 
@@ -1249,7 +1402,9 @@ impl eframe::App for ExplorerApp {
             version => version.to_string(),
         };
 
-        crate::ui::status_bar::StatusBar::show(
+        let patch_running = self.patch_check_for.as_ref().is_some_and(|checked| *checked == self.current_patch());
+        let patch_health = crate::ui::patch_page::health(self.patch_report.as_ref(), patch_running);
+        let chip_clicked = crate::ui::status_bar::StatusBar::show(
             ctx,
             &self.status_msg,
             self.is_loading,
@@ -1258,7 +1413,12 @@ impl eframe::App for ExplorerApp {
             &poe_version,
             &schema_date,
             self.update_state.latest_version.as_deref().zip(self.update_state.release_url.as_deref()),
+            is_loaded.then_some(&patch_health),
         );
+        if chip_clicked {
+            self.settings_window.close();
+            self.patch_page.open();
+        }
 
         // Export Window logic
         let _ = self.export_window.show(ctx);
@@ -1315,58 +1475,13 @@ impl eframe::App for ExplorerApp {
 
         if let Some(rx) = &self.patch_version_rx {
             match rx.try_recv() {
-                Ok(Ok(version)) => {
-                    if self.settings.poe2_patch_version != version {
-                        let old_version = self.settings.poe2_patch_version.clone();
-                        self.settings.poe2_patch_version = version.clone();
-                        self.settings.save();
-                        self.content_view.update_cdn_version(&version);
-
-                        // A new patch can change bundle contents under unchanged
-                        // names/hashes, so the cached index, tree, CDN bundles,
-                        // and parsed-content cache from the old patch can no
-                        // longer be trusted — wipe them so the next load rebuilds
-                        // from scratch against the new patch. Before the wipe,
-                        // the cached index is the last full record of the old
-                        // patch — save it as a diff snapshot.
-                        self.status_msg = format!("New patch {} — snapshotting previous index...", version);
-                        let (tx, rx) = channel();
-                        self.auto_snapshot_rx = Some(rx);
-                        thread::spawn(move || {
-                            let game = crate::settings::Game::Poe2;
-                            let cache_path = crate::settings::AppSettings::index_cache_path(game);
-                            let mut snapshot_note = String::new();
-                            if cache_path.exists() && !crate::diff::has_snapshot_for_version(&old_version, game) {
-                                match crate::bundles::index::Index::load_from_cache(&cache_path) {
-                                    Ok(mut index) => {
-                                        index.drop_shader_cache();
-                                        match crate::diff::take_snapshot(&index, &old_version, "auto (pre-patch index cache)", game) {
-                                            Ok(_) => snapshot_note = format!(", snapshot of {} saved", old_version),
-                                            Err(e) => println!("Auto-snapshot failed: {}", e),
-                                        }
-                                    }
-                                    Err(e) => println!("Auto-snapshot: failed to load index cache: {}", e),
-                                }
-                            }
-                            let result = match crate::settings::AppSettings::clear_cache(game) {
-                                Ok(()) => {
-                                    println!("Cleared disk cache after patch change: {} -> {}", old_version, version);
-                                    let _ = crate::settings::AppSettings::stamp_cache_patch(&version, game);
-                                    Ok(format!("Updated PoE 2 patch version to {} (cache cleared{})", version, snapshot_note))
-                                }
-                                Err(e) => {
-                                    println!("Failed to clear cache after patch change: {}", e);
-                                    Err(format!("Updated PoE 2 patch version to {}{}", version, snapshot_note))
-                                }
-                            };
-                            let _ = tx.send(result);
-                        });
-                    }
+                Ok((game, Ok(version))) => {
                     self.patch_version_rx = None;
+                    self.live_patch_found(game, version);
                 },
-                Ok(Err(e)) => {
+                Ok((game, Err(e))) => {
                     if self.status_msg == "Ready" {
-                        self.status_msg = format!("Patch auto-detect failed: {}", e);
+                        self.status_msg = format!("Could not ask which {} patch is live: {}", game.label(), e);
                     }
                     self.patch_version_rx = None;
                 },
@@ -1381,31 +1496,13 @@ impl eframe::App for ExplorerApp {
 
         if let Some(rx) = &self.auto_snapshot_rx {
             match rx.try_recv() {
-                Ok(result) => {
-                    self.status_msg = match result {
-                        Ok(msg) => msg,
-                        Err(msg) => msg,
-                    };
+                Ok((game, version, message)) => {
+                    self.status_msg = message;
                     self.auto_snapshot_rx = None;
                     if self.diff_window.is_open() {
                         self.diff_window.refresh();
                     }
-                    // The patch is live before the install updates; check it
-                    // from the CDN while the last patch's tables are at hand.
-                    let game = crate::settings::Game::Poe2;
-                    let version = self.settings.poe2_patch_version.clone();
-                    if !version.is_empty() && !crate::patch_check::was_checked(game, &version) {
-                        let cdn_version = version.clone();
-                        self.start_patch_check(game, version, move || {
-                            let cdn = crate::bundles::cdn::CdnBundleLoader::new(
-                                &crate::settings::AppSettings::file_cache_dir(game),
-                                Some(&cdn_version),
-                                game,
-                            );
-                            let index = cdn.fetch_index().map_err(|e| format!("could not read patch {} from the CDN: {}", cdn_version, e))?;
-                            Ok(crate::data_export::source::GameFiles::new(None, Arc::new(index), None, Some(cdn)))
-                        });
-                    }
+                    self.check_live_patch(game, version);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -1414,12 +1511,7 @@ impl eframe::App for ExplorerApp {
             }
         }
 
-        if self.command_palette.handle_shortcut(ctx) {
-            if self.command_palette_needs_refresh || self.command_palette_items.is_empty() {
-                self.command_palette_items = self.tree_view.command_palette_items(120_000);
-                self.command_palette_needs_refresh = false;
-            }
-        }
+        self.command_palette.handle_shortcut(ctx);
 
         // Inspector toggle shortcut (Ctrl+I)
         if ctx.input(|i| i.key_pressed(egui::Key::I) && i.modifiers.ctrl && !i.modifiers.shift) {
@@ -1444,17 +1536,46 @@ impl eframe::App for ExplorerApp {
             &mut self.export_window
         );
 
-        if self.inspector_open {
+        if self.inspector_open && !on_page {
             self.show_inspector(ctx);
         }
 
         // Central Panel
         let schema_date_for_settings = self.content_view.dat_viewer.schema_date.clone();
+        let (open_game, open_version) = self.current_patch();
+        let mut patch_actions = crate::ui::patch_page::PatchActions::default();
+        let mut home_actions = crate::ui::home::HomeActions::default();
+        let mut search_actions = crate::ui::search_page::SearchActions::default();
         egui::CentralPanel::default().show(ctx, |ui| {
              if self.settings_window.is_open() {
                  let loaded = (self.reader.is_some() || self.bundle_index.is_some())
                      .then(|| crate::settings::Game::from_is_poe2(self.is_poe2));
                  self.settings_window.show(ui, &mut self.settings, Some(&schema_date_for_settings), loaded);
+             } else if self.patch_page.is_open() {
+                 let view = crate::ui::patch_page::PatchView {
+                     game: is_loaded.then_some(open_game),
+                     version: &open_version,
+                     report: self.patch_report.as_ref(),
+                     running: patch_running,
+                     checked_at: self.patch_checked_at.as_deref(),
+                 };
+                 patch_actions = self.patch_page.show(ui, &view);
+             } else if self.search_page.is_open() {
+                 let sources = self.bundle_index.as_ref().map(|index| crate::ui::search_page::Sources { index, reader: self.reader.as_ref(), steam: self.content_view.steam_loader.as_ref() });
+                 search_actions = self.search_page.show(ui, sources);
+             } else if is_loaded && self.selected_file.is_none() {
+                 let headline = self.patch_report.as_ref().map(|r| r.headline());
+                 let source = self.settings.steam_path_for(open_game).or(self.settings.ggpk_path_for(open_game)).cloned().unwrap_or_default();
+                 let view = crate::ui::home::HomeView {
+                     game: open_game,
+                     version: &open_version,
+                     source: &source,
+                     files: self.bundle_index.as_ref().map_or(0, |index| index.files.len()),
+                     schema_date: &schema_date_for_settings,
+                     health: &patch_health,
+                     headline: headline.as_deref(),
+                 };
+                 home_actions = crate::ui::home::show(ui, &view);
              } else if self.reader.is_some() || self.bundle_index.is_some() {
                  self.content_view.show(ui, self.reader.clone(), self.selected_file.clone(), self.is_poe2, &self.bundle_index);
              } else {
@@ -1477,6 +1598,52 @@ impl eframe::App for ExplorerApp {
              }
         });
 
+        if let Some(opened) = search_actions.open {
+            if let Some(file) = self.bundle_index.as_ref().and_then(|index| index.files.get(&opened.hash)) {
+                self.content_view.focus_match(opened.hash, &file.path, opened.line, &opened.text);
+            }
+            self.selected_file = Some(FileSelection::BundleFile(opened.hash));
+            self.search_page.close();
+        }
+        if let Some(kind) = home_actions.filter_kind {
+            self.tree_view.set_filter(&kind.query());
+        }
+        if patch_actions.check_again {
+            self.recheck_patch();
+        }
+        if patch_actions.open_folder {
+            if let Some(dir) = crate::patch_check::report_path(open_game, &open_version).parent() {
+                let _ = open::that(dir);
+            }
+        }
+        if let Some(name) = patch_actions.open_table {
+            match self.table_selection(&name) {
+                Some(selection) => {
+                    self.selected_file = Some(selection);
+                    self.patch_page.close();
+                }
+                None => self.status_msg = format!("{} is not in this install", name),
+            }
+        }
+        if home_actions.open_patch {
+            self.patch_page.open();
+        }
+        if home_actions.open_diff {
+            self.diff_window.open_window();
+        }
+        if home_actions.open_palette {
+            self.command_palette.open();
+        }
+        for (wanted, kind) in [
+            (home_actions.export_data, crate::ui::data_export_window::ExportKind::Semantic),
+            (home_actions.export_pob, crate::ui::data_export_window::ExportKind::Pob),
+            (home_actions.export_tables, crate::ui::data_export_window::ExportKind::Tables),
+        ] {
+            if wanted {
+                self.open_data_export(kind);
+            }
+        }
+
         // Handle Export Requests from Content View
         if let Some((hashes, name, settings)) = self.content_view.export_requested.take() {
              let is_folder = hashes.len() > 1; 
@@ -1492,9 +1659,13 @@ impl eframe::App for ExplorerApp {
             self.selected_file = Some(selection);
         }
 
-        if let Some(hash) = self.command_palette.show(ctx, &self.command_palette_items) {
+        if let Some(hash) = self.command_palette.show(ctx, self.bundle_index.as_ref()) {
+            self.settings_window.close();
+            self.patch_page.close();
             self.selected_file = Some(FileSelection::BundleFile(hash));
-            self.status_msg = format!("Navigated to bundle file hash {:016x}", hash);
+        }
+        if let Some(FileSelection::BundleFile(hash)) = &self.selected_file {
+            self.command_palette.note_opened(*hash);
         }
 
         // Poll Export Status
@@ -1527,29 +1698,20 @@ impl eframe::App for ExplorerApp {
         }
 
 
-        let diff_source = self
-            .settings
-            .steam_path
-            .clone()
-            .or_else(|| self.settings.ggpk_path.clone())
-            .unwrap_or_default();
-        self.diff_window.show(ctx, &self.bundle_index, &self.settings.poe2_patch_version, &diff_source);
+        let diff_game = if is_loaded { open_game } else { self.settings.game };
+        let diff_source = self.settings.steam_path_for(diff_game).or(self.settings.ggpk_path_for(diff_game)).cloned().unwrap_or_default();
+        self.diff_window.show(ctx, &self.bundle_index, diff_game, self.settings.patch_version(diff_game), &diff_source);
         if let Some(hash) = self.diff_window.navigate_to.take() {
             self.selected_file = Some(FileSelection::BundleFile(hash));
         }
 
-        let old_patch_ver = self.settings.poe2_patch_version.clone();
-
-
         if let Some(game) = self.settings_window.requested_game.take() {
             self.switch_game(game, ctx);
         }
-        
-        if self.settings.poe2_patch_version != old_patch_ver {
-             println!("Patch version changed to: {}", self.settings.poe2_patch_version);
-             self.content_view.update_cdn_version(&self.settings.poe2_patch_version);
-        }
 
+        if is_loaded && self.settings.patch_version(open_game) != open_version {
+            self.content_view.update_cdn_version(self.settings.patch_version(open_game));
+        }
 
         if let Some(rx) = &self.schema_update_rx {
              match rx.try_recv() {
@@ -1638,41 +1800,30 @@ impl eframe::App for ExplorerApp {
             self.start_schema_update();
         }
 
+        if self.selected_file.is_some() && self.selected_file != selected_before {
+            self.patch_page.close();
+            self.search_page.close();
+        }
+
         handle_resize_zones(ctx);
         
         if self.show_about {
-            egui::Window::new("About")
-                .open(&mut self.show_about)
-                .collapsible(false)
-                .resizable(false)
-                .default_width(300.0)
-                .show(ctx, |ui| {
-                    ui.spacing_mut().item_spacing.y = 5.0;
-
-                    ui.vertical_centered(|ui| {
-                        ui.label(
-                            egui::RichText::new("GGPK Explorer")
-                                .size(15.0)
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .size(11.5)
-                                .color(egui::Color32::from_rgb(113, 113, 122)),
-                        );
-                    });
-
-                    ui.separator();
-                    crate::ui::components::modal_section(ui, "AUTHOR");
-                    ui.label(egui::RichText::new("Created by Judd").size(12.5));
+            use crate::ui::components::{modal, modal_section};
+            let close = modal::show(ctx, "about", "About", 380.0, |ui| {
+                modal::body(ui, |ui| {
+                    let muted = ui.visuals().weak_text_color();
+                    ui.add_space(4.0);
                     ui.horizontal(|ui| {
-                        ui.hyperlink_to("GitHub", "https://github.com/juddisjudd/ggpk-explorer");
-                        ui.label(egui::RichText::new("·").color(egui::Color32::from_rgb(82, 82, 91)));
-                        ui.hyperlink_to("Ko-fi", "https://ko-fi.com/ohitsjudd");
+                        ui.add(egui::Image::new(egui::include_image!("../../assets/icon-48x48.png")).fit_to_exact_size(egui::vec2(40.0, 40.0)));
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.label(egui::RichText::new("GGPK Explorer").size(16.0).strong());
+                            ui.label(egui::RichText::new(format!("Version {} · by Judd", env!("CARGO_PKG_VERSION"))).size(12.0).color(muted));
+                        });
                     });
 
-                    ui.separator();
-                    crate::ui::components::modal_section(ui, "UPDATES");
+                    modal_section(ui, "UPDATES");
                     if self.update_state.pending {
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -1696,13 +1847,29 @@ impl eframe::App for ExplorerApp {
                         });
                     }
 
-                    ui.separator();
-                    crate::ui::components::modal_section(ui, "CREDITS");
-                    ui.hyperlink_to("ooz", "https://github.com/zao/ooz");
-                    ui.hyperlink_to("dat-schema", "https://github.com/poe-tool-dev/dat-schema");
-                    ui.hyperlink_to("poe-dat-viewer", "https://github.com/SnosMe/poe-dat-viewer");
-                    ui.hyperlink_to("LibGGPK3", "https://github.com/aianlinb/LibGGPK3");
+                    modal_section(ui, "LINKS");
+                    ui.horizontal(|ui| {
+                        ui.hyperlink_to("GitHub", "https://github.com/juddisjudd/ggpk-explorer");
+                        ui.label(egui::RichText::new("·").color(muted));
+                        ui.hyperlink_to("Ko-fi", "https://ko-fi.com/ohitsjudd");
+                    });
+
+                    modal_section(ui, "BUILT ON");
+                    ui.horizontal(|ui| {
+                        let credits = [("ooz", "https://github.com/zao/ooz"), ("dat-schema", "https://github.com/poe-tool-dev/dat-schema"), ("poe-dat-viewer", "https://github.com/SnosMe/poe-dat-viewer"), ("LibGGPK3", "https://github.com/aianlinb/LibGGPK3")];
+                        for (index, (name, url)) in credits.into_iter().enumerate() {
+                            if index > 0 {
+                                ui.label(egui::RichText::new("·").color(muted));
+                            }
+                            ui.hyperlink_to(name, url);
+                        }
+                    });
+                    ui.add_space(6.0);
                 });
+            });
+            if close {
+                self.show_about = false;
+            }
         }
     }
 }

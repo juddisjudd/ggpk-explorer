@@ -26,7 +26,7 @@ impl CurveViewer {
             crate::ui::components::badge(ui, &format!("{} blocks", file.blocks.len()));
             crate::ui::components::badge(ui, &format!("{} curves", total_curves));
             ui.label("🔍");
-            ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text("Filter keys").desired_width(180.0));
+            ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text(crate::ui::components::hint(ui, "Filter keys")).desired_width(180.0));
             ui.toggle_value(&mut state.hide_constant, "Hide flat").on_hover_text("Skip curves whose value never changes");
         });
         ui.separator();

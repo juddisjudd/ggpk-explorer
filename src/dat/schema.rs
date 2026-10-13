@@ -76,11 +76,6 @@ fn valid_for_game(valid_for: Option<u32>, is_poe2: bool) -> bool {
     }
 }
 
-fn games_overlap(a: Option<u32>, b: Option<u32>) -> bool {
-    let all = VALID_FOR_POE1 | VALID_FOR_POE2;
-    a.unwrap_or(all) & b.unwrap_or(all) != 0
-}
-
 impl Schema {
     pub fn empty() -> Self {
         Schema { version: SUPPORTED_SCHEMA_VERSION, created_at: 0, tables: Vec::new(), enumerations: Vec::new() }
@@ -89,8 +84,13 @@ impl Schema {
     /// Layers user-defined tables over the community ones: an override replaces every
     /// same-named definition for the games it is valid for and is marked `custom`.
     pub fn apply_overrides(&mut self, overrides: &[Table]) {
+        let all = VALID_FOR_POE1 | VALID_FOR_POE2;
         for o in overrides {
-            self.tables.retain(|t| !(t.name.eq_ignore_ascii_case(&o.name) && games_overlap(t.valid_for, o.valid_for)));
+            // A definition both games share stays in force for the game the override does not cover.
+            for t in self.tables.iter_mut().filter(|t| t.name.eq_ignore_ascii_case(&o.name)) {
+                t.valid_for = Some(t.valid_for.unwrap_or(all) & !o.valid_for.unwrap_or(all));
+            }
+            self.tables.retain(|t| !(t.name.eq_ignore_ascii_case(&o.name) && t.valid_for == Some(0)));
             self.tables.push(Table { custom: true, ..o.clone() });
         }
     }

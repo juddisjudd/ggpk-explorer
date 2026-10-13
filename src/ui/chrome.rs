@@ -1,9 +1,24 @@
+use crate::settings::Game;
 use eframe::egui;
 
+/// What the title bar's game switch shows.
+pub struct GameSwitch {
+    /// The game being read, or the one being opened.
+    pub game: Game,
+    pub loaded: bool,
+    pub busy: bool,
+    /// Whether an install is saved for PoE 1 and for PoE 2, in that order.
+    pub saved: [bool; 2],
+}
+
 pub struct ChromeActions {
+    pub switch_game: Option<Game>,
     pub open_ggpk: bool,
     pub open_steam: bool,
     pub open_settings: bool,
+    pub open_home: bool,
+    pub open_search: bool,
+    pub open_patch: bool,
     pub open_diff: bool,
     pub export_data: bool,
     pub export_pob: bool,
@@ -16,9 +31,13 @@ pub struct ChromeActions {
 impl ChromeActions {
     fn new() -> Self {
         Self {
+            switch_game: None,
             open_ggpk: false,
             open_steam: false,
             open_settings: false,
+            open_home: false,
+            open_search: false,
+            open_patch: false,
             open_diff: false,
             export_data: false,
             export_pob: false,
@@ -83,6 +102,44 @@ impl AppChrome {
                 .rounding(egui::Rounding::same(4.0))
                 .min_size(egui::vec2(button_w, button_h)),
         )
+    }
+
+    /// Both games side by side with the one being read lit, so the other is one click away on every page.
+    fn game_switch(ui: &mut egui::Ui, games: &GameSwitch) -> Option<Game> {
+        let dark_mode = ui.visuals().dark_mode;
+        let shade = |dark: u8, light: u8| egui::Color32::from_gray(if dark_mode { dark } else { light });
+        let mut asked = None;
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for game in [Game::Poe1, Game::Poe2] {
+                let lit = games.loaded && games.game == game;
+                let saved = games.saved[usize::from(game.is_poe2())];
+                let text = match (lit, saved) {
+                    (true, _) => shade(244, 20),
+                    (false, true) => shade(161, 75),
+                    (false, false) => shade(96, 160),
+                };
+                let hint = match (lit, saved) {
+                    (true, _) => format!("Reading {}", game.label()),
+                    (false, true) => format!("Switch to {}", game.label()),
+                    (false, false) => format!("No {} install is saved. Click to set its path.", game.label()),
+                };
+                let button = egui::Button::new(egui::RichText::new(game.label()).size(12.5).color(text))
+                    .fill(if lit { shade(46, 222) } else { egui::Color32::TRANSPARENT })
+                    .stroke(egui::Stroke::NONE)
+                    .rounding(egui::Rounding::same(4.0))
+                    .min_size(egui::vec2(48.0, 24.0));
+                let behind = ui.painter().add(egui::Shape::Noop);
+                let response = ui.add_enabled(!games.busy, button).on_hover_text(hint);
+                if response.hovered() && !lit {
+                    ui.painter().set(behind, egui::Shape::rect_filled(response.rect, 4.0, shade(23, 232)));
+                }
+                if response.clicked() && !lit {
+                    asked = Some(game);
+                }
+            }
+        });
+        asked
     }
 
     fn nav_button_menu(ui: &mut egui::Ui, label: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -244,6 +301,7 @@ impl AppChrome {
         _has_reader: bool,
         _is_loading: bool,
         _inspector_open: &mut bool,
+        games: &GameSwitch,
     ) -> ChromeActions {
         let mut actions = ChromeActions::new();
 
@@ -303,6 +361,8 @@ impl AppChrome {
                         );
 
                         ui.add_space(10.0);
+                        actions.switch_game = Self::game_switch(ui, games);
+                        ui.add_space(6.0);
 
                         let mut open_ggpk = false;
                         let mut open_steam = false;
@@ -333,7 +393,7 @@ impl AppChrome {
                             if ui
                                 .button("Export PoB Data...")
                                 .on_hover_text(
-                                    "Write Path of Building's data files (bases, skills, gems, mods, minions,                                      stat descriptions) as pob-data JSON",
+                                    "Write Path of Building's data files (bases, skills, gems, mods, minions, stat descriptions) as pob-data JSON",
                                 )
                                 .clicked()
                             {
@@ -378,12 +438,24 @@ impl AppChrome {
                             actions.toggle_inspector = true;
                         }
 
-                        if Self::nav_button(ui, "Settings").clicked() {
-                            actions.open_settings = true;
+                        if Self::nav_button(ui, "Home").clicked() {
+                            actions.open_home = true;
+                        }
+
+                        if Self::nav_button(ui, "Search").on_hover_text("Find text inside the game's files (Ctrl+Shift+F)").clicked() {
+                            actions.open_search = true;
+                        }
+
+                        if Self::nav_button(ui, "Patch").clicked() {
+                            actions.open_patch = true;
                         }
 
                         if Self::nav_button(ui, "Diff").clicked() {
                             actions.open_diff = true;
+                        }
+
+                        if Self::nav_button(ui, "Settings").clicked() {
+                            actions.open_settings = true;
                         }
 
                         if Self::nav_button(ui, "About").clicked() {
@@ -434,5 +506,58 @@ impl AppChrome {
             });
 
         actions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Draws the switch, clicks the game labelled `label`, and returns what the switch asked for.
+    fn clicked(games: &GameSwitch, label: &str) -> Option<Game> {
+        fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label => Some(text.visual_bounding_rect().center()),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, label)),
+                _ => None,
+            }
+        }
+        let ctx = egui::Context::default();
+        let (mut at, mut asked) = (egui::Pos2::ZERO, None);
+        for step in 0..4 {
+            let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            let events = match step {
+                0 => vec![],
+                1 => vec![egui::Event::PointerMoved(at)],
+                2 => vec![button(true)],
+                _ => vec![button(false)],
+            };
+            let output = ctx.run(egui::RawInput { events, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| asked = asked.or(AppChrome::game_switch(ui, games)));
+            });
+            at = output.shapes.iter().find_map(|s| find(&s.shape, label)).expect("the switch did not draw this game");
+        }
+        asked
+    }
+
+    #[test]
+    fn the_switch_asks_for_the_game_that_is_not_being_read() {
+        let reading_poe1 = GameSwitch { game: Game::Poe1, loaded: true, busy: false, saved: [true, true] };
+        assert_eq!(clicked(&reading_poe1, "PoE 2"), Some(Game::Poe2));
+        assert_eq!(clicked(&reading_poe1, "PoE 1"), None);
+    }
+
+    #[test]
+    fn a_game_with_no_install_can_still_be_asked_for() {
+        let only_poe2 = GameSwitch { game: Game::Poe2, loaded: true, busy: false, saved: [false, true] };
+        assert_eq!(clicked(&only_poe2, "PoE 1"), Some(Game::Poe1));
+        let nothing_open = GameSwitch { game: Game::Poe2, loaded: false, busy: false, saved: [false, true] };
+        assert_eq!(clicked(&nothing_open, "PoE 2"), Some(Game::Poe2));
+    }
+
+    #[test]
+    fn the_switch_waits_while_a_load_or_export_runs() {
+        let busy = GameSwitch { game: Game::Poe1, loaded: true, busy: true, saved: [true, true] };
+        assert_eq!(clicked(&busy, "PoE 2"), None);
     }
 }

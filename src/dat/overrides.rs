@@ -87,7 +87,7 @@ impl Overrides {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dat::schema::{Column, VALID_FOR_POE2};
+    use crate::dat::schema::{Column, VALID_FOR_POE1, VALID_FOR_POE2};
 
     fn col(name: &str, ty: &str) -> Column {
         Column {
@@ -156,5 +156,24 @@ mod tests {
         assert!(poe2.custom);
         assert_eq!(poe2.columns.len(), 2);
         assert!(!schema.find_table("Foo", false).unwrap().custom);
+    }
+
+    #[test]
+    fn an_override_for_one_game_leaves_a_shared_table_to_the_other() {
+        let mut schema = Schema::empty();
+        schema.tables.push(table("Foo", Some(VALID_FOR_POE1 | VALID_FOR_POE2)));
+        schema.tables.push(table("Bar", None));
+        let mut custom = table("Foo", Some(VALID_FOR_POE2));
+        custom.columns.push(col("Extra", "i32"));
+        schema.apply_overrides(&[custom.clone(), Table { name: "Bar".into(), ..custom.clone() }]);
+        for name in ["Foo", "Bar"] {
+            assert_eq!(schema.find_table(name, true).unwrap().columns.len(), 2, "PoE 2 reads {} through the override", name);
+            let poe1 = schema.find_table(name, false).unwrap();
+            assert!(!poe1.custom && poe1.columns.len() == 1, "PoE 1 keeps the shared definition of {}", name);
+        }
+
+        schema.apply_overrides(&[Table { valid_for: Some(VALID_FOR_POE1), ..custom }]);
+        assert!(schema.find_table("Foo", false).unwrap().custom);
+        assert_eq!(schema.tables.iter().filter(|t| t.name == "Foo").count(), 2, "nothing is left of the shared definition");
     }
 }

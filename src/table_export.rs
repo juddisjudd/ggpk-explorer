@@ -46,8 +46,8 @@ pub fn run(files: GameFiles, schema: crate::dat::schema::Schema, is_poe2: bool, 
         (Some(version), false) => out.join(options.folder_name(version)),
         _ => out,
     };
-    if let Err(e) = std::fs::create_dir_all(&out) {
-        let _ = tx.send(ExportStatus::Error(format!("Could not create {}: {}", out.display(), e)));
+    if let Err(e) = crate::data_export::create_out_dir(&out) {
+        let _ = tx.send(ExportStatus::Error(e));
         return;
     }
     if let Some(version) = &options.version {

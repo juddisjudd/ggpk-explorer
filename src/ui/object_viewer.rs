@@ -186,7 +186,7 @@ impl ObjectViewer {
         });
         ui.horizontal(|ui| {
             ui.label("🔍");
-            ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text("Filter components, keys, values").desired_width(260.0));
+            ui.add(egui::TextEdit::singleline(&mut state.filter).hint_text(crate::ui::components::hint(ui, "Filter components, keys, values")).desired_width(260.0));
             if !state.filter.is_empty() && ui.small_button("✕").clicked() {
                 state.filter.clear();
             }

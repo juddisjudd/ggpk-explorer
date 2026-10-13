@@ -44,6 +44,8 @@ pub struct DatViewer {
     schema_gen: u64,
     table: Option<(u64, bool, Option<Arc<Table>>)>,
     filter: String,
+    /// A filter to open one table with: its path and the text, as when a search match inside it is opened.
+    opening_filter: Option<(String, String)>,
     sort: Option<(usize, bool)>,
     view_rows: Option<Vec<u32>>,
     all_rows: Option<Vec<Vec<DatValue>>>,
@@ -70,6 +72,9 @@ pub struct DatViewer {
     fk_suggestions: Option<(usize, HashMap<usize, Vec<FkCandidate>>)>,
     editor: Option<SchemaEditor>,
     notice: Option<String>,
+    /// The open patch's layouts as the game client reads them.
+    client: Option<crate::dat::exe_layout::ClientLayouts>,
+    client_findings: Option<ClientFindings>,
     /// Column names being carried over from an earlier patch, in the background.
     refit: Option<RefitJob>,
     /// The patch to carry names from, looked up once.
@@ -90,6 +95,7 @@ impl Default for DatViewer {
             schema_gen: 0,
             table: None,
             filter: String::new(),
+            opening_filter: None,
             sort: None,
             view_rows: None,
             all_rows: None,
@@ -112,10 +118,18 @@ impl Default for DatViewer {
             fk_suggestions: None,
             editor: None,
             notice: None,
+            client: None,
+            client_findings: None,
             refit: None,
             prev_patch: None,
         }
     }
+}
+
+/// Where the layout being shown differs from the game client's, kept for the table at one address with one row length.
+struct ClientFindings {
+    key: (usize, Option<usize>),
+    lines: Vec<String>,
 }
 
 /// Where the column layout being shown came from.
@@ -159,7 +173,9 @@ fn refit_against(
     }
     .ok_or_else(|| format!("{} is not in patch {}", path, version))?;
 
-    match crate::dat::refit::refit_file(old_bytes, new_bytes, path, &def) {
+    let current = crate::settings::AppSettings::load().patch_version(game).to_string();
+    let client = crate::dat::exe_layout::kept(game, &current);
+    match crate::dat::refit::refit_file(old_bytes, new_bytes, path, &def, client.as_ref()) {
         Ok(refitted) => Ok(refitted.report),
         Err(crate::dat::refit::RefitError::OldDoesNotFit) => {
             Err(format!("the schema does not describe patch {} either, so there is nothing to carry", version))
@@ -782,11 +798,25 @@ impl DatViewer {
         }
     }
 
+    /// Shows only the rows holding `text` in the table at `path`, now if it is the one on screen, else when it loads.
+    pub fn filter_table(&mut self, path: &str, text: &str) {
+        match self.loaded_filename().is_some_and(|loaded| loaded.eq_ignore_ascii_case(path)) {
+            true => {
+                self.filter = text.to_string();
+                self.invalidate_view();
+            }
+            false => self.opening_filter = Some((path.to_string(), text.to_string())),
+        }
+    }
+
     pub fn load_from_bytes(&mut self, data: Vec<u8>, filename: &str) {
         self.error_msg = None;
         self.row_cache.clear();
         self.table = None;
         self.filter.clear();
+        if let Some((_, text)) = self.opening_filter.take_if(|(path, _)| path.eq_ignore_ascii_case(filename)) {
+            self.filter = text;
+        }
         self.sort = None;
         self.invalidate_view();
         self.hidden_cols.clear();
@@ -893,7 +923,9 @@ impl DatViewer {
                 }
             }
             None => {
-                self.show_unknown_banner(ui, is_poe2);
+                if self.show_unknown_banner(ui, is_poe2) {
+                    return;
+                }
                 let guessed = if self.byte_view { None } else { self.ensure_guessed() };
                 match guessed {
                     Some(t) => self.show_table(ui, is_poe2, t, loader, Layout::Guessed),
@@ -976,6 +1008,25 @@ impl DatViewer {
         }
         self.fk_suggestions = Some((key, out.clone()));
         out
+    }
+
+    /// The client's layouts for the open patch, or none once another patch is opened.
+    pub fn set_client_layouts(&mut self, layouts: Option<crate::dat::exe_layout::ClientLayouts>) {
+        self.client = layouts;
+        self.client_findings = None;
+    }
+
+    /// Where the layout being shown differs from the client's; worked out once per layout, not per frame.
+    fn client_findings_for(&mut self, table: &Arc<Table>, row_len: Option<usize>) -> Vec<String> {
+        let key = (Arc::as_ptr(table) as usize, row_len);
+        if self.client_findings.as_ref().map(|found| found.key) != Some(key) {
+            let found = self.client.as_ref().and_then(|client| {
+                let layout = client.find(&table.name).filter(|layout| row_len == Some(layout.row_size))?;
+                Some(client.disagreements(table, layout))
+            });
+            self.client_findings = Some(ClientFindings { key, lines: found.unwrap_or_default() });
+        }
+        self.client_findings.as_ref().map(|found| found.lines.clone()).unwrap_or_default()
     }
 
     fn show_table(&mut self, ui: &mut egui::Ui, is_poe2: bool, table: Arc<Table>, loader: Option<&mut TableLoader<'_>>, layout: Layout) {
@@ -1062,6 +1113,17 @@ impl DatViewer {
                 }
             });
         }
+        let disputed = self.client_findings_for(&table, row_len);
+        if !disputed.is_empty() {
+            let columns = if disputed.len() == 1 { "1 column".to_string() } else { format!("{} columns", disputed.len()) };
+            let title = RichText::new(format!("The game client reads {} of this table differently", columns)).color(Color32::from_rgb(96, 165, 250)).size(12.0);
+            egui::CollapsingHeader::new(title).id_salt("client_findings").show(ui, |ui| {
+                for line in &disputed {
+                    ui.label(RichText::new(line).monospace().size(11.0).weak());
+                }
+                ui.label(RichText::new("The client's own loader is the reference. Fix a column under Edit columns.").weak().size(11.0));
+            });
+        }
         let file_width = row_len.unwrap_or(0);
         match layout {
             Layout::Aligned => {
@@ -1128,7 +1190,7 @@ impl DatViewer {
 
         ui.horizontal(|ui| {
             ui.label("🔍");
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Filter rows (any column)").desired_width(240.0));
+            let resp = ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text(crate::ui::components::hint(ui, "Filter rows (any column)")).desired_width(240.0));
             if resp.changed() {
                 self.view_rows = None;
             }
@@ -1514,7 +1576,7 @@ impl DatViewer {
                             if analysis::is_foreign(col) || col.r#type == "enumrow" {
                                 ui.horizontal(|ui| {
                                     let mut target = col.references.as_ref().map(|r| r.table.clone()).unwrap_or_default();
-                                    if ui.add(egui::TextEdit::singleline(&mut target).desired_width(130.0).hint_text("target table")).changed() {
+                                    if ui.add(egui::TextEdit::singleline(&mut target).desired_width(130.0).hint_text(crate::ui::components::hint(ui, "target table"))).changed() {
                                         col.references = if target.is_empty() { None } else { Some(analysis::reference_to(&target)) };
                                         dirty = true;
                                     }
@@ -1566,7 +1628,22 @@ impl DatViewer {
         action
     }
 
-    fn show_unknown_banner(&mut self, ui: &mut egui::Ui, is_poe2: bool) {
+    /// Returns whether the table is empty, in which case there is no grid to draw under the banner.
+    fn show_unknown_banner(&mut self, ui: &mut egui::Ui, is_poe2: bool) -> bool {
+        let empty = self.schema.is_some() && self.reader.as_ref().is_some_and(|reader| reader.row_count == 0);
+        if empty {
+            let name = self.reader.as_ref().and_then(|reader| std::path::Path::new(&reader.filename).file_stem()?.to_str().map(str::to_string)).unwrap_or_default();
+            let layout = self.client.as_ref().and_then(|client| client.find(&name));
+            let [what, why] = empty_table_note(if is_poe2 { "PoE 2" } else { "PoE 1" }, self.client.is_some(), layout);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(what).strong());
+                if ui.small_button("Update schema").on_hover_text("Download the latest community schema, in case it has gained this table").clicked() {
+                    self.request_update_schema = true;
+                }
+            });
+            ui.label(RichText::new(why).weak());
+            return true;
+        }
         ui.horizontal(|ui| {
             if self.schema.is_none() {
                 ui.colored_label(Color32::from_rgb(239, 68, 68), "Schema not loaded.");
@@ -1587,6 +1664,7 @@ impl DatViewer {
                 ui.label(RichText::new("Column types are guessed from the data and may be wrong.").weak());
             }
         });
+        false
     }
 
     fn output_rows(&self, table: &Table) -> Vec<Vec<DatValue>> {
@@ -1703,5 +1781,58 @@ impl DatViewer {
             }
         }
         serde_json::to_string_pretty(&all_rows).ok()
+    }
+}
+
+/// What to say about a table with no rows that the schema does not describe: what it is, then why its columns cannot be shown.
+fn empty_table_note(game: &str, client_read: bool, layout: Option<&crate::dat::exe_layout::TableLayout>) -> [String; 2] {
+    let what = format!("An empty table. It has no rows in this patch and is not in the {} schema.", game);
+    let why = match (layout, client_read) {
+        (Some(layout), _) => {
+            let columns: Vec<String> = layout.pointers.iter().map(|pointer| format!("{} at byte {}", crate::dat::exe_layout::describe_pointer(pointer), pointer.offset)).collect();
+            let columns = if columns.is_empty() { "no strings, keys or lists".to_string() } else { columns.join(", ") };
+            format!("The game client does load it: rows of {} bytes, with {}. The other columns cannot be read without a row to read them from.", layout.row_size, columns)
+        }
+        (None, true) => "The game client does not load it either, so nothing in the game says what its columns are. It is most likely unused, or read only by the game's servers.".to_string(),
+        (None, false) => "With no rows there is nothing to read its columns from.".to_string(),
+    };
+    [what, why]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dat::exe_layout::{ClientLayouts, Kind, Pointer, TableLayout};
+    use crate::dat::schema::Column;
+
+    fn column(name: &str, kind: &str, array: bool) -> Column {
+        Column { name: Some(name.to_string()), description: None, array, r#type: kind.to_string(), unique: false, localized: false, references: None, interval: false, file: None, files: None }
+    }
+
+    #[test]
+    fn the_client_notice_follows_the_layout_being_shown() {
+        let table = |area: Column| Arc::new(Table { name: "T".to_string(), columns: vec![column("Id", "string", false), area], tags: None, valid_for: None, custom: false });
+        let pointer = |offset: usize, kind: Kind| Pointer { offset, kind, element: None, target: None, proven: false };
+        let layout = TableLayout { table: "T".to_string(), row_size: 24, walked: true, pointers: vec![pointer(0, Kind::String), pointer(8, Kind::Key)] };
+        let mut viewer = DatViewer::default();
+        viewer.set_client_layouts(Some(ClientLayouts { tables: vec![layout] }));
+
+        let misread = table(column("Area", "i32", true));
+        assert_eq!(viewer.client_findings_for(&misread, Some(24)), vec!["byte 8: the client reads a key, the schema has Area ([i32])".to_string()]);
+        assert!(viewer.client_findings_for(&misread, Some(28)).is_empty(), "a client that expects other rows says nothing about this file");
+        assert!(viewer.client_findings_for(&table(column("Area", "foreignrow", false)), Some(24)).is_empty());
+        viewer.set_client_layouts(None);
+        assert!(viewer.client_findings_for(&misread, Some(24)).is_empty());
+    }
+
+    #[test]
+    fn an_empty_table_the_schema_lacks_says_what_is_and_is_not_known() {
+        let [what, why] = empty_table_note("PoE 1", true, None);
+        assert_eq!(what, "An empty table. It has no rows in this patch and is not in the PoE 1 schema.");
+        assert!(why.starts_with("The game client does not load it either"));
+        let layout = TableLayout { table: "MercenaryDisabledUniques".to_string(), row_size: 16, walked: true, pointers: vec![Pointer { offset: 0, kind: Kind::Key, element: None, target: Some("Words".to_string()), proven: true }] };
+        let [_, why] = empty_table_note("PoE 1", true, Some(&layout));
+        assert!(why.starts_with("The game client does load it: rows of 16 bytes, with a key to Words at byte 0."), "{}", why);
+        assert_eq!(empty_table_note("PoE 2", false, None)[1], "With no rows there is nothing to read its columns from.");
     }
 }

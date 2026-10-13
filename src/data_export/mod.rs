@@ -114,9 +114,20 @@ fn scan_patch(log: &str) -> Option<(crate::settings::Game, String)> {
         .last()
 }
 
+/// Creates an export's folder. Windows reports a link whose target is gone as "already exists", so the link is named.
+pub(crate) fn create_out_dir(out: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(out).map_err(|e| match out.ancestors().find(|dir| dir.is_symlink() && !dir.exists()) {
+        Some(link) => {
+            let target = std::fs::read_link(link).map(|target| target.display().to_string()).unwrap_or_default();
+            format!("Could not create {}: {} is a link to {}, which does not exist", out.display(), link.display(), target)
+        }
+        None => format!("Could not create {}: {}", out.display(), e),
+    })
+}
+
 /// Reads the last `limit` bytes of a file; logs grow to hundreds of megabytes
 /// and only the newest lines say which patch is installed.
-fn read_tail(path: &Path, limit: u64) -> std::io::Result<String> {
+pub(crate) fn read_tail(path: &Path, limit: u64) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let size = file.metadata()?.len();
@@ -429,8 +440,8 @@ pub fn run_with(
         (Some(version), false) => out.join(options.folder_name(version)),
         _ => out,
     };
-    if let Err(e) = std::fs::create_dir_all(&out) {
-        let _ = tx.send(ExportStatus::Error(format!("Could not create {}: {}", out.display(), e)));
+    if let Err(e) = create_out_dir(&out) {
+        let _ = tx.send(ExportStatus::Error(e));
         return;
     }
     if let Some(version) = &options.version {

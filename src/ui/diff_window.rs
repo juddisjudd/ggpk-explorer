@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use crate::bundles::index::Index;
 use crate::diff::{DiffEntry, DiffResult, SnapshotMeta};
-use crate::ui::components::modal_section;
+use crate::ui::components::button::{action as action_button, Kind};
+use crate::ui::components::{modal, modal_section};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DiffTab {
@@ -18,6 +19,7 @@ enum DiffTab {
 
 pub struct DiffWindow {
     open: bool,
+    game: crate::settings::Game,
     snapshots: Vec<(PathBuf, SnapshotMeta)>,
     selected: Option<usize>,
     confirm_delete: Option<usize>,
@@ -41,6 +43,7 @@ impl Default for DiffWindow {
     fn default() -> Self {
         Self {
             open: false,
+            game: crate::settings::Game::default(),
             snapshots: Vec::new(),
             selected: None,
             confirm_delete: None,
@@ -84,7 +87,7 @@ impl DiffWindow {
     }
 
     pub fn refresh(&mut self) {
-        self.snapshots = crate::diff::list_snapshots(crate::settings::Game::Poe2);
+        self.snapshots = crate::diff::list_snapshots(self.game);
         if self.selected.map_or(true, |i| i >= self.snapshots.len()) {
             self.selected = if self.snapshots.is_empty() { None } else { Some(0) };
         }
@@ -120,8 +123,9 @@ impl DiffWindow {
         self.snapshot_rx = Some(rx);
         self.status = Some(("Saving snapshot...".to_string(), false));
         let ctx = ctx.clone();
+        let game = self.game;
         std::thread::spawn(move || {
-            let result = crate::diff::take_snapshot(&index, &patch_version, &source, crate::settings::Game::Poe2)
+            let result = crate::diff::take_snapshot(&index, &patch_version, &source, game)
                 .map_err(|e| format!("Snapshot failed: {}", e));
             let _ = tx.send(result);
             ctx.request_repaint();
@@ -309,7 +313,7 @@ impl DiffWindow {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let busy = self.snapshot_rx.is_some() || self.diff_rx.is_some();
-            let snap_btn = ui.add_enabled(index_loaded && !busy, egui::Button::new("Take Snapshot"));
+            let snap_btn = action_button(ui, "Take Snapshot", Kind::Primary, index_loaded && !busy);
             if snap_btn
                 .on_disabled_hover_text("Open a GGPK file or Steam folder first")
                 .clicked()
@@ -317,10 +321,7 @@ impl DiffWindow {
                 action = Some(SnapshotAction::Take);
             }
             let can_compare = index_loaded && !busy && self.selected.is_some();
-            if ui
-                .add_enabled(can_compare, egui::Button::new("Compare with current"))
-                .clicked()
-            {
+            if action_button(ui, "Compare with current", Kind::Secondary, can_compare).clicked() {
                 action = Some(SnapshotAction::Compare(self.selected.unwrap()));
             }
             if busy {
@@ -382,7 +383,7 @@ impl DiffWindow {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("Filter").size(11.0).color(egui::Color32::from_rgb(113, 113, 122)));
-            ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(240.0).hint_text("path contains..."));
+            ui.add(egui::TextEdit::singleline(&mut self.filter).desired_width(240.0).hint_text(crate::ui::components::hint(ui, "path contains...")));
         });
         ui.add_space(4.0);
 
@@ -455,9 +456,18 @@ impl DiffWindow {
         &mut self,
         ctx: &egui::Context,
         current_index: &Option<Arc<Index>>,
+        game: crate::settings::Game,
         patch_version: &str,
         source: &str,
     ) {
+        if self.game != game {
+            self.game = game;
+            self.selected = None;
+            self.confirm_delete = None;
+            self.result = None;
+            self.cache_valid = false;
+            self.refresh();
+        }
         if !self.open {
             return;
         }
@@ -467,27 +477,32 @@ impl DiffWindow {
         let mut pending: Option<SnapshotAction> = None;
 
         egui::Window::new("Patch Diff")
-            .open(&mut open)
+            .title_bar(false)
+            .frame(modal::frame(ctx.style().visuals.dark_mode))
             .collapsible(false)
             .resizable(true)
             .default_size([860.0, 560.0])
             .show(ctx, |ui| {
                 ui.spacing_mut().item_spacing.y = 5.0;
-
-                pending = self.show_snapshot_list(ui, current_index.is_some());
-
-                if let Some((msg, is_error)) = &self.status {
-                    let color = if *is_error {
-                        egui::Color32::from_rgb(239, 68, 68)
-                    } else {
-                        egui::Color32::from_rgb(113, 113, 122)
-                    };
-                    ui.label(egui::RichText::new(msg).size(11.0).color(color));
+                if modal::header(ui, "Patch Diff") {
+                    open = false;
                 }
+                egui::Frame::none().inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 2.0, bottom: 14.0 }).show(ui, |ui| {
+                    pending = self.show_snapshot_list(ui, current_index.is_some());
 
-                if self.result.is_some() {
-                    self.show_results(ui, current_index);
-                }
+                    if let Some((msg, is_error)) = &self.status {
+                        let color = if *is_error {
+                            egui::Color32::from_rgb(239, 68, 68)
+                        } else {
+                            egui::Color32::from_rgb(113, 113, 122)
+                        };
+                        ui.label(egui::RichText::new(msg).size(11.0).color(color));
+                    }
+
+                    if self.result.is_some() {
+                        self.show_results(ui, current_index);
+                    }
+                });
             });
         self.open = open;
 

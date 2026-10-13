@@ -18,38 +18,52 @@ impl PremiumDarkTheme {
         let selection = Color::from_rgb(34, 34, 39);
 
         visuals.panel_fill = bg_primary;
-        visuals.window_fill = bg_primary;
+        visuals.window_fill = Color::from_rgb(18, 18, 21);
         visuals.extreme_bg_color = bg_tertiary;
         visuals.faint_bg_color = bg_secondary;
         visuals.override_text_color = Some(text_primary);
-        visuals.window_rounding = egui::Rounding::same(6.0);
+        visuals.window_rounding = egui::Rounding::same(10.0);
+        visuals.menu_rounding = egui::Rounding::same(8.0);
         visuals.window_shadow = egui::Shadow {
-            offset: egui::vec2(0.0, 4.0),
-            blur: 18.0,
+            offset: egui::vec2(0.0, 14.0),
+            blur: 40.0,
             spread: 0.0,
-            color: egui::Color32::from_black_alpha(72),
+            color: egui::Color32::from_black_alpha(150),
         };
-        visuals.window_stroke = egui::Stroke::new(1.0_f32, border);
+        visuals.popup_shadow = egui::Shadow {
+            offset: egui::vec2(0.0, 8.0),
+            blur: 24.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(112),
+        };
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(44, 44, 50));
 
         visuals.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
         visuals.widgets.noninteractive.bg_fill = bg_secondary;
         visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border);
         visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_muted);
 
-        visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.inactive.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.inactive.weak_bg_fill = Color::from_rgb(26, 26, 30);
         visuals.widgets.inactive.bg_fill = bg_secondary;
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(44, 44, 50));
         visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
-        visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.hovered.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.hovered.weak_bg_fill = Color::from_rgb(36, 36, 41);
         visuals.widgets.hovered.bg_fill = bg_hover;
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, border_strong);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(68, 68, 76));
         visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
-        visuals.widgets.active.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.active.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.active.weak_bg_fill = Color::from_rgb(46, 46, 52);
         visuals.widgets.active.bg_fill = selection;
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, border_strong);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(68, 68, 76));
         visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
+
+        visuals.widgets.open.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.open.weak_bg_fill = Color::from_rgb(36, 36, 41);
+        visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(68, 68, 76));
 
         visuals.selection.bg_fill = selection;
         visuals.selection.stroke = egui::Stroke::new(1.0_f32, border_strong);
@@ -123,38 +137,52 @@ impl PremiumLightTheme {
         let selection = Color::from_rgb(220, 225, 238);
 
         visuals.panel_fill = bg_primary;
-        visuals.window_fill = bg_primary;
+        visuals.window_fill = Color::from_rgb(255, 255, 255);
         visuals.extreme_bg_color = bg_tertiary;
         visuals.faint_bg_color = bg_secondary;
         visuals.override_text_color = Some(text_primary);
-        visuals.window_rounding = egui::Rounding::same(6.0);
+        visuals.window_rounding = egui::Rounding::same(10.0);
+        visuals.menu_rounding = egui::Rounding::same(8.0);
         visuals.window_shadow = egui::Shadow {
-            offset: egui::vec2(0.0, 4.0),
-            blur: 18.0,
+            offset: egui::vec2(0.0, 14.0),
+            blur: 40.0,
             spread: 0.0,
-            color: egui::Color32::from_black_alpha(20),
+            color: egui::Color32::from_black_alpha(44),
         };
-        visuals.window_stroke = egui::Stroke::new(1.0_f32, border);
+        visuals.popup_shadow = egui::Shadow {
+            offset: egui::vec2(0.0, 8.0),
+            blur: 24.0,
+            spread: 0.0,
+            color: egui::Color32::from_black_alpha(33),
+        };
+        visuals.window_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(206, 206, 214));
 
         visuals.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
         visuals.widgets.noninteractive.bg_fill = bg_secondary;
         visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, border);
         visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_muted);
 
-        visuals.widgets.inactive.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.inactive.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.inactive.weak_bg_fill = Color::from_rgb(255, 255, 255);
         visuals.widgets.inactive.bg_fill = bg_secondary;
-        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border);
+        visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(206, 206, 214));
         visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
-        visuals.widgets.hovered.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.hovered.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.hovered.weak_bg_fill = Color::from_rgb(240, 240, 245);
         visuals.widgets.hovered.bg_fill = bg_hover;
-        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, border_strong);
+        visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(176, 176, 186));
         visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
-        visuals.widgets.active.rounding = egui::Rounding::same(4.0);
+        visuals.widgets.active.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.active.weak_bg_fill = Color::from_rgb(228, 228, 236);
         visuals.widgets.active.bg_fill = selection;
-        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, border_strong);
+        visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(176, 176, 186));
         visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
+
+        visuals.widgets.open.rounding = egui::Rounding::same(5.0);
+        visuals.widgets.open.weak_bg_fill = Color::from_rgb(240, 240, 245);
+        visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, Color::from_rgb(176, 176, 186));
 
         visuals.selection.bg_fill = selection;
         visuals.selection.stroke = egui::Stroke::new(1.0_f32, border_strong);

@@ -84,7 +84,7 @@ USAGE:
     ggpk-explorer export-tree [OPTIONS]    Write Path of Building's passive tree folders (src/TreeData)
     ggpk-explorer export-tables [OPTIONS]  Write every DAT table whole, as JSON and/or CSV
     ggpk-explorer refit [OPTIONS]          Re-derive drifted table layouts from an earlier patch
-    ggpk-explorer lint [OPTIONS]           Check the schema.s references and enums against the game files
+    ggpk-explorer lint [OPTIONS]           Check the schema's references and enums against the game files
     ggpk-explorer patch-check [OPTIONS]    Check a patch, re-fit the tables it moved, compare exports
 
 EXPORT OPTIONS:
@@ -146,6 +146,7 @@ LINT OPTIONS:
         --schema <FILE>    Schema to check (default: the cached schema.min.json)
         --suggest          Also rank target tables for references the schema leaves untargeted
         --ggpk / --steam   as above
+        --poe1 / --poe2    Which game to read (default: the one the install's log names)
 
 PATCH-CHECK OPTIONS:
     Keeps the patch's tables, retires earlier re-fits the community schema now
@@ -637,7 +638,8 @@ fn cdn_patch_version(explicit: Option<String>, settings: &AppSettings, game: Gam
         return Ok(version);
     }
     match settings.patch_version(game) {
-        "" => AppSettings::fetch_latest_patch_version(game, &settings.patch_version_source_url)
+        "" => crate::patch_server::live(game, settings.patch_protocol(game))
+            .map(|patch| patch.version)
             .map_err(|e| format!("Could not ask which {} patch is live: {}", game.label(), e)),
         saved => Ok(saved.to_string()),
     }
@@ -646,6 +648,17 @@ fn cdn_patch_version(explicit: Option<String>, settings: &AppSettings, game: Gam
 fn install_root(ggpk: Option<&str>, steam: Option<&str>) -> Option<std::path::PathBuf> {
     let path = ggpk.or(steam)?;
     std::path::Path::new(path).parent().map(|p| p.to_path_buf())
+}
+
+/// Refuses to read an install as the other game, which would clear that game's caches for a patch they never held.
+fn check_game(ggpk: Option<&str>, steam: Option<&str>, game: Game) -> Result<(), String> {
+    match install_root(ggpk, steam).as_deref().and_then(crate::data_export::detect_game) {
+        Some(found) if found != game => {
+            let flag = if found.is_poe2() { "--poe2" } else { "--poe1" };
+            Err(format!("This install's client log names {}, but it is being read as {}. Pass {}.", found.label(), game.label(), flag))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn load_schema(path: Option<String>) -> Result<crate::dat::schema::Schema, String> {
@@ -704,6 +717,7 @@ fn open_source(
             let index = crate::bundles::index::Index::from_ggpk_records(&reader);
             return Ok((Some(reader), None, index));
         }
+        check_game(Some(&path), None, game)?;
         sync_caches_to_install(Some(&path), None, game);
         let cache = AppSettings::index_cache_path(game);
         if let Ok(mut index) = crate::bundles::index::Index::load_from_cache(&cache) {
@@ -726,6 +740,7 @@ fn open_source(
 
     if let Some(dir) = steam {
         println!("Opening Steam bundles at {}", dir);
+        check_game(None, Some(&dir), game)?;
         sync_caches_to_install(None, Some(&dir), game);
         let loader = crate::bundles::steam::SteamBundleLoader::new(std::path::PathBuf::from(&dir));
         let bytes = loader.load_index_bytes().map_err(|e| format!("Failed to read _.index.bin: {}", e))?;
@@ -895,6 +910,14 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     println!("Re-fitting {} table(s): {}\n", names.len(), names.join(", "));
+    let client = match new_version.as_deref().map(|v| crate::dat::exe_layout::for_patch(&new_files, game, v)) {
+        Some(Ok(layouts)) => Some(layouts),
+        Some(Err(why)) => {
+            println!("No table layouts from the game client, so values alone place the columns: {}\n", why);
+            None
+        }
+        None => None,
+    };
 
     let mut overrides = crate::dat::overrides::Overrides::load(&crate::dat::overrides::Overrides::default_path());
     let mut written = 0;
@@ -912,8 +935,18 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
             unresolved.push(name);
             continue;
         };
-        use crate::dat::refit::{refit_file, RefitError, Refitted};
-        let refitted = refit_file(old_bytes, new_bytes, &file, def);
+        use crate::dat::refit::{refit_file, repair_from_client, RefitError, Refitted};
+        let refitted = match refit_file(old_bytes, new_bytes.clone(), &file, def, client.as_ref()) {
+            // A layout neither patch reads right has nothing to carry, so the client's own reading is what is left.
+            Err(RefitError::OldDoesNotFit) => match client.as_ref().map(|client| repair_from_client(new_bytes, &file, def, client)) {
+                Some(Ok(repaired)) if !repaired.after.is_broken() => {
+                    println!("{}: the schema does not fit patch {} either, so its columns were lined up with the game client's reading", name, old_version);
+                    Ok(repaired)
+                }
+                _ => Err(RefitError::OldDoesNotFit),
+            },
+            other => other,
+        };
         if let Err(RefitError::OldDoesNotFit) = refitted {
             let overridden = overrides.tables.iter().any(|t| t.name.eq_ignore_ascii_case(name));
             println!(
@@ -961,7 +994,7 @@ pub fn run_refit(args: &[String]) -> Result<(), String> {
                     false => {
                         println!("  the re-fitted layout reads cleanly");
                         if write {
-                            overrides.upsert(report.table.clone());
+                            overrides.upsert(crate::dat::schema::Table { valid_for: Some(crate::dat::schema::game_mask(is_poe2)), ..report.table.clone() });
                             written += 1;
                         }
                     }
@@ -1044,10 +1077,11 @@ pub fn run_patch_check(args: &[String]) -> Result<(), String> {
 
     // `--cdn` alone means the patch that is live right now.
     let cdn_version = match cdn_version {
-        Some(None) => Some(Some(
-            AppSettings::fetch_latest_patch_version(requested_game.unwrap_or_default(), &settings.patch_version_source_url)
-                .map_err(|e| format!("Could not ask which patch is live: {}", e))?,
-        )),
+        Some(None) => {
+            let game = requested_game.unwrap_or_default();
+            let live = crate::patch_server::live(game, settings.patch_protocol(game)).map_err(|e| format!("Could not ask which {} patch is live: {}", game.label(), e))?;
+            Some(Some(live.version))
+        }
         other => other,
     };
     let cdn_version = cdn_version.flatten();
@@ -1139,7 +1173,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
     let mut ggpk: Option<String> = None;
     let mut steam: Option<String> = None;
     let mut schema_path: Option<String> = None;
-    let mut is_poe2 = true;
+    let mut requested_game: Option<Game> = None;
     let mut suggest = false;
 
     let mut i = 0;
@@ -1153,7 +1187,8 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
             "--ggpk" => ggpk = Some(value(&mut i)?),
             "--steam" => steam = Some(value(&mut i)?),
             "--schema" => schema_path = Some(value(&mut i)?),
-            "--poe1" => is_poe2 = false,
+            "--poe1" => requested_game = Some(Game::Poe1),
+            "--poe2" => requested_game = Some(Game::Poe2),
             "--suggest" => suggest = true,
             "-h" | "--help" => {
                 println!("{}", USAGE);
@@ -1166,9 +1201,11 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
 
     let settings = AppSettings::load();
     let schema = load_schema(schema_path.or_else(|| settings.schema_local_path.clone()))?;
-    let game = Game::from_is_poe2(is_poe2);
-    let ggpk = ggpk.or_else(|| if steam.is_some() { None } else { settings.ggpk_path_for(game).cloned() });
-    let steam = steam.or_else(|| if ggpk.is_some() { None } else { settings.steam_path_for(game).cloned() });
+    let defaults = requested_game.unwrap_or_default();
+    let ggpk = ggpk.or_else(|| if steam.is_some() { None } else { settings.ggpk_path_for(defaults).cloned() });
+    let steam = steam.or_else(|| if ggpk.is_some() { None } else { settings.steam_path_for(defaults).cloned() });
+    let game = resolve_game(requested_game, ggpk.as_deref(), steam.as_deref(), None);
+    let (is_poe2, dir) = (game.is_poe2(), crate::dat::table_store::table_dir(game));
     let patch = install_root(ggpk.as_deref(), steam.as_deref()).as_deref().and_then(crate::data_export::detect_version);
     let (reader, steam_loader, index) = open_source(ggpk, steam, None, game)?;
     let files = GameFiles::new(reader, Arc::new(index), steam_loader, None);
@@ -1178,9 +1215,9 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
     // the reference checks measure against.
     let mut readers: Vec<(String, crate::dat::reader::DatReader)> = Vec::new();
     let mut row_counts: HashMap<String, u32> = HashMap::new();
-    for path in files.list_dir("data/balance/") {
+    for path in files.list_dir(dir) {
         let lower = path.to_ascii_lowercase();
-        let Some(rest) = lower.strip_prefix("data/balance/") else { continue };
+        let Some(rest) = lower.strip_prefix(dir) else { continue };
         if rest.contains('/') || !rest.ends_with(".datc64") {
             continue;
         }
@@ -1191,7 +1228,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
         readers.push((name, dat));
     }
     readers.sort_by(|a, b| a.0.cmp(&b.0));
-    println!("Checking {} tables", readers.len());
+    println!("Checking {} {} tables", readers.len(), game.label());
 
     let mut findings = Vec::new();
     let mut skipped = 0;
@@ -1209,7 +1246,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
         use crate::dat::analysis::{foreign_key_stats, has_unresolved_foreign, is_foreign, rank_targets, TableStats};
         let tables: Vec<TableStats> = readers
             .iter()
-            .map(|(n, d)| TableStats { path: format!("data/balance/{}.datc64", n), row_count: d.row_count })
+            .map(|(n, d)| TableStats { path: format!("{}{}.datc64", dir, n), row_count: d.row_count })
             .collect();
         let mut lines: Vec<(f32, String)> = Vec::new();
         for (name, dat) in &readers {
@@ -1217,7 +1254,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
             if dat.row_count == 0 || !has_unresolved_foreign(def) || crate::dat::analysis::check_fit(dat, def, 40).is_broken() {
                 continue;
             }
-            let path = format!("data/balance/{}.datc64", name);
+            let path = format!("{}{}.datc64", dir, name);
             let stats = foreign_key_stats(dat, def);
             for (ci, col) in def.columns.iter().enumerate() {
                 if !is_foreign(col) || col.references.is_some() {
@@ -1227,7 +1264,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
                 if st.non_null == 0 {
                     continue;
                 }
-                let ranked = rank_targets(&st, &tables, "data/balance", "datc64", &path, 8, col.name.as_deref());
+                let ranked = rank_targets(&st, &tables, dir.trim_end_matches('/'), "datc64", &path, 8, col.name.as_deref());
                 let Some(best) = ranked.first() else { continue };
                 let candidates: Vec<String> =
                     ranked.iter().map(|c| format!("{} ({} rows, fit {:.2})", c.stem, c.row_count, c.fit)).collect();
