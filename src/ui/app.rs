@@ -241,6 +241,8 @@ impl ExplorerApp {
         }
         self.settings.game = game;
         self.settings.save();
+        // A file open in one game is not in the other's index.
+        self.selected_file = None;
         if let Some(p) = steam {
             self.reader = None;
             let loader = crate::bundles::steam::SteamBundleLoader::new(p.clone());

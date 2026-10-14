@@ -60,11 +60,10 @@ pub struct ContentView {
     room_viewer_state: HashMap<u64, crate::ui::room_viewer::RoomViewerState>,
     /// JSON body (after any `version` header) of `.mat/.env/.atl/.pet` files; `None` when not JSON.
     structured_json: HashMap<u64, Option<(String, std::sync::Arc<serde_json::Value>)>>,
-    /// Downscaled texture previews by path (`None` = could not decode), oldest first in `thumb_order`.
-    thumb_cache: HashMap<String, Option<egui::TextureHandle>>,
-    thumb_order: Vec<String>,
-    thumb_pending: std::collections::HashSet<String>,
-    thumb_rx: Option<std::sync::mpsc::Receiver<Vec<(String, Option<egui::ColorImage>)>>>,
+    /// Downscaled texture previews by path.
+    thumbs: Background<egui::ColorImage, egui::TextureHandle>,
+    /// What each material gives the 3D preview, by material path.
+    mesh_textures: Background<crate::ui::mesh_preview::Material, std::sync::Arc<crate::ui::mesh_preview::Material>>,
     /// Drawable geometry per model file; `None` when the file has no vertices.
     mesh_cache: HashMap<u64, Option<std::sync::Arc<crate::ui::mesh_preview::MeshData>>>,
     mesh_view_state: HashMap<u64, crate::ui::mesh_preview::MeshPreviewState>,
@@ -179,10 +178,8 @@ impl Default for ContentView {
             room_cache: HashMap::new(),
             room_viewer_state: HashMap::new(),
             structured_json: HashMap::new(),
-            thumb_cache: HashMap::new(),
-            thumb_order: Vec::new(),
-            thumb_pending: std::collections::HashSet::new(),
-            thumb_rx: None,
+            thumbs: Background::new(96),
+            mesh_textures: Background::new(24),
             mesh_cache: HashMap::new(),
             mesh_view_state: HashMap::new(),
             skinned_mesh_cache: HashMap::new(),
@@ -326,7 +323,8 @@ impl ContentView {
         }
 
         self.poll_load(ui.ctx());
-        self.poll_thumbnails(ui.ctx());
+        self.thumbs.poll(ui.ctx(), |path, image| ui.ctx().load_texture(format!("thumb:{}", path), image, egui::TextureOptions::LINEAR));
+        self.mesh_textures.poll(ui.ctx(), |_, material| std::sync::Arc::new(material));
         self.poll_tree_export();
         if let Some(rx) = &self.psg_texture_rx {
             if let Ok(batch) = rx.try_recv() {
@@ -598,7 +596,9 @@ impl ContentView {
                                      match (&mesh, summary_view) {
                                          (Some(mesh), false) => {
                                              let state = self.mesh_view_state.entry(hash).or_default();
-                                             crate::ui::mesh_preview::MeshPreview::show(ui, hash, mesh, state);
+                                             let mut wanted = Vec::new();
+                                             crate::ui::mesh_preview::MeshPreview::show(ui, hash, mesh, state, &self.mesh_textures.cache, &mut wanted);
+                                             self.ensure_mesh_textures(reader.clone(), index, wanted);
                                          }
                                          _ => crate::ui::model_viewer::ModelViewer::show(ui, &file_info.path, &model, &summary),
                                      }
@@ -813,6 +813,7 @@ impl ContentView {
                                                         }
                                                     });
                                                     let mut wanted_thumbs: Vec<String> = Vec::new();
+                                                    let mut wanted_mesh_textures: Vec<String> = Vec::new();
                                                     let opened = if raw {
                                                         self.show_linked_text(ui, hash, &text)
                                                     } else {
@@ -857,7 +858,7 @@ impl ContentView {
                                                                 match self.skinned_mesh_cache[&hash].clone() {
                                                                     Ok(sm) => {
                                                                         let state = self.mesh_view_state.entry(hash).or_default();
-                                                                        crate::ui::skinned_mesh_viewer::SkinnedMeshViewer::show(ui, hash, &sm, state)
+                                                                        crate::ui::skinned_mesh_viewer::SkinnedMeshViewer::show(ui, hash, &sm, state, &self.mesh_textures.cache, &mut wanted_mesh_textures)
                                                                     }
                                                                     Err(e) => {
                                                                         ui.colored_label(egui::Color32::from_rgb(245, 158, 11), format!("Could not read the skinned mesh: {}", e));
@@ -866,7 +867,7 @@ impl ContentView {
                                                                 }
                                                             }
                                                             "mat" => match self.structured_json(hash, &text) {
-                                                                Some((_, doc)) => crate::ui::material_viewer::MaterialViewer::show(ui, hash, &doc, &self.thumb_cache, &mut wanted_thumbs),
+                                                                Some((_, doc)) => crate::ui::material_viewer::MaterialViewer::show(ui, hash, &doc, &self.thumbs.cache, &mut wanted_thumbs),
                                                                 None => self.show_linked_text(ui, hash, &text),
                                                             },
                                                             "atl" => match self.structured_json(hash, &text) {
@@ -889,9 +890,8 @@ impl ContentView {
                                                             },
                                                         }
                                                     };
-                                                    if !wanted_thumbs.is_empty() {
-                                                        self.ensure_thumbnails(reader.clone(), index, wanted_thumbs);
-                                                    }
+                                                    self.ensure_thumbnails(reader.clone(), index, wanted_thumbs);
+                                                    self.ensure_mesh_textures(reader.clone(), index, wanted_mesh_textures);
                                                     if let Some(p) = opened {
                                                         self.open_path(index, &p);
                                                     }
@@ -2163,49 +2163,22 @@ impl ContentView {
 
     /// Starts decoding texture previews in the background (one batch at a time).
     fn ensure_thumbnails(&mut self, reader: Option<std::sync::Arc<GgpkReader>>, index: &std::sync::Arc<crate::bundles::index::Index>, paths: Vec<String>) {
-        if self.thumb_rx.is_some() {
-            return;
-        }
-        let missing: Vec<String> = paths.into_iter().filter(|p| !self.thumb_cache.contains_key(p) && !self.thumb_pending.contains(p)).collect();
-        if missing.is_empty() {
-            return;
-        }
-        for p in &missing {
-            self.thumb_pending.insert(p.clone());
-        }
+        let Some((missing, tx)) = self.thumbs.start(paths) else { return };
         let index = index.clone();
         let steam = self.steam_loader.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.thumb_rx = Some(rx);
         std::thread::spawn(move || {
-            let batch = fetch_thumbnails(reader.as_deref(), &index, steam.as_ref(), missing, 192);
-            let _ = tx.send(batch);
+            let _ = tx.send(fetch_thumbnails(reader.as_deref(), &index, steam.as_ref(), missing, 192));
         });
     }
 
-    fn poll_thumbnails(&mut self, ctx: &egui::Context) {
-        let Some(rx) = &self.thumb_rx else { return };
-        match rx.try_recv() {
-            Ok(batch) => {
-                self.thumb_rx = None;
-                for (path, img) in batch {
-                    self.thumb_pending.remove(&path);
-                    let handle = img.map(|i| ctx.load_texture(format!("thumb:{}", path), i, egui::TextureOptions::LINEAR));
-                    self.thumb_cache.insert(path.clone(), handle);
-                    self.thumb_order.push(path);
-                }
-                while self.thumb_order.len() > 96 {
-                    let old = self.thumb_order.remove(0);
-                    self.thumb_cache.remove(&old);
-                }
-                ctx.request_repaint();
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.thumb_rx = None;
-                self.thumb_pending.clear();
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-        }
+    /// Starts reading materials and decoding the textures each names, for the 3D preview.
+    fn ensure_mesh_textures(&mut self, reader: Option<std::sync::Arc<GgpkReader>>, index: &std::sync::Arc<crate::bundles::index::Index>, materials: Vec<String>) {
+        let Some((missing, tx)) = self.mesh_textures.start(materials) else { return };
+        let index = index.clone();
+        let steam = self.steam_loader.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch_mesh_textures(reader.as_deref(), &index, steam.as_ref(), missing));
+        });
     }
 
     /// Opens a game file named inside another file (a link click in any viewer).
@@ -2668,6 +2641,103 @@ fn json_body(text: &str) -> Option<(String, serde_json::Value)> {
     Some((header.join(" · "), value))
 }
 
+type Batch<D> = Vec<(String, Option<D>)>;
+
+/// What a worker thread decodes one batch at a time, kept by path (`None` = it could not be decoded), the oldest dropped past `limit`.
+struct Background<D, T> {
+    cache: HashMap<String, Option<T>>,
+    order: Vec<String>,
+    pending: std::collections::HashSet<String>,
+    rx: Option<std::sync::mpsc::Receiver<Batch<D>>>,
+    limit: usize,
+}
+
+impl<D, T> Background<D, T> {
+    fn new(limit: usize) -> Self {
+        Self { cache: HashMap::new(), order: Vec::new(), pending: std::collections::HashSet::new(), rx: None, limit }
+    }
+
+    /// The paths neither decoded nor on their way, and where to send them once decoded; `None` while a batch is out.
+    fn start(&mut self, paths: Vec<String>) -> Option<(Vec<String>, std::sync::mpsc::Sender<Batch<D>>)> {
+        if self.rx.is_some() {
+            return None;
+        }
+        let mut missing: Vec<String> = paths.into_iter().filter(|p| !self.cache.contains_key(p) && !self.pending.contains(p)).collect();
+        missing.sort();
+        missing.dedup();
+        if missing.is_empty() {
+            return None;
+        }
+        self.pending.extend(missing.iter().cloned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.rx = Some(rx);
+        Some((missing, tx))
+    }
+
+    fn poll(&mut self, ctx: &egui::Context, keep: impl Fn(&str, D) -> T) {
+        let Some(rx) = &self.rx else { return };
+        // A finished batch raises no input event, so the wait for one has to ask for its own frames.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        match rx.try_recv() {
+            Ok(batch) => {
+                self.rx = None;
+                for (path, decoded) in batch {
+                    self.pending.remove(&path);
+                    let kept = decoded.map(|decoded| keep(&path, decoded));
+                    self.cache.insert(path.clone(), kept);
+                    self.order.push(path);
+                }
+                while self.order.len() > self.limit {
+                    let old = self.order.remove(0);
+                    self.cache.remove(&old);
+                }
+                ctx.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.rx = None;
+                self.pending.clear();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+}
+
+/// What each material gives the 3D preview: its colour texture and its surface map, decoded.
+fn fetch_mesh_textures(
+    reader: Option<&GgpkReader>,
+    index: &crate::bundles::index::Index,
+    steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
+    materials: Vec<String>,
+) -> Batch<crate::ui::mesh_preview::Material> {
+    use crate::ui::material_viewer::{colour_texture, is_opaque, is_shadow_only, surface_texture};
+    use crate::ui::mesh_preview::{Material, MeshTexture};
+    // PoE 2 keeps some textures only as a `.dds.header` stub of their smallest mips.
+    let decode = |texture: &str| {
+        let info = resolve_texture_path(index, texture).or_else(|| find_file_info_by_path(index, &format!("{}.header", texture)))?;
+        decode_dds_rgba(dds_payload(&extract_bundle_file_sync(info, index, reader, steam_loader)?))
+    };
+    materials
+        .into_iter()
+        .map(|material| {
+            let doc = find_file_info_by_path(index, &material)
+                .and_then(|info| extract_bundle_file_sync(info, index, reader, steam_loader))
+                .and_then(|bytes| json_body(&crate::parsers::utils::decode_text_lossy(&bytes)));
+            let read = doc.map(|(_, doc)| {
+                let colour = colour_texture(&doc).and_then(|texture| decode(&texture)).map(|mut image| {
+                    // An opaque material keeps something other than coverage in its colour texture's alpha channel.
+                    if is_opaque(&doc) {
+                        image.pixels_mut().for_each(|pixel| pixel.0[3] = 255);
+                    }
+                    MeshTexture::new(&image)
+                });
+                let surface = surface_texture(&doc).and_then(|(texture, packing)| Some((MeshTexture::new(&decode(&texture)?), packing)));
+                Material { colour, surface, hidden: is_shadow_only(&doc) }
+            });
+            (material, read)
+        })
+        .collect()
+}
+
 /// Small RGBA previews for texture paths, decoded without touching the on-disk art cache.
 fn fetch_thumbnails(
     reader: Option<&GgpkReader>,
@@ -2675,7 +2745,7 @@ fn fetch_thumbnails(
     steam_loader: Option<&crate::bundles::steam::SteamBundleLoader>,
     paths: Vec<String>,
     max_px: u32,
-) -> Vec<(String, Option<egui::ColorImage>)> {
+) -> Batch<egui::ColorImage> {
     paths
         .into_iter()
         .map(|path| {

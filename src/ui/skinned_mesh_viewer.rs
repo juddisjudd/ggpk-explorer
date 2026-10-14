@@ -2,7 +2,7 @@
 
 use crate::parsers::sm::SmFile;
 use crate::ui::links;
-use crate::ui::mesh_preview::{MeshData, MeshPreview, MeshPreviewState};
+use crate::ui::mesh_preview::{Materials, MeshData, MeshPreview, MeshPreviewState};
 use crate::ui::object_viewer::Loader;
 use eframe::egui::{self, Color32, RichText};
 
@@ -19,7 +19,11 @@ impl SkinnedMesh {
         let mesh = loader(&smd)
             .ok_or_else(|| format!("{} is not in the index", smd))
             .and_then(|bytes| crate::parsers::model::parse_model(&smd, &bytes))
-            .and_then(|model| crate::ui::mesh_preview::extract(&model).ok_or_else(|| format!("{} has no vertices", smd)));
+            .and_then(|model| crate::ui::mesh_preview::extract(&model).ok_or_else(|| format!("{} has no vertices", smd)))
+            .map(|mut mesh| {
+                mesh.set_materials(file.materials.iter().map(|m| (m.mat_file.as_deref(), m.shape_count as usize)));
+                mesh
+            });
         Ok(Self { file, mesh })
     }
 }
@@ -28,7 +32,7 @@ pub struct SkinnedMeshViewer;
 
 impl SkinnedMeshViewer {
     /// Returns a path when a link is clicked.
-    pub fn show(ui: &mut egui::Ui, id: u64, sm: &SkinnedMesh, state: &mut MeshPreviewState) -> Option<String> {
+    pub fn show(ui: &mut egui::Ui, id: u64, sm: &SkinnedMesh, state: &mut MeshPreviewState, materials: &Materials, wanted: &mut Vec<String>) -> Option<String> {
         let mut opened = None;
         egui::SidePanel::left(egui::Id::new(("sm_details", id))).resizable(true).default_width(360.0).show_inside(ui, |ui| {
             egui::ScrollArea::both().id_salt(("sm_details_scroll", id)).auto_shrink([false, false]).show(ui, |ui| {
@@ -36,7 +40,7 @@ impl SkinnedMeshViewer {
             });
         });
         match &sm.mesh {
-            Ok(mesh) => MeshPreview::show(ui, id, mesh, state),
+            Ok(mesh) => MeshPreview::show(ui, id, mesh, state, materials, wanted),
             Err(e) => {
                 ui.colored_label(Color32::from_rgb(245, 158, 11), format!("Could not draw the mesh: {}", e));
             }

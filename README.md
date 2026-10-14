@@ -39,12 +39,12 @@ Every file reference inside any viewer is a link that opens that file: a `.dds` 
 - **Particles & trails** (`.pet`, `.trl`): Every keyframe and sampled curve plotted per emitter or trail block.
 - **Dungeon graphs** (`.dgr`): The room grid drawn with its nodes and connections; click a node for its details and room sets.
 - **Rooms** (`.arm`): The slot grid with ground types, doodads, decals, zones and points of interest; click a doodad or decal to open its file, or a slot for its edge and ground files.
-- **Skinned meshes** (`.sm`): The `.smd` it wraps in the 3D preview, with the material for each run of shapes (click a shape to isolate it), the bounding box and the bone groups.
+- **Skinned meshes** (`.sm`): The `.smd` it wraps in the 3D preview, drawn with the material for each run of shapes (click a shape to isolate it), beside the bounding box and the bone groups.
 - **PSG (skill trees)**: Renders the character, atlas, Chayula and Royale skill graphs the way the game lays them out, with every asset taken from the GGPK: centre ring and class illustration, class-start plates, ascendancy plates relocated onto the outer ring (with a class/ascendancy picker that dims the others), textured orbit arcs and connectors from the game's sprite sheets, per-context node frames (character/ascendancy/atlas/Breach, plus per-node overrides), group backgrounds, atlas subtree art and blockers. Hover any node for its name, stats and flavour text.
 - **JSON**: Interactive, collapsible tree viewer (`.json`, `.hideout`, `.env`, JSON-bodied `.pet`) with file links, colour swatches and inline plots for `points` curves.
 - **Shaders**: Syntax-highlighted view for `.hlsl`, `.fx`, `.vshader`, `.pshader`.
 - **Text / Config**: Every other PoE text format (`.tst`, `.rs`, `.mtd`, `.tsi`, `.amd`, `.ui`, …) in a filterable view with file references as links and a Raw toggle for the plain editor; UTF-16 with or without a BOM.
-- **Models**: `.fmt` / `.tgm` meshes and `.smd` skinned meshes in a 3D preview (orbit, zoom, pan, wireframe, per-shape selection), `.ast` skeletons as bone lines, plus the structured summary with geometry stats and full JSON export.
+- **Models**: `.fmt` / `.tgm` meshes and `.smd` skinned meshes in a 3D preview (orbit, zoom, pan, wireframe, per-shape selection), drawn the right way up with each shape's colour texture where its material is known. The **Lit** view adds the material's normal, gloss and occlusion maps, a key light you move with shift-drag, and a shadow on the model and on a ground that runs to the horizon. `.ast` skeletons show as bone lines. There is also a structured summary with geometry stats and full JSON export.
 - **DDS headers**: PoE 2 `.dds.header` streaming stubs render as thumbnails.
 - **Hex Viewer**: Adaptive layout for raw binary inspection of any file.
 

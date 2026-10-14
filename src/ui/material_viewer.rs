@@ -31,6 +31,57 @@ pub fn texture_paths(doc: &Value) -> Vec<String> {
     out
 }
 
+/// How a surface map packs its channels, which the name of the graph parameter that samples it tells.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SurfaceMap {
+    /// `NormalGlossAO_TEX`: the normal in red and green, occlusion in blue, gloss in alpha.
+    NormalGlossAo,
+    /// `base_normalspec_texture`: the normal in alpha and green, specular in red.
+    NormalSpec,
+}
+
+/// Each graph parameter's name with the texture it samples and whether it samples it as sRGB.
+fn sampled(doc: &Value) -> impl Iterator<Item = (&str, String, bool)> + '_ {
+    let parameters = doc.get("graphinstances").and_then(|g| g.as_array()).into_iter().flatten().filter_map(|inst| inst.get("custom_parameters")?.as_array()).flatten();
+    parameters.filter_map(|p| {
+        let texture = p.get("parameters")?.as_array()?.iter().find(|value| value.get("path").is_some())?;
+        Some((p.get("name")?.as_str()?, links::normalize(texture.get("path")?.as_str()?), texture.get("srgb").and_then(|s| s.as_bool()) == Some(true)))
+    })
+}
+
+/// The texture a material is coloured by: the one its colour parameter samples, else the first sampled as sRGB, else its first texture.
+pub fn colour_texture(doc: &Value) -> Option<String> {
+    let named = sampled(doc).find(|(name, _, _)| ["base_color_texture", "AlbedoTransparency_TEX"].contains(name));
+    let colour = named.or_else(|| sampled(doc).find(|(_, _, srgb)| *srgb)).map(|(_, path, _)| path);
+    colour.or_else(|| texture_paths(doc).into_iter().next())
+}
+
+/// The map a material's surface detail is packed in, for the two packings the preview reads.
+pub fn surface_texture(doc: &Value) -> Option<(String, SurfaceMap)> {
+    sampled(doc).find_map(|(name, path, _)| match name {
+        "NormalGlossAO_TEX" => Some((path, SurfaceMap::NormalGlossAo)),
+        "base_normalspec_texture" => Some((path, SurfaceMap::NormalSpec)),
+        _ => None,
+    })
+}
+
+/// The file name of each graph the material is built from, in lower case.
+fn graph_names(doc: &Value) -> impl Iterator<Item = String> + '_ {
+    let parents = doc.get("graphinstances").and_then(|g| g.as_array()).into_iter().flatten().filter_map(|inst| inst.get("parent")?.as_str());
+    parents.map(|parent| parent.rsplit('/').next().unwrap_or(parent).to_ascii_lowercase())
+}
+
+/// Whether the material only casts a shadow, so the shapes it covers are never seen.
+pub fn is_shadow_only(doc: &Value) -> bool {
+    graph_names(doc).any(|graph| graph.contains("shadowonly"))
+}
+
+/// Whether the material draws without alpha, so its texture's alpha channel holds something other than coverage.
+pub fn is_opaque(doc: &Value) -> bool {
+    let blend = doc.pointer("/defaultgraph/overriden_blend_mode").and_then(|m| m.as_str());
+    blend.is_none_or(|mode| mode.eq_ignore_ascii_case("Opaque")) && !graph_names(doc).any(|graph| graph.contains("alpha"))
+}
+
 fn value_summary(v: &Value) -> String {
     match v {
         Value::Array(a) => a.iter().map(value_summary).collect::<Vec<_>>().join(", "),
@@ -178,5 +229,43 @@ mod tests {
         let mut paths = texture_paths(&doc);
         paths.sort();
         assert_eq!(paths, vec!["Art/A.dds", "Art/B.dds"]);
+    }
+
+    #[test]
+    fn the_colour_texture_is_the_one_sampled_as_srgb() {
+        let normal_first = json!({
+            "textures": [{ "filename": "Art/Wolfns.dds" }, { "filename": "Art/Wolf_colour.dds" }],
+            "defaultgraph": { "overriden_blend_mode": "Opaque" },
+            "graphinstances": [{ "custom_parameters": [
+                { "name": "base_normalspec_texture", "parameters": [{ "path": "Art/Wolfns.dds", "srgb": false }, {}] },
+                { "name": "base_color_texture", "parameters": [{ "path": "Art/Wolf_colour.dds", "srgb": true }, {}] }
+            ] }]
+        });
+        assert_eq!(colour_texture(&normal_first).as_deref(), Some("Art/Wolf_colour.dds"));
+        assert_eq!(surface_texture(&normal_first), Some(("Art/Wolfns.dds".to_string(), SurfaceMap::NormalSpec)));
+        assert!(is_opaque(&normal_first));
+
+        let glow_first = json!({ "graphinstances": [{ "custom_parameters": [
+            { "name": "SSS_TEX", "parameters": [{ "path": "Art/Twig_sss.dds", "srgb": true }, {}] },
+            { "name": "AlbedoTransparency_TEX", "parameters": [{ "path": "Art/Twig_colour.dds", "srgb": true }, {}] },
+            { "name": "NormalGlossAO_TEX", "parameters": [{ "path": "Art/Twig_normal.dds", "srgb": false }, {}] }
+        ] }] });
+        assert_eq!(colour_texture(&glow_first).as_deref(), Some("Art/Twig_colour.dds"));
+        assert_eq!(surface_texture(&glow_first), Some(("Art/Twig_normal.dds".to_string(), SurfaceMap::NormalGlossAo)));
+
+        let no_graph = json!({ "textures": [{ "filename": "Art/Leaf.dds" }], "defaultgraph": { "overriden_blend_mode": "AlphaTest" } });
+        assert_eq!(colour_texture(&no_graph).as_deref(), Some("Art/Leaf.dds"));
+        assert!(!is_opaque(&no_graph));
+        assert_eq!(colour_texture(&json!({})), None);
+    }
+
+    #[test]
+    fn graphs_say_when_a_material_is_cut_out_or_only_casts_a_shadow() {
+        let shadow = json!({ "graphinstances": [{ "parent": "Metadata/Art/Textures/Misc/black_shadowonlyc.fxgraph" }, { "parent": "Metadata/Effects/Graphs/General/ForceOpaqueShadowOnly.fxgraph" }] });
+        assert!(is_shadow_only(&shadow) && is_opaque(&shadow));
+        let cut_out = json!({ "graphinstances": [{ "parent": "Metadata/Materials/SpecGlossSpecMask.fxgraph" }, { "parent": "Metadata/Effects/Graphs/General/ForceAlphaTestWithShadow.fxgraph" }] });
+        assert!(!is_shadow_only(&cut_out) && !is_opaque(&cut_out));
+        let plain = json!({ "graphinstances": [{ "parent": "Metadata/Effects/Graphs/General/ForceOpaqueNoShadow.fxgraph" }] });
+        assert!(!is_shadow_only(&plain) && is_opaque(&plain));
     }
 }
