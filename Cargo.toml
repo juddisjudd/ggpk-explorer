@@ -36,7 +36,7 @@ chrono = { version = "0.4", features = ["serde"] }
 hound = "3.5.1"
 semver = "1.0"
 open = "5"
-lru = "0.18"
+lru = "0.19"
 regex = "1.12"
 rayon = "1.11"
 memchr = "2.7"
