@@ -1,4 +1,8 @@
 /target
+# The app data folder falls back to the working folder when APPDATA is unset, as on every Linux run
+/cache
+/poe1
+/tables
 *.cache
 /docs
 *.bin

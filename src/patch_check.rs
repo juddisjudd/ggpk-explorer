@@ -40,6 +40,8 @@ pub struct Report {
     pub client: Option<Result<usize, String>>,
     /// Tables the client reads differently from the layout in use, with each difference.
     pub disputed: Vec<(String, Vec<String>)>,
+    /// Disputed tables with a finding the check of `previous` did not list; `None` when that patch was never checked.
+    pub new_disputes: Option<Vec<String>>,
     /// Tables whose rows are not the size the client expects: the client is from another patch.
     pub mismatched: usize,
 }
@@ -75,8 +77,18 @@ impl Report {
         }
         if !self.disputed.is_empty() {
             line.push_str(&format!(", {} read differently by the client", self.disputed.len()));
+            if let (Some(new), Some(before)) = (&self.new_disputes, &self.previous) {
+                match new.len() {
+                    0 => line.push_str(&format!(" (none new since {})", before)),
+                    n => line.push_str(&format!(" ({} new since {})", n, before)),
+                }
+            }
         }
         line
+    }
+
+    pub fn is_new_dispute(&self, table: &str) -> bool {
+        self.new_disputes.as_ref().is_some_and(|new| new.iter().any(|t| t == table))
     }
 
     pub fn lines(&self) -> Vec<String> {
@@ -106,7 +118,8 @@ impl Report {
             out.push(format!("  {} table(s) have rows of a size the client does not expect; is it from another patch?", self.mismatched));
         }
         for (name, found) in &self.disputed {
-            out.push(format!("  the client reads {} differently:", name));
+            let new = if self.is_new_dispute(name) { " (new)" } else { "" };
+            out.push(format!("  the client reads {} differently{}:", name, new));
             out.extend(found.iter().map(|line| format!("    {}", line)));
         }
         out
@@ -127,6 +140,7 @@ impl Report {
             "client_error": self.client.as_ref().and_then(|c| c.as_ref().err()),
             "client_mismatched": self.mismatched,
             "disputed": self.disputed.iter().map(|(n, found)| serde_json::json!({ "table": n, "findings": found })).collect::<Vec<_>>(),
+            "disputed_new": self.new_disputes,
         })
     }
 
@@ -153,15 +167,42 @@ impl Report {
             written: value["written"].as_bool().unwrap_or(false),
             client,
             disputed: rows("disputed").iter().map(|r| (table(r), texts(&r["findings"]))).collect(),
+            new_disputes: value["disputed_new"].as_array().map(|_| texts(&value["disputed_new"])),
             mismatched: value["client_mismatched"].as_u64().unwrap_or(0) as usize,
         })
     }
+
+    /// Disputed tables with a finding that `before` did not list.
+    fn disputes_new_since(&self, before: &Report) -> Vec<String> {
+        self.disputed
+            .iter()
+            .filter(|(name, found)| match before.disputed.iter().find(|(n, _)| n == name) {
+                Some((_, old)) => found.iter().any(|f| !old.contains(f)),
+                None => true,
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    fn compare_with_previous(&mut self, game: Game) {
+        if let Some(before) = self.previous.as_deref().and_then(|v| read(game, v)) {
+            self.new_disputes = Some(self.disputes_new_since(&before));
+        }
+    }
+}
+
+fn read(game: Game, version: &str) -> Option<Report> {
+    let text = std::fs::read_to_string(report_path(game, version)).ok()?;
+    Report::from_json(&serde_json::from_str(&text).ok()?)
 }
 
 /// The last check recorded for a patch.
 pub fn load(game: Game, version: &str) -> Option<Report> {
-    let text = std::fs::read_to_string(report_path(game, version)).ok()?;
-    Report::from_json(&serde_json::from_str(&text).ok()?)
+    let mut report = read(game, version)?;
+    if report.new_disputes.is_none() {
+        report.compare_with_previous(game);
+    }
+    Some(report)
 }
 
 /// Where a patch's check is recorded, beside its kept tables.
@@ -193,6 +234,7 @@ pub fn run(
     let mut report = check(&tables, game, version, community, overrides_path, write, old, client.as_ref().ok())?;
     report.kept = kept;
     report.client = Some(client.map(|c| c.tables.len()));
+    report.compare_with_previous(game);
     let record = report_path(game, version);
     if let Some(dir) = record.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -369,12 +411,39 @@ mod tests {
             written: true,
             client: Some(Ok(801)),
             disputed: vec![("NPCTalk".to_string(), vec!["byte 300: the client reads a key to WorldAreas".to_string()])],
+            new_disputes: Some(Vec::new()),
             mismatched: 2,
         };
         let back = Report::from_json(&report.to_json()).unwrap();
         assert_eq!(back.lines(), Report { kept: None, ..report }.lines());
         assert_eq!((back.checked, back.mismatched, back.written), (823, 2, true));
+        assert_eq!(back.new_disputes, Some(Vec::new()));
         assert!(back.headline().contains("1 re-fitted from 0.5.5.3, 1 repaired from the game client"), "{}", back.headline());
+        assert!(back.headline().ends_with("1 read differently by the client (none new since 0.5.5.3)"), "{}", back.headline());
+    }
+
+    #[test]
+    fn a_dispute_is_new_when_the_last_check_lacked_one_of_its_findings() {
+        let found = |lines: &[&str]| lines.iter().map(|l| l.to_string()).collect::<Vec<_>>();
+        let before = Report {
+            disputed: vec![("Quest".to_string(), found(&["byte 103: a"])), ("MapDeviceRecipes".to_string(), found(&["byte 24: b", "byte 100: c"]))],
+            ..Default::default()
+        };
+        let now = Report {
+            previous: Some("0.5.5.4.2".to_string()),
+            disputed: vec![
+                ("MapDeviceRecipes".to_string(), found(&["byte 100: c"])),
+                ("Quest".to_string(), found(&["byte 103: a", "byte 119: d"])),
+                ("Mods".to_string(), found(&["byte 278: e"])),
+            ],
+            ..Default::default()
+        };
+        let new = now.disputes_new_since(&before);
+        assert_eq!(new, vec!["Quest".to_string(), "Mods".to_string()]);
+        let now = Report { new_disputes: Some(new), ..now };
+        assert!(now.headline().ends_with("(2 new since 0.5.5.4.2)"), "{}", now.headline());
+        assert!(now.is_new_dispute("Mods") && !now.is_new_dispute("MapDeviceRecipes"));
+        assert!(now.lines().contains(&"  the client reads Mods differently (new):".to_string()));
     }
 
     #[test]
@@ -382,7 +451,7 @@ mod tests {
         let old = serde_json::json!({ "version": "3.29.3.3", "previous": null, "checked": 849, "broken": ["MapDeviceLayouts"], "refitted": [], "unresolved": [], "retired": [], "written": false });
         let report = Report::from_json(&old).unwrap();
         assert_eq!(report.broken, vec!["MapDeviceLayouts".to_string()]);
-        assert!(report.client.is_none() && report.disputed.is_empty());
+        assert!(report.client.is_none() && report.disputed.is_empty() && report.new_disputes.is_none());
     }
 }
 

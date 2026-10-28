@@ -936,6 +936,8 @@ pub struct OrderReport {
     /// Offsets into the middle of an earlier value or outside the section,
     /// per column index, with how many values that column read.
     pub stray: Vec<(usize, usize, usize)>,
+    /// Empty lists pointing neither at the write position nor at an earlier value, per column index, with how many empty lists it read.
+    pub empty_stray: Vec<(usize, usize, usize)>,
 }
 
 pub fn check_order(reader: &DatReader, table: &Table) -> OrderReport {
@@ -986,11 +988,23 @@ pub fn check_order(reader: &DatReader, table: &Table) -> OrderReport {
     }
 
     let mut counts: HashMap<usize, (usize, usize)> = HashMap::new();
+    let mut empty_counts: HashMap<usize, (usize, usize)> = HashMap::new();
     let mut seen: HashSet<u64> = HashSet::new();
     let mut write_at = 8u64;
     // A list of unknown element type ends wherever the next value starts.
     let mut open_ended = false;
     let mut visit = |start: u64, end: Option<Option<u64>>, column: usize, report: &mut OrderReport| {
+        // An empty list writes nothing, yet still points where the next value goes or back at an earlier one.
+        if end == Some(Some(start)) {
+            let entry = empty_counts.entry(column).or_default();
+            entry.0 += 1;
+            if start == write_at || (open_ended && start > write_at) {
+                seen.insert(start);
+            } else if !seen.contains(&start) {
+                entry.1 += 1;
+            }
+            return;
+        }
         report.values += 1;
         let entry = counts.entry(column).or_default();
         entry.0 += 1;
@@ -1030,6 +1044,7 @@ pub fn check_order(reader: &DatReader, table: &Table) -> OrderReport {
             }
             let (count, start) = (first, read(base + offset + ptr).unwrap_or(0));
             if count == 0 {
+                visit(start, Some(Some(start)), index, &mut report);
                 continue;
             }
             if count > 1_000_000 {
@@ -1047,11 +1062,17 @@ pub fn check_order(reader: &DatReader, table: &Table) -> OrderReport {
         }
     }
 
+    report.stray = worst_first(counts);
+    report.empty_stray = worst_first(empty_counts);
+    report
+}
+
+/// Columns with offsets out of order, as `(column, bad, read)`, the largest share first.
+fn worst_first(counts: HashMap<usize, (usize, usize)>) -> Vec<(usize, usize, usize)> {
     let mut stray: Vec<(usize, usize, usize)> =
         counts.into_iter().filter(|(_, (_, bad))| *bad > 0).map(|(c, (n, bad))| (c, bad, n)).collect();
     stray.sort_by(|a, b| (b.1 * a.2).cmp(&(a.1 * b.2)).then(a.0.cmp(&b.0)));
-    report.stray = stray;
-    report
+    stray
 }
 
 /// No table in the game has this many rows, so a key at or past it is a misread
@@ -1213,6 +1234,16 @@ pub fn lint_table(
             violations: bad,
         });
     }
+    for (column, bad, read) in order.empty_stray {
+        findings.push(LintFinding {
+            table: table.name.clone(),
+            column: column_name(table, column),
+            kind: "empty list out of order",
+            detail: "points neither where the next value is written nor at an earlier one: probably not a list, or a list at the wrong byte".to_string(),
+            sampled: read,
+            violations: bad,
+        });
+    }
     findings
 }
 
@@ -1299,6 +1330,42 @@ mod tests {
             file: None,
             files: None,
         }
+    }
+
+    /// Rows of (bool, empty list, string) as the game writes them: each empty list points where its row's string goes.
+    fn empty_lists() -> Vec<u8> {
+        let mut var: Vec<u8> = vec![0xBB; 8];
+        let mut data = 3u32.to_le_bytes().to_vec();
+        for s in ["a", "bc", ""] {
+            let at = var.len() as u64;
+            data.push(0);
+            data.extend_from_slice(&0u64.to_le_bytes());
+            data.extend_from_slice(&at.to_le_bytes());
+            data.extend_from_slice(&at.to_le_bytes());
+            for u in s.encode_utf16() {
+                var.extend_from_slice(&u.to_le_bytes());
+            }
+            var.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        data.extend_from_slice(&var);
+        data
+    }
+
+    #[test]
+    fn an_empty_list_read_a_byte_early_is_out_of_order() {
+        let reader = DatReader::new(empty_lists(), "t.datc64").unwrap();
+        let list = |name: &str| Column { array: true, ..col(name, "i32") };
+        let right = table(vec![col("Flag", "bool"), list("List"), col("Text", "string")]);
+        assert!(check_order(&reader, &right).empty_stray.is_empty());
+
+        let early = table(vec![list("List"), col("Flag", "bool"), col("Text", "string")]);
+        let order = check_order(&reader, &early);
+        assert_eq!(order.empty_stray, vec![(0, 3, 3)]);
+        assert!(order.stray.is_empty() && order.gaps == 0);
+        assert!(!check_fit(&reader, &early, 40).is_broken(), "an empty list out of order is a lint finding, not a broken table");
+        let schema = crate::dat::schema::Schema { version: 0, created_at: 0, tables: vec![early.clone()], enumerations: Vec::new() };
+        let findings = lint_table(&reader, &early, &schema, &HashMap::new(), true, 60);
+        assert!(findings.iter().any(|f| f.column == "List" && f.kind == "empty list out of order" && f.violations == 3), "{:?}", findings.iter().map(|f| f.kind).collect::<Vec<_>>());
     }
 
     fn g(offset: usize, size: usize, guess: Guess) -> GuessedColumn {

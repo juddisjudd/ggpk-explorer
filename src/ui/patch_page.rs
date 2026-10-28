@@ -49,7 +49,14 @@ pub fn health(report: Option<&Report>, running: bool) -> Health {
         None => ("Patch not checked".to_string(), Tone::Idle),
         Some(r) if !r.unresolved.is_empty() => (format!("{} broken", count(r.unresolved.len(), "table")), Tone::Bad),
         Some(r) if !r.refitted.is_empty() => (format!("{} re-fitted", count(r.refitted.len(), "table")), Tone::Warn),
-        Some(r) if !r.disputed.is_empty() => (format!("{} read differently", count(r.disputed.len(), "table")), Tone::Note),
+        Some(r) if !r.disputed.is_empty() => {
+            let new = match r.new_disputes.as_deref() {
+                Some([]) => ", none new".to_string(),
+                Some(new) => format!(", {} new", new.len()),
+                None => String::new(),
+            };
+            (format!("{} read differently{}", count(r.disputed.len(), "table"), new), Tone::Note)
+        }
         Some(_) => ("Patch checked".to_string(), Tone::Good),
     };
     Health { label, tone }
@@ -259,13 +266,24 @@ impl PatchPage {
             if !report.disputed.is_empty() {
                 modal_section(ui, &format!("READ DIFFERENTLY BY THE GAME CLIENT · {}", report.disputed.len()));
                 note(ui, "These tables open, but the game's own loader reads the columns below another way than the layout in use. Treat those columns as suspect.");
+                if let (Some(new), Some(before)) = (&report.new_disputes, &report.previous) {
+                    match new.len() {
+                        0 => note(ui, &format!("None are new: the check of patch {} found the same.", before)),
+                        n => note(ui, &format!("{} new since patch {}, marked below.", count(n, "table"), before)),
+                    }
+                }
                 card(ui, |ui| {
                     ui.set_width(ui.available_width());
                     for (i, (name, found)) in report.disputed.iter().enumerate() {
                         if i > 0 {
                             ui.separator();
                         }
-                        link(ui, name);
+                        ui.horizontal(|ui| {
+                            link(ui, name);
+                            if report.is_new_dispute(name) {
+                                ui.label(egui::RichText::new("new").size(11.5).color(Tone::Warn.color(ui.visuals().dark_mode)));
+                            }
+                        });
                         for line in found {
                             ui.label(egui::RichText::new(line).size(11.5).monospace().color(muted(ui)));
                         }
@@ -330,6 +348,10 @@ mod tests {
         assert_eq!(health(Some(&r), false).label, "1 table re-fitted");
         r.refitted.clear();
         assert_eq!(health(Some(&r), false), Health { label: "1 table read differently".to_string(), tone: Tone::Note });
+        r.new_disputes = Some(Vec::new());
+        assert_eq!(health(Some(&r), false).label, "1 table read differently, none new");
+        r.new_disputes = Some(vec!["NPCTalk".to_string()]);
+        assert_eq!(health(Some(&r), false).label, "1 table read differently, 1 new");
         r.disputed.clear();
         assert_eq!(health(Some(&r), false).tone, Tone::Good);
         assert_eq!(health(Some(&r), true).label, "Checking patch…");
@@ -346,6 +368,24 @@ mod tests {
         for expected in ["PoE 2 · patch 0.5.5.4", "Checked 2026-10-13 09:13 · re-fits come from patch 0.5.5.3", "823", "STILL BROKEN · 1", "not in both patches", "could not place IsLocal", "NPCTalk", "byte 300: the client reads a key to WorldAreas"] {
             assert!(text.contains(expected), "missing {:?} in:\n{}", expected, text);
         }
+        assert!(!text.contains("new since"), "{}", text);
+    }
+
+    #[test]
+    fn the_page_says_which_disputes_are_new() {
+        let r = Report { new_disputes: Some(vec!["NPCTalk".to_string()]), ..report() };
+        let view = PatchView { game: Some(Game::Poe2), version: "0.5.5.4", report: Some(&r), running: false, checked_at: None };
+        let text = painted_text(|ui| {
+            PatchPage { open: true }.show(ui, &view);
+        });
+        assert!(text.contains("1 table new since patch 0.5.5.3, marked below."), "{}", text);
+        assert!(text.contains("NPCTalk\nnew\n"), "{}", text);
+        let r = Report { new_disputes: Some(Vec::new()), ..report() };
+        let view = PatchView { report: Some(&r), ..view };
+        let text = painted_text(|ui| {
+            PatchPage { open: true }.show(ui, &view);
+        });
+        assert!(text.contains("None are new: the check of patch 0.5.5.3 found the same."), "{}", text);
     }
 
     #[test]

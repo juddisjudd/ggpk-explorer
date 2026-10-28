@@ -84,7 +84,7 @@ USAGE:
     ggpk-explorer export-tree [OPTIONS]    Write Path of Building's passive tree folders (src/TreeData)
     ggpk-explorer export-tables [OPTIONS]  Write every DAT table whole, as JSON and/or CSV
     ggpk-explorer refit [OPTIONS]          Re-derive drifted table layouts from an earlier patch
-    ggpk-explorer lint [OPTIONS]           Check the schema's references and enums against the game files
+    ggpk-explorer lint [OPTIONS]           Check the schema against the game files and the game client's own reading
     ggpk-explorer patch-check [OPTIONS]    Check a patch, re-fit the tables it moved, compare exports
 
 EXPORT OPTIONS:
@@ -1210,6 +1210,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
     let (reader, steam_loader, index) = open_source(ggpk, steam, None, game)?;
     let files = GameFiles::new(reader, Arc::new(index), steam_loader, None);
     keep_tables(&files, game, patch.as_deref());
+    let client = patch.as_deref().map(|v| crate::dat::exe_layout::for_patch(&files, game, v));
 
     // Every base-language table, read once and kept for the row counts that
     // the reference checks measure against.
@@ -1231,6 +1232,7 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
     println!("Checking {} {} tables", readers.len(), game.label());
 
     let mut findings = Vec::new();
+    let mut disputed: Vec<(String, Vec<String>)> = Vec::new();
     let mut skipped = 0;
     for (name, dat) in &readers {
         let Some(def) = schema.find_table(name, is_poe2) else { continue };
@@ -1241,6 +1243,12 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
             continue;
         }
         findings.extend(crate::dat::analysis::lint_table(dat, def, &schema, &row_counts, is_poe2, 60));
+        if let Some(Ok(client)) = &client {
+            let layout = client.find(&def.name).filter(|l| dat.row_count > 0 && dat.row_length == Some(l.row_size));
+            if let Some(found) = layout.map(|l| client.disagreements(def, l)).filter(|found| !found.is_empty()) {
+                disputed.push((def.name.clone(), found));
+            }
+        }
     }
     if suggest {
         use crate::dat::analysis::{foreign_key_stats, has_unresolved_foreign, is_foreign, rank_targets, TableStats};
@@ -1314,6 +1322,20 @@ pub fn run_lint(args: &[String]) -> Result<(), String> {
                     f.kind,
                     f.detail
                 );
+            }
+        }
+    }
+    match &client {
+        None => println!("\nThe install's log names no patch, so the game client's layouts were not read."),
+        Some(Err(why)) => println!("\nNo table layouts from the game client: {}", why),
+        Some(Ok(_)) if disputed.is_empty() => println!("\nThe game client reads every table the way the schema describes it."),
+        Some(Ok(_)) => {
+            println!("\n{} table(s) the game client reads differently:\n", disputed.len());
+            for (name, found) in &disputed {
+                println!("  {}", name);
+                for line in found {
+                    println!("      {}", line);
+                }
             }
         }
     }
