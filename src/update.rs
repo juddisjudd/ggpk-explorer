@@ -3,7 +3,7 @@ use std::thread;
 use serde::Deserialize;
 use semver::Version;
 
-const REPO: &str = "https://github.com/juddisjudd/ggpk-explorer";
+const REPO: &str = "juddisjudd/ggpk-explorer";
 
 #[derive(Deserialize, Debug)]
 struct GitHubRelease {
@@ -150,7 +150,7 @@ fn check_update_impl() -> Result<Option<Found>, String> {
         return result.map(|update| {
             update.map(|update| {
                 let tag = format!("v{}", update.version());
-                Found { url: format!("{}/releases/tag/{}", REPO, tag), tag, update: Some(update) }
+                Found { url: format!("https://github.com/{}/releases/tag/{}", REPO, tag), tag, update: Some(update) }
             })
         });
     }
@@ -163,7 +163,7 @@ fn check_update_impl() -> Result<Option<Found>, String> {
         .build()
         .map_err(|e| format!("Failed to build client: {}", e))?;
 
-    let resp = client.get("https://api.github.com/repos/juddisjudd/ggpk-explorer/releases/latest")
+    let resp = client.get(format!("https://api.github.com/repos/{}/releases/latest", REPO))
         .send()
         .map_err(|e| format!("Network error: {}", e))?;
 
@@ -202,7 +202,7 @@ mod installed {
     /// None when this copy was not set up by the installer.
     pub fn check() -> Option<Result<Option<Update>, String>> {
         // A local folder or URL of packed releases, to try an update before it is published.
-        let feed = std::env::var("GGPK_EXPLORER_UPDATE_FEED").unwrap_or_else(|_| super::REPO.to_string());
+        let feed = std::env::var("GGPK_EXPLORER_UPDATE_FEED").unwrap_or_else(|_| format!("https://github.com/{}", super::REPO));
         let manager = UpdateManager::new(AutoSource::new(&feed), None, None).ok()?;
         Some(match manager.check_for_updates() {
             Ok(UpdateCheck::UpdateAvailable(info)) => Ok(Some(Update { manager, info: *info })),
