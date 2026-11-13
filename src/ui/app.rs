@@ -1228,7 +1228,10 @@ impl eframe::App for ExplorerApp {
         }
 
         self.update_state.poll();
-        
+        if matches!(self.update_state.install(), crate::update::Install::Downloading(_)) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         // Poll loader
         if self.is_loading {
              if let Some(rx) = &self.load_rx {
@@ -1422,7 +1425,7 @@ impl eframe::App for ExplorerApp {
 
         let patch_running = self.patch_check_for.as_ref().is_some_and(|checked| *checked == self.current_patch());
         let patch_health = crate::ui::patch_page::health(self.patch_report.as_ref(), patch_running);
-        let chip_clicked = crate::ui::status_bar::StatusBar::show(
+        let clicks = crate::ui::status_bar::StatusBar::show(
             ctx,
             &self.status_msg,
             self.is_loading,
@@ -1430,12 +1433,20 @@ impl eframe::App for ExplorerApp {
             game.label(),
             &poe_version,
             &schema_date,
-            self.update_state.latest_version.as_deref().zip(self.update_state.release_url.as_deref()),
+            self.update_state.latest_version.as_deref(),
             is_loaded.then_some(&patch_health),
         );
-        if chip_clicked {
+        if clicks.patch {
             self.settings_window.close();
             self.patch_page.open();
+        }
+        if clicks.update {
+            match (self.update_state.install(), &self.update_state.release_url) {
+                (crate::update::Install::Unavailable, Some(url)) => {
+                    let _ = open::that(url);
+                }
+                _ => self.show_about = true,
+            }
         }
 
         // Export Window logic
@@ -1848,11 +1859,43 @@ impl eframe::App for ExplorerApp {
                             ui.spinner();
                             ui.label(egui::RichText::new("Checking...").size(12.5).color(egui::Color32::from_rgb(161, 161, 170)));
                         });
-                    } else if let Some(ver) = &self.update_state.latest_version {
+                    } else if let Some(ver) = self.update_state.latest_version.clone() {
+                        use crate::update::Install;
                         ui.label(egui::RichText::new(format!("New version: {}", ver)).size(12.5).color(egui::Color32::from_rgb(74, 222, 128)));
-                        if let Some(url) = &self.update_state.release_url {
-                            if ui.button("Download Update").clicked() {
-                                let _ = open::that(url);
+                        let url = self.update_state.release_url.clone();
+                        let open_page = |ui: &mut egui::Ui, label: &str| {
+                            if let Some(url) = &url {
+                                if ui.button(label).clicked() {
+                                    let _ = open::that(url);
+                                }
+                            }
+                        };
+                        match self.update_state.install().clone() {
+                            Install::Unavailable => open_page(ui, "Download Update"),
+                            Install::Available => {
+                                ui.horizontal(|ui| {
+                                    if ui.button("Install Update").clicked() {
+                                        self.update_state.start_install();
+                                    }
+                                    open_page(ui, "Release Notes");
+                                });
+                            }
+                            Install::Downloading(percent) => {
+                                ui.add(egui::ProgressBar::new(percent as f32 / 100.0).desired_width(220.0).text(format!("Downloading {}%", percent)));
+                            }
+                            Install::Ready => {
+                                if ui.button("Restart to Update").clicked() && self.update_state.apply_on_exit() {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                                }
+                            }
+                            Install::Failed(err) => {
+                                ui.label(egui::RichText::new(err).size(12.5).color(egui::Color32::from_rgb(239, 68, 68)));
+                                ui.horizontal(|ui| {
+                                    if ui.button("Try Again").clicked() {
+                                        self.update_state.start_install();
+                                    }
+                                    open_page(ui, "Download from GitHub");
+                                });
                             }
                         }
                     } else if let Some(err) = &self.update_state.error_msg {

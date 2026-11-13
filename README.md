@@ -6,6 +6,11 @@ A Path of Exile asset explorer for the standalone (GGPK) and Steam (Bundles2) in
 
 <img width="1280" height="776" alt="image" src="https://github.com/user-attachments/assets/dc94a152-393d-420b-ab9e-9ed455c8a87e" />
 
+## Install
+
+- **Windows**: Run [`ggpk-explorer-win-Setup.exe`](https://github.com/juddisjudd/ggpk-explorer/releases/latest/download/ggpk-explorer-win-Setup.exe). It installs for your user only, with no admin prompt, and adds shortcuts to the Start menu and the Desktop. The app checks for updates when it starts. When one is out, **About → Install Update** downloads it and **Restart to Update** applies it. The installer is not code-signed yet, so Windows SmartScreen may warn: choose **More info → Run anyway**. Prefer no installer? Download `ggpk-explorer-vX.Y.Z-windows-x64.exe` from the [releases](https://github.com/juddisjudd/ggpk-explorer/releases). That copy shows a link when an update is out, but does not update itself.
+- **Linux**: Download the `.deb` or the AppImage from the [releases](https://github.com/juddisjudd/ggpk-explorer/releases).
+
 ## Features
 
 ### Data Sources

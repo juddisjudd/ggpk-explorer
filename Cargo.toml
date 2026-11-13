@@ -45,6 +45,9 @@ webp = "0.3"
 zstd = "0.14"
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info"] }
 
+[target.'cfg(windows)'.dependencies]
+velopack = "=1.2.161"
+
 [dev-dependencies]
 iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "code_asm"] }
 

@@ -1,8 +1,7 @@
 use eframe::egui;
 
-/// A new release, as a chip that opens its page. Only drawn when there is one,
-/// so the bar stays as it was otherwise.
-fn update_chip(ui: &mut egui::Ui, tag: &str, url: &str) {
+/// A new release, as a chip drawn only when there is one, so the bar is otherwise unchanged.
+fn update_chip(ui: &mut egui::Ui, tag: &str) -> bool {
     let dark_mode = ui.visuals().dark_mode;
     let (fill, border, text_color, dot_color) = match dark_mode {
         true => (
@@ -34,10 +33,14 @@ fn update_chip(ui: &mut egui::Ui, tag: &str, url: &str) {
     ui.painter().circle_filled(egui::pos2(rect.min.x + 10.0, rect.center().y), 3.0, dot_color);
     ui.painter().galley(egui::pos2(rect.min.x + 19.0, rect.center().y - galley.size().y / 2.0), galley, text_color);
 
-    if response.clicked() {
-        let _ = open::that(url);
-    }
-    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("A newer release is out — open it on GitHub");
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("A newer release is out").clicked()
+}
+
+/// Which chips on the bar were clicked this frame.
+#[derive(Default)]
+pub struct StatusClicks {
+    pub patch: bool,
+    pub update: bool,
 }
 
 /// How the open patch stands, as a chip that opens the patch page.
@@ -69,10 +72,10 @@ impl StatusBar {
         game: &str,
         poe_version: &str,
         schema_date: &str,
-        update: Option<(&str, &str)>,
+        update: Option<&str>,
         patch: Option<&crate::ui::patch_page::Health>,
-    ) -> bool {
-        let mut open_patch = false;
+    ) -> StatusClicks {
+        let mut clicks = StatusClicks::default();
         egui::TopBottomPanel::bottom("status_panel")
             .frame(egui::Frame {
                 inner_margin: egui::Margin::same(0.0),
@@ -141,7 +144,7 @@ impl StatusBar {
                             ui.add_space(6.0);
                         }
                         if let Some(health) = patch {
-                            open_patch = patch_chip(ui, health);
+                            clicks.patch = patch_chip(ui, health);
                             ui.add_space(6.0);
                         }
 
@@ -183,8 +186,8 @@ impl StatusBar {
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(10.0);
-                            if let Some((tag, url)) = update {
-                                update_chip(ui, tag, url);
+                            if let Some(tag) = update {
+                                clicks.update = update_chip(ui, tag);
                                 ui.add_space(8.0);
                             }
                             let meta_color = if dark_mode {
@@ -236,7 +239,7 @@ impl StatusBar {
                     },
                 );
             });
-        open_patch
+        clicks
     }
 }
 
@@ -245,7 +248,7 @@ mod tests {
     use super::*;
 
     /// Every piece of text the bar paints, with where it sits and whether it was cut short.
-    fn painted(update: Option<(&str, &str)>, message: &str, input: egui::RawInput) -> Vec<(String, egui::Rect, bool)> {
+    fn painted(update: Option<&str>, message: &str, input: egui::RawInput) -> Vec<(String, egui::Rect, bool)> {
         let ctx = egui::Context::default();
         let output = ctx.run(input, |ctx| {
             let health = crate::ui::patch_page::Health { label: "2 tables re-fitted".to_string(), tone: crate::ui::patch_page::Tone::Warn };
@@ -263,7 +266,7 @@ mod tests {
         out
     }
 
-    fn painted_text(update: Option<(&str, &str)>) -> String {
+    fn painted_text(update: Option<&str>) -> String {
         painted(update, "Ready", egui::RawInput::default()).into_iter().map(|(text, _, _)| text).collect()
     }
 
@@ -271,7 +274,7 @@ mod tests {
     #[test]
     fn the_update_chip_draws_only_when_there_is_a_release() {
         let quiet = painted_text(None);
-        let announced = painted_text(Some(("v9.9.9", "https://example.invalid/releases/latest")));
+        let announced = painted_text(Some("v9.9.9"));
         assert!(quiet.contains("Patch 4.5.5.2"), "the bar should still say what it always says");
         assert!(quiet.contains("2 tables re-fitted"), "the patch chip should say how the patch stands");
         assert!(!quiet.contains("available"));

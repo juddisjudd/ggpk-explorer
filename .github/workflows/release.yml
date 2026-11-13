@@ -55,6 +55,25 @@ jobs:
           mkdir -p dist
           cp target/x86_64-pc-windows-msvc/release/ggpk-explorer.exe "dist/ggpk-explorer-${GITHUB_REF_NAME}-windows-x64.exe"
 
+      # The vpk version must match the velopack crate in Cargo.toml.
+      - name: Package installer and update feed
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $version = "$env:GITHUB_REF_NAME".TrimStart('v')
+          dotnet tool install vpk --version 1.2.161 --tool-path .vpk
+          New-Item -ItemType Directory -Force pack, velopack | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/ggpk-explorer.exe pack/
+          # The previous release's package lets vpk build a delta, so an update downloads only what changed.
+          .vpk/vpk download github --repoUrl "https://github.com/$env:GITHUB_REPOSITORY" --token $env:GH_TOKEN -o velopack
+          .vpk/vpk pack --packId ggpk-explorer --packVersion $version --runtime win-x64 --packDir pack --mainExe ggpk-explorer.exe --packTitle "GGPK Explorer" --packAuthors Judd --icon assets/icon.ico -o velopack
+          # Only this release's files go up; earlier packages stay on the releases that shipped them.
+          $files = @((Get-Content velopack/assets.win.json | ConvertFrom-Json).RelativeFileName) + 'releases.win.json'
+          foreach ($file in $files) { Copy-Item "velopack/$file" dist/ }
+          Get-ChildItem dist
+
       - name: Upload Windows Binary
         uses: actions/upload-artifact@v7
         with:

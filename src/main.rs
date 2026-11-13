@@ -62,6 +62,9 @@ fn main() -> eframe::Result<()> {
     
 
     let args: Vec<String> = std::env::args().collect();
+    // Only a plain GUI start applies an update downloaded earlier, never a CLI command.
+    #[cfg(windows)]
+    velopack::VelopackApp::build().set_auto_apply_on_startup(args.len() == 1).run();
     match args.get(1).map(String::as_str) {
         Some("inspect") => {
             if let Err(e) = cli::run_inspect() {
