@@ -715,7 +715,8 @@ const INTELLIGENCE_STATS: [&str; 7] = [
 
 /// Stat lines plus the ones the client synthesises from other columns.
 fn stat_lines(info: &SkillGraphNodeInfo, ctx: &NodeContext) -> Vec<String> {
-    let mut lines = info.stat_texts.clone();
+    let mut lines: Vec<String> = granted_effect_line(info.granted_effect, ctx).into_iter().collect();
+    lines.extend(info.stat_texts.iter().cloned());
     if info.skill_points_granted > 0 {
         lines.push(format!("Grants {} Passive Skill Point{}", info.skill_points_granted, if info.skill_points_granted == 1 { "" } else { "s" }));
     }
@@ -726,6 +727,30 @@ fn stat_lines(info: &SkillGraphNodeInfo, ctx: &NodeContext) -> Vec<String> {
         lines.push(format!("Grants Skill: <underline>{{{}}}", gem.name));
     }
     lines
+}
+
+/// PoE 1's line for a granted skill, linked the way GGG's export links skills.
+fn granted_effect_line(row: Option<usize>, ctx: &NodeContext) -> Option<String> {
+    let effect = row.and_then(|r| ctx.tables.granted_effects.get(&r))?;
+    let link = format!("[{}::{}|{}]", effect.id, effect.level, effect.name);
+    Some(match effect.unsupported {
+        true => format!("Grants {}", link),
+        false => format!("Grants Level {} {}", effect.level, link),
+    })
+}
+
+/// `proxyKey` of a passive a Blightcore jewel grows, by the socket it names.
+const BLIGHTCORE_PROXY_KEYS: [&str; 6] = [
+    "BlightcoreLeft",
+    "BlightcoreTopLeft",
+    "BlightcoreBottomLeft",
+    "BlightcoreRight",
+    "BlightcoreTopRight",
+    "BlightcoreBottomRight",
+];
+
+fn blightcore_proxy_key(info: &SkillGraphNodeInfo) -> Option<&'static str> {
+    usize::try_from(info.blightcore_socket).ok()?.checked_sub(1).and_then(|i| BLIGHTCORE_PROXY_KEYS.get(i).copied())
 }
 
 /// Rows kept in the table for classes not in the game are exported as
@@ -739,11 +764,11 @@ fn is_placeholder(info: &SkillGraphNodeInfo, db: &SkillGraphDatabase) -> bool {
 /// One node in the official layout. `calc` is `None` for override nodes,
 /// which have no position or links.
 /// The order GGG's PoE 1 export writes a node's keys in, read off every node
-/// of the 3.29 export (normal and Ruthless). Keys it never writes go before
+/// of the 3.29 and 3.30 exports (normal and Ruthless). Keys it never writes go before
 /// the position fields.
-const POE1_NODE_KEYS: [&str; 33] = [
+const POE1_NODE_KEYS: [&str; 34] = [
     "skill", "name", "icon", "isJewelSocket", "expansionJewel", "isKeystone", "isMastery", "inactiveIcon",
-    "activeIcon", "activeEffectImage", "isNotable", "isBlighted", "isProxy", "masteryEffects", "recipe",
+    "activeIcon", "activeEffectImage", "isNotable", "isBlighted", "isProxy", "proxyKey", "masteryEffects", "recipe",
     "grantedStrength", "grantedDexterity", "grantedIntelligence", "ascendancyName", "grantedPassivePoints",
     "isAscendancyStart", "isBloodline", "isMultipleChoice", "isMultipleChoiceOption", "stats", "classStartIndex",
     "reminderText", "flavourText", "group", "orbit", "orbitIndex", "out", "in",
@@ -835,8 +860,12 @@ fn node_fields(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCa
             o.set("ascendancyName", J::str(&d.id));
             o.set("isBloodline", J::Bool(true));
         }
-        if ctx.is_poe1 && info.is_proxy {
+        let proxy_key = blightcore_proxy_key(info).filter(|_| ctx.is_poe1);
+        if ctx.is_poe1 && (info.is_proxy || proxy_key.is_some()) {
             o.set("isProxy", J::Bool(true));
+        }
+        if let Some(key) = proxy_key {
+            o.set("proxyKey", J::str(key));
         }
         if let Some(jewel) = ctx.tables.expansion_jewels.get(&gid) {
             let mut e = J::obj();
@@ -871,7 +900,8 @@ fn node_fields(gid: u32, info: Option<&SkillGraphNodeInfo>, calc: Option<&NodeCa
                             .map(|effect| {
                                 let mut m = J::obj();
                                 m.set("effect", J::Int(effect.hash));
-                                m.set("stats", J::strs(effect.stat_lines.iter().cloned()));
+                                let granted = granted_effect_line(effect.granted_effect, ctx);
+                                m.set("stats", J::strs(granted.into_iter().chain(effect.stat_lines.iter().cloned())));
                                 if !effect.reminder_lines.is_empty() {
                                     m.set("reminderText", J::strs(effect.reminder_lines.iter().cloned()));
                                 }
@@ -1825,12 +1855,17 @@ mod real_data_tests {
     #[test]
     #[ignore]
     fn real_tree_export() {
-        let settings = crate::settings::AppSettings::load();
-        let ggpk_path = settings.ggpk_path.expect("no ggpk_path configured");
+        use crate::settings::{AppSettings, Game};
+        let settings = AppSettings::load();
+        let game = match std::env::var("TREE_EXPORT_GAME").as_deref() {
+            Ok("poe1") => Game::Poe1,
+            _ => Game::Poe2,
+        };
+        let ggpk_path = settings.ggpk_path_for(game).expect("no ggpk_path configured").clone();
         let reader = Arc::new(GgpkReader::open(&ggpk_path).unwrap());
-        let cache_path = crate::settings::AppSettings::get_app_data_dir().join(crate::settings::INDEX_CACHE_FILENAME);
-        let index = Arc::new(BundleIndex::load_from_cache(&cache_path).expect("run the app once to build the index cache"));
-        let schema_text = std::fs::read_to_string(crate::settings::AppSettings::get_app_data_dir().join("schema.min.json")).unwrap();
+        let index = Arc::new(BundleIndex::load_from_cache(&AppSettings::index_cache_path(game)).expect("run the app once to build the index cache"));
+        let schema_path = settings.schema_local_path.clone().map(PathBuf::from).unwrap_or_else(|| AppSettings::get_app_data_dir().join("schema.min.json"));
+        let schema_text = std::fs::read_to_string(schema_path).unwrap();
         let schema: Schema = serde_json::from_str(&schema_text).unwrap();
         let source = TreeExportSource::new(Some(reader), index, None, schema);
 
@@ -1874,7 +1909,7 @@ mod real_data_tests {
             if let (Some(x), Some(mx)) = (node["x"].as_f64(), mine["x"].as_f64()) {
                 pos_diff_max = pos_diff_max.max((x - mx).abs()).max((node["y"].as_f64().unwrap() - mine["y"].as_f64().unwrap()).abs());
             }
-            for key in ["keystonesInRadius", "recipe", "isBlighted", "hideConnection", "isFree", "grantedPassivePoints", "activeEffectImage", "unlockConstraint", "classStartIndex", "ascendancyId", "grantedStrength", "grantedDexterity", "grantedIntelligence", "multipleChoiceParent", "edges", "out", "in", "flavourText", "icon", "name", "id", "isGenericAttribute"] {
+            for key in ["keystonesInRadius", "recipe", "isBlighted", "hideConnection", "isFree", "grantedPassivePoints", "activeEffectImage", "unlockConstraint", "classStartIndex", "ascendancyId", "grantedStrength", "grantedDexterity", "grantedIntelligence", "multipleChoiceParent", "edges", "out", "in", "flavourText", "icon", "name", "id", "isGenericAttribute", "isProxy", "proxyKey", "masteryEffects", "reminderText"] {
                 if node.get(key) != mine.get(key) {
                     *key_mismatch.entry(key.to_string()).or_default() += 1;
                 }
@@ -1894,7 +1929,8 @@ mod real_data_tests {
         for e in stat_examples {
             println!("  {}", e);
         }
-        println!("edges: ours {} official {}", ours["edges"].as_array().unwrap().len(), official["edges"].as_array().unwrap().len());
+        let edge_count = |tree: &serde_json::Value| tree["edges"].as_array().map(|e| e.len()).unwrap_or(0);
+        println!("edges: ours {} official {}", edge_count(&ours), edge_count(&official));
         println!("skillOverrides: ours {} official {}", ours["skillOverrides"].as_object().map(|o| o.len()).unwrap_or(0), official["skillOverrides"].as_object().map(|o| o.len()).unwrap_or(0));
         println!("jewelSlots equal: {}", ours["jewelSlots"] == official["jewelSlots"]);
         println!("classes: ours {:?}", ours["classes"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap_or("").to_string(), c["ascendancies"].as_array().map(|a| a.len()).unwrap_or(0))).collect::<Vec<_>>());

@@ -70,6 +70,10 @@ pub struct SkillGraphNodeInfo {
     pub mastery_group: Option<usize>,
     /// `GrantedSkill` (`SkillGems` row index).
     pub granted_skill: Option<usize>,
+    /// `GrantedEffectsPerLevel` row index (PoE 1).
+    pub granted_effect: Option<usize>,
+    /// Unnamed column before `VariantType`: 1 to 6 names the Blightcore socket that grows this passive.
+    pub blightcore_socket: i32,
     pub stat_ids: Vec<String>,
     pub stat_values: Vec<i32>,
     /// One entry per rendered stat description (may contain newlines);
@@ -415,7 +419,7 @@ fn parse_buff_template_lines(
     is_poe2: bool,
     stat_ids: &[String],
     lookup: &TranslationLookup,
-) -> Result<HashMap<usize, Vec<String>>, String> {
+) -> Result<HashMap<usize, BuffText>, String> {
     let def_table = find_table(schema, "BuffDefinitions", is_poe2)?;
     let def_reader = crate::dat::analysis::open_checked(definitions, "buffdefinitions.datc64", def_table)?;
     let def_stats = col_index(def_table, "StatsKeys").or_else(|| col_index(def_table, "Stats"));
@@ -456,7 +460,7 @@ fn parse_buff_template_lines(
         else {
             continue;
         };
-        let mut values: Vec<i32> = match values_col.and_then(|c| row.get(c).map(|v| (c, v))) {
+        let values: Vec<i32> = match values_col.and_then(|c| row.get(c).map(|v| (c, v))) {
             Some((c, DatValue::List(count, offset))) if *count > 0 => reader
                 .read_list_values(*offset, *count, &table.columns[c])
                 .unwrap_or_default()
@@ -465,8 +469,8 @@ fn parse_buff_template_lines(
                 .collect(),
             _ => Vec::new(),
         };
-        let mut covered: Vec<String> = stats.into_iter().take(values.len()).collect();
-        values.truncate(covered.len());
+        let (mut covered, mut values): (Vec<String>, Vec<i32>) =
+            stats.into_iter().zip(values).filter(|(_, v)| *v != 0).unzip();
         for flag in flags {
             covered.push(flag);
             values.push(1);
@@ -474,13 +478,19 @@ fn parse_buff_template_lines(
         if covered.is_empty() {
             continue;
         }
-        let lines: Vec<String> =
-            lookup.translate_grouped(&covered, &values).into_iter().filter(|l| !l.is_empty()).collect();
+        let (lines, reminders) = lookup.translate_with_reminders(&covered, &values);
         if !lines.is_empty() {
-            out.insert(i as usize, lines);
+            out.insert(i as usize, BuffText { lines, reminders });
         }
     }
     Ok(out)
+}
+
+/// What one buff template prints: its lines and the `ReminderText` ids they ask for.
+#[derive(Debug, Clone, Default)]
+struct BuffText {
+    lines: Vec<String>,
+    reminders: Vec<String>,
 }
 
 /// `Descendancy`: the id, name and panel text of each alternate ascendancy.
@@ -519,6 +529,7 @@ fn parse_mastery_groups(
     let effect_reader = crate::dat::analysis::open_checked(effects, "passiveskillmasteryeffects.datc64", effect_table)?;
     let hash_col = col_index(effect_table, "HASH16").or_else(|| col_index(effect_table, "HASH32"));
     let stats_col = col_index(effect_table, "Stats");
+    let granted_col = col_index(effect_table, "GrantedEffect");
     let value_cols: Vec<Option<usize>> = (1..=4).map(|n| col_index(effect_table, &format!("Stat{}Value", n))).collect();
     let effects: Vec<MasteryEffect> = (0..effect_reader.row_count)
         .map(|i| {
@@ -556,6 +567,7 @@ fn parse_mastery_groups(
                     .filter_map(|id| reminder_by_id.get(id.as_str()).filter(|t| !t.is_empty()))
                     .flat_map(|text| text.lines().map(str::to_string))
                     .collect(),
+                granted_effect: granted_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
             }
         })
         .collect();
@@ -641,6 +653,8 @@ pub struct MasteryEffect {
     pub hash: i64,
     pub stat_lines: Vec<String>,
     pub reminder_lines: Vec<String>,
+    /// `GrantedEffectsPerLevel` row index.
+    pub granted_effect: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -900,6 +914,8 @@ pub fn build(
     let unlocked_by_col = col_index(ps_table, "UnlockedBy");
     let visible_for_col = col_index(ps_table, "VisibleForAscendancy");
     let granted_skill_col = col_index(ps_table, "GrantedSkill");
+    let granted_effect_col = col_index(ps_table, "GrantedEffectsPerLevel");
+    let blightcore_col = unnamed_col_near(ps_table, "VariantType", -1, "i32").filter(|_| !is_poe2);
     // PoE 1's Ruthless ("hardmode") keeps its own name, stats, points and
     // buffs beside the normal ones, for the nodes it changes.
     let hardmode_col = col_index(ps_table, "HasHardmodeAlternate").filter(|_| hardmode);
@@ -910,6 +926,7 @@ pub fn build(
         .collect();
     let hard_points_col = col_index(ps_table, "SkillPointsGrantedHardmode").or(points_col);
     let hard_buffs_col = col_index(ps_table, "BuffsHardmode").or(buffs_col);
+    let hard_granted_effect_col = col_index(ps_table, "GrantedEffectsPerLevelHardmode").or(granted_effect_col);
 
     // `UnlockedBy` references rows of this same table, so graph ids are
     // needed for every row before any node is built.
@@ -942,6 +959,7 @@ pub fn build(
         let stat_value_cols = if hard { &hard_value_cols } else { &stat_value_cols };
         let points_col = if hard { hard_points_col } else { points_col };
         let buffs_col = if hard { hard_buffs_col } else { buffs_col };
+        let granted_effect_col = if hard { hard_granted_effect_col } else { granted_effect_col };
         let name = row.get(name_col).and_then(as_string).unwrap_or_default();
         let read_row_refs = |col: Option<usize>| -> Vec<usize> {
             match col.and_then(|c| row.get(c).map(|v| (c, v))) {
@@ -989,13 +1007,14 @@ pub fn build(
             })
             .unzip();
 
-        let (mut stat_texts, described_reminders) = match stat_id_list.is_empty() {
+        let (mut stat_texts, mut described_reminders) = match stat_id_list.is_empty() {
             true => (Vec::new(), Vec::new()),
             false => lookup.translate_with_reminders(&stat_id_list, &stat_values),
         };
         // What a node's own buff applies reads as part of what the node grants.
-        for template in read_row_refs(buffs_col) {
-            stat_texts.extend(buff_lines.get(&template).cloned().unwrap_or_default());
+        for buff in read_row_refs(buffs_col).iter().filter_map(|template| buff_lines.get(template)) {
+            stat_texts.extend(buff.lines.iter().cloned());
+            described_reminders.extend(buff.reminders.iter().cloned());
         }
         let stat_lines: Vec<String> = stat_texts.iter().flat_map(|t| t.lines().map(|l| l.to_string())).collect();
         // The reminders a description asks for come before the node's own, and
@@ -1065,6 +1084,8 @@ pub fn build(
             visible_for_ascendancy: visible_for_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
             mastery_group: is_mastery_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
             granted_skill: granted_skill_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
+            granted_effect: granted_effect_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
+            blightcore_socket: blightcore_col.and_then(|c| row.get(c)).map(as_int).unwrap_or(0),
             stat_ids: stat_id_list,
             stat_values,
             stat_texts,

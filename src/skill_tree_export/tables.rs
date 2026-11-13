@@ -14,6 +14,18 @@ pub struct GrantedSkill {
     pub icon: String,
 }
 
+/// A skill a PoE 1 passive grants, from its `GrantedEffectsPerLevel` row.
+#[derive(Debug, Clone, Default)]
+pub struct GrantedEffect {
+    /// `GrantedEffects.Id`.
+    pub id: String,
+    pub level: i64,
+    /// `ActiveSkills.DisplayedName`.
+    pub name: String,
+    /// `GrantedEffects.CannotBeSupported`: the client then leaves the level out.
+    pub unsupported: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct ExtraTables {
     /// `PassiveSkillTrees.Id` of the tree whose graph is being exported.
@@ -32,6 +44,8 @@ pub struct ExtraTables {
     pub recipes: HashMap<u32, Vec<String>>,
     /// `SkillGems` row -> gem name/icon.
     pub granted_skills: HashMap<usize, GrantedSkill>,
+    /// `GrantedEffectsPerLevel` row -> the skill and level it grants.
+    pub granted_effects: HashMap<usize, GrantedEffect>,
     /// Jewel radius ring textures (`PassiveJewelRadiiArt`), deduplicated.
     pub jewel_radius_art: Vec<String>,
     /// Graph ids of the passives a cluster jewel can add, which sit in no
@@ -203,6 +217,10 @@ impl<'a> Dat<'a> {
             Some(DatValue::Long(l)) => *l as i64,
             _ => 0,
         }
+    }
+
+    fn flag(&self, row: &[DatValue], name: &str) -> bool {
+        matches!(self.col(name).and_then(|c| row.get(c)), Some(DatValue::Bool(true)))
     }
 
     fn row_ref(&self, row: &[DatValue], name: &str) -> Option<usize> {
@@ -419,6 +437,39 @@ pub fn load(source: &TreeExportSource, db: &SkillGraphDatabase, psg_path: &str) 
                     .and_then(|v| bases.row_ref(&base, bases.pick(&["ItemVisualIdentity", "ItemVisualIdentityKey"])).and_then(|i| v.row(i)).map(|r| v.string(&r, "DDSFile")))
                     .unwrap_or_default();
                 out.granted_skills.insert(gem, GrantedSkill { name: bases.string(&base, "Name"), icon });
+            }
+        }
+    }
+
+    let mut effect_rows: Vec<usize> = db.nodes.values().filter_map(|n| n.granted_effect).collect();
+    effect_rows.extend(db.mastery_groups.values().flat_map(|g| g.effects.iter().filter_map(|e| e.granted_effect)));
+    if !effect_rows.is_empty() {
+        if let (Some(levels), Some(effects), Some(skills)) =
+            (open(source, db, "GrantedEffectsPerLevel"), open(source, db, "GrantedEffects"), open(source, db, "ActiveSkills"))
+        {
+            for row in effect_rows {
+                if out.granted_effects.contains_key(&row) {
+                    continue;
+                }
+                let Some(level_row) = levels.row(row) else { continue };
+                let Some(effect) = levels.row_ref(&level_row, "GrantedEffect").and_then(|e| effects.row(e)) else { continue };
+                let name = effects
+                    .row_ref(&effect, "ActiveSkill")
+                    .and_then(|s| skills.row(s))
+                    .map(|s| skills.string(&s, "DisplayedName"))
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    continue;
+                }
+                out.granted_effects.insert(
+                    row,
+                    GrantedEffect {
+                        id: effects.string(&effect, "Id"),
+                        level: levels.int(&level_row, "Level"),
+                        name,
+                        unsupported: effects.flag(&effect, "CannotBeSupported"),
+                    },
+                );
             }
         }
     }

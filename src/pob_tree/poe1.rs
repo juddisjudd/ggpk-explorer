@@ -11,7 +11,6 @@
 //! class illustrations are PoB's own choices, kept as tables below.
 
 use crate::data_export::Ctx;
-use crate::pob_export::text::escape_ggg_string;
 use crate::skill_tree_export::json::J;
 use crate::skill_tree_export::{export_tree, TreeExportOptions, TreeExportSource};
 use std::path::Path;
@@ -179,7 +178,8 @@ const EXTRA_IMAGES: [(f64, f64, &str); 6] = [
 /// Every table the web export reads. It reads them without the fit check, so
 /// they are checked here first: a patch that moved one stops the run rather
 /// than letting it read the wrong bytes.
-const TABLES: [&str; 34] = [
+const TABLES: [&str; 37] = [
+    "ActiveSkills",
     "Ascendancy",
     "AscendancyPassiveSkillOverrides",
     "AtlasPassiveSkillSubTrees",
@@ -192,6 +192,8 @@ const TABLES: [&str; 34] = [
     "Characters",
     "ClassPassiveSkillOverrides",
     "Descendancy",
+    "GrantedEffects",
+    "GrantedEffectsPerLevel",
     "ItemVisualIdentity",
     "PassiveJewelRadiiArt",
     "PassiveJewelSlots",
@@ -392,14 +394,10 @@ fn build(ctx: &Ctx, dir: &Path, staging: &Path, ruthless: bool) -> Result<(), St
 fn fix_ascendancy_positions(data: &mut Py) -> Result<(), String> {
     if let Some(Py::Dict(nodes)) = data.get_mut("nodes") {
         for (_, node) in nodes.iter_mut() {
-            for field in ["stats", "reminderText"] {
-                if let Some(Py::List(lines)) = node.get_mut(field) {
-                    for line in lines.iter_mut() {
-                        if let Py::Str(s) = line {
-                            *s = escape_ggg_string(s);
-                        }
-                    }
-                }
+            strip_links(node);
+            // GGG links words in mastery effects from 3.30 on, which PoB's script does not strip yet.
+            if let Some(Py::List(effects)) = node.get_mut("masteryEffects") {
+                effects.iter_mut().for_each(strip_links);
             }
         }
     }
@@ -476,6 +474,103 @@ fn fix_ascendancy_positions(data: &mut Py) -> Result<(), String> {
         data.get_mut("nodes").ok_or("data.json has no nodes")?.set(&retired.skill.to_string(), Py::Dict(fields));
     }
     Ok(())
+}
+
+fn strip_links(entry: &mut Py) {
+    for field in ["stats", "reminderText"] {
+        if let Some(Py::List(lines)) = entry.get_mut(field) {
+            for line in lines.iter_mut() {
+                if let Py::Str(s) = line {
+                    *s = strip_markup(s);
+                }
+            }
+        }
+    }
+}
+
+/// `[Id|Label]`, `[Id::10|Label]` and `[Id<gemlevel 20>|Label]` show the label, `[Id]` the id, `<tag>{text}` the text.
+fn strip_markup(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let markup = match chars[i] {
+            '[' => keyword_link(&chars, i),
+            '<' => tagged_text(&chars, i),
+            _ => None,
+        };
+        match markup {
+            Some((shown, next)) => {
+                out.push_str(&strip_markup(&shown));
+                i = next;
+            }
+            None => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn keyword_link(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let mut parameters = 0;
+    let mut bar = None;
+    for (i, &c) in chars.iter().enumerate().skip(start + 1) {
+        match c {
+            '<' => parameters += 1,
+            '>' if parameters > 0 => parameters -= 1,
+            _ if parameters > 0 => {}
+            '[' => return None,
+            '|' if bar.is_none() => bar = Some(i),
+            ']' => {
+                return match bar {
+                    Some(bar) => Some((chars[bar + 1..i].iter().collect(), i + 1)),
+                    None => Some(keyword_id(&chars[start + 1..i])).filter(|id| !id.trim().is_empty()).map(|id| (id, i + 1)),
+                };
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn keyword_id(id: &[char]) -> String {
+    let mut out = String::new();
+    let mut parameters = 0;
+    for &c in id {
+        match c {
+            '<' => parameters += 1,
+            '>' if parameters > 0 => parameters -= 1,
+            _ if parameters > 0 => {}
+            c => out.push(c),
+        }
+    }
+    match out.find("::") {
+        Some(at) => out[..at].to_string(),
+        None => out,
+    }
+}
+
+fn tagged_text(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let close = (start + 1..chars.len()).find(|&i| chars[i] == '>' || chars[i] == '<')?;
+    if chars[close] != '>' || close == start + 1 || chars.get(close + 1) != Some(&'{') {
+        return None;
+    }
+    let mut depth = 0;
+    for (i, &c) in chars.iter().enumerate().skip(close + 1) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((chars[close + 2..i].iter().collect(), i + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Class and ascendancy fields the viewer draws with and GGG's export, as PoB
@@ -674,6 +769,27 @@ mod tests {
         ];
         for (value, expected) in cases {
             assert_eq!(float_repr(value), expected);
+        }
+    }
+
+    #[test]
+    fn markup_strips_to_the_drawn_text() {
+        let cases: [(&str, &str); 12] = [
+            ("[Poison|Poisons] you inflict deal Damage 20% [DamageFaster|Faster]", "Poisons you inflict deal Damage 20% Faster"),
+            ("40% increased Effect of [Onslaught] on you", "40% increased Effect of Onslaught on you"),
+            ("Grants Level 20 [Barkskin::20|Barkskin]", "Grants Level 20 Barkskin"),
+            ("Grants [PrimalAegis::20|Primal Aegis]", "Grants Primal Aegis"),
+            ("Socketed Gems are Supported by Level 10 [SupportFortify::10|Fortify Support]", "Socketed Gems are Supported by Level 10 Fortify Support"),
+            ("Supported by [SupportPredator<gemlevel {0}>|Predator]", "Supported by Predator"),
+            ("Supported by [SupportPredator<gemlevel 20>|Predator] and [Blind|Blinded]", "Supported by Predator and Blinded"),
+            ("[SupportPredator<gemlevel 20>] and [Detonate::1]", "SupportPredator and Detonate"),
+            ("Grants Skill: <underline>{[Bleed|Bleeding]}", "Grants Skill: Bleeding"),
+            ("[AssassinsMarkTriggeredAssassin::30|Assassin's Mark]", "Assassin's Mark"),
+            ("unclosed [Blind and <tag> and []", "unclosed [Blind and <tag> and []"),
+            ("Life < 50% and > 10%", "Life < 50% and > 10%"),
+        ];
+        for (raw, shown) in cases {
+            assert_eq!(strip_markup(raw), shown, "{}", raw);
         }
     }
 
