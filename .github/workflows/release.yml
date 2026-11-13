@@ -64,7 +64,7 @@ jobs:
   build-linux:
     name: Build Linux
     needs: verify
-    # The binary needs the glibc it was built against, so build on the oldest Ubuntu still supported.
+    # The binary needs a glibc at least as new as the one it is built with, so build on 24.04 LTS.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
