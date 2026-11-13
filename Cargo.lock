@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "ggpk-explorer"
-version = "1.14.3"
+version = "1.14.4"
 dependencies = [
  "anyhow",
  "bincode",
