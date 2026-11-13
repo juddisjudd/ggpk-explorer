@@ -139,6 +139,13 @@ pub fn build_skill_graph_db_from(
         fetch_file(path).ok_or_else(|| format!("Could not read {}", path))
     };
     let fetch_optional = |path: &str| -> Option<Vec<u8>> { fetch_file(path) };
+    // PoE 1 ships its descriptions as `.csd` from 3.30 on and as `.txt` before.
+    let fetch_description = |path: &str| -> Option<atlas_node_db::StatCsdSource> {
+        [Some(path.to_string()), crate::pob_export::statdesc::other_format(path)]
+            .into_iter()
+            .flatten()
+            .find_map(|path| fetch_file(&path).map(|bytes| atlas_node_db::StatCsdSource { path, bytes }))
+    };
     // PoE 2 keeps its tables under `data/balance/` and its descriptions as
     // `.csd`; PoE 1 keeps both one level up.
     let table = |name: &str| match is_poe2 {
@@ -161,14 +168,14 @@ pub fn build_skill_graph_db_from(
         // stats as what nearby enemies or allies get, and belongs to buffs.
         false => ["atlas_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions"]
             .iter()
-            .map(|n| format!("metadata/statdescriptions/{}.txt", n))
+            .map(|n| format!("metadata/statdescriptions/{}.csd", n))
             .collect(),
     };
     let mut stat_csd_sources = Vec::new();
     for path in csd_paths {
         // A tree file one game does not ship simply adds nothing.
-        let Some(bytes) = fetch_optional(&path) else { continue };
-        stat_csd_sources.push(atlas_node_db::StatCsdSource { path, bytes });
+        let Some(source) = fetch_description(&path) else { continue };
+        stat_csd_sources.push(source);
     }
     if stat_csd_sources.is_empty() {
         return Err("no passive tree stat descriptions found".to_string());
@@ -179,19 +186,15 @@ pub fn build_skill_graph_db_from(
         descendancy: fetch_optional(&table("descendancy")),
         mastery_effects: fetch_optional(&table("passiveskillmasteryeffects")),
         reminder_text: fetch_optional(&table("remindertext")),
-        aura_descriptions: fetch_optional("metadata/statdescriptions/passive_skill_aura_stat_descriptions.txt").map(|bytes| {
-            atlas_node_db::StatCsdSource {
-                path: "metadata/statdescriptions/passive_skill_aura_stat_descriptions.txt".to_string(),
-                bytes,
-            }
-        }),
+        aura_descriptions: fetch_description("metadata/statdescriptions/passive_skill_aura_stat_descriptions.csd"),
         buff_templates: fetch_optional(&table("bufftemplates")),
         buff_definitions: fetch_optional(&table("buffdefinitions")),
         atlas_subtrees: fetch_optional(&table("atlaspassiveskillsubtrees")),
         characters: fetch_optional(&table("characters")),
         decorators: fetch_optional(&table("passivetreedecorators")),
         mastery_groups: fetch_optional(&table("passiveskillmasterygroups")),
-        mastery_art: fetch_optional(&table("passiveskilltreemasteryart")),
+        mastery_art: atlas_node_db::mastery_art_table(schema, is_poe2)
+            .and_then(|name| fetch_optional(&table(&name.to_ascii_lowercase()))),
     };
 
     let mut db = atlas_node_db::build(

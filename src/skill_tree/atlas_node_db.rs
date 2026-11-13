@@ -667,24 +667,50 @@ pub struct ExtraTables {
     pub mastery_art: Option<Vec<u8>>,
 }
 
-fn parse_mastery_effect_images(groups: Vec<u8>, art: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<HashMap<usize, String>, String> {
-    let art_table = find_table(schema, "PassiveSkillTreeMasteryArt", is_poe2)?;
-    let art_reader = crate::dat::analysis::open_checked(art, "passiveskilltreemasteryart.datc64", art_table)?;
-    let image_col = col_index(art_table, "ActiveEffectImage").ok_or("PassiveSkillTreeMasteryArt missing ActiveEffectImage")?;
-    let images: Vec<Option<String>> = (0..art_reader.row_count)
-        .map(|i| art_reader.read_row(i, art_table).ok().and_then(|r| r.get(image_col).and_then(as_string)))
-        .collect();
+/// A mastery group's icons as the row its `Art` key names holds them.
+#[derive(Debug, Clone, Default)]
+struct MasteryArt {
+    inactive_icon: Option<String>,
+    active_icon: Option<String>,
+    active_effect_image: Option<String>,
+}
+
+/// Each mastery group's art, read from whichever table the schema's `Art` key names.
+fn parse_mastery_art(groups: Vec<u8>, art: Vec<u8>, schema: &Schema, is_poe2: bool) -> Result<HashMap<usize, MasteryArt>, String> {
     let groups_table = find_table(schema, "PassiveSkillMasteryGroups", is_poe2)?;
-    let groups_reader = crate::dat::analysis::open_checked(groups, "passiveskillmasterygroups.datc64", groups_table)?;
     let art_col = col_index(groups_table, "Art").ok_or("PassiveSkillMasteryGroups missing Art")?;
+    let art_name = mastery_art_table(schema, is_poe2).ok_or("PassiveSkillMasteryGroups.Art names no table")?;
+    let art_table = find_table(schema, &art_name, is_poe2)?;
+    let art_reader =
+        crate::dat::analysis::open_checked(art, &format!("{}.datc64", art_name.to_ascii_lowercase()), art_table)?;
+    let cols = (
+        col_index(art_table, "InactiveIcon"),
+        col_index(art_table, "ActiveIcon"),
+        col_index(art_table, "ActiveEffectImage").ok_or_else(|| format!("{} missing ActiveEffectImage", art_name))?,
+    );
+    let rows: Vec<MasteryArt> = (0..art_reader.row_count)
+        .map(|i| {
+            let row = art_reader.read_row(i, art_table).ok();
+            let text = |col: Option<usize>| row.as_ref().and_then(|r| col.and_then(|c| r.get(c)).and_then(as_string));
+            MasteryArt { inactive_icon: text(cols.0), active_icon: text(cols.1), active_effect_image: text(Some(cols.2)) }
+        })
+        .collect();
+    let groups_reader = crate::dat::analysis::open_checked(groups, "passiveskillmasterygroups.datc64", groups_table)?;
     let mut out = HashMap::new();
     for i in 0..groups_reader.row_count {
         let row = groups_reader.read_row(i, groups_table).map_err(|e| e.to_string())?;
-        if let Some(img) = row.get(art_col).and_then(as_foreign_row).and_then(|a| images.get(a).cloned().flatten()) {
-            out.insert(i as usize, img);
+        if let Some(art) = row.get(art_col).and_then(as_foreign_row).and_then(|a| rows.get(a).cloned()) {
+            out.insert(i as usize, art);
         }
     }
     Ok(out)
+}
+
+/// The table `PassiveSkillMasteryGroups.Art` points at, if the schema has that column.
+pub fn mastery_art_table(schema: &Schema, is_poe2: bool) -> Option<String> {
+    let groups = schema.find_table("PassiveSkillMasteryGroups", is_poe2)?;
+    let art = groups.columns.iter().find(|c| c.name.as_deref() == Some("Art"))?;
+    art.references.as_ref().map(|r| r.table.clone())
 }
 
 pub fn build(
@@ -708,13 +734,17 @@ pub fn build(
         characters: characters_bytes,
         decorators: decorators_bytes,
         mastery_groups,
-        mastery_art,
+        mastery_art: mastery_art_bytes,
     } = extra;
     let mastery_group_bytes = mastery_groups.clone();
-    let mastery_effect_images = match (mastery_groups, mastery_art) {
-        (Some(groups), Some(art)) => parse_mastery_effect_images(groups, art, schema, is_poe2).unwrap_or_default(),
+    let mastery_art = match (mastery_groups, mastery_art_bytes) {
+        (Some(groups), Some(art)) => parse_mastery_art(groups, art, schema, is_poe2).unwrap_or_default(),
         _ => HashMap::new(),
     };
+    let mastery_effect_images: HashMap<usize, String> = mastery_art
+        .iter()
+        .filter_map(|(group, art)| art.active_effect_image.clone().map(|image| (*group, image)))
+        .collect();
     let stats_table = find_table(schema, "Stats", is_poe2)?;
     let stats_reader = crate::dat::analysis::open_checked(stats_bytes, "stats.datc64", stats_table)?;
     let stats_id_col = col_index(stats_table, "Id").ok_or("Stats table missing Id column")?;
@@ -793,12 +823,29 @@ pub fn build(
     let reminder_by_id: HashMap<&str, &str> =
         reminders.iter().map(|(id, text)| (id.as_str(), text.as_str())).collect();
 
-    let mastery_group_table = mastery_group_bytes
+    let mut mastery_group_table = mastery_group_bytes
         .zip(mastery_effects_bytes)
         .and_then(|(groups, effects)| {
             parse_mastery_groups(groups, effects, schema, is_poe2, &stat_ids, &lookup, &reminder_by_id).ok()
         })
         .unwrap_or_default();
+    // PoE 1 moved a group's icons onto the row its `Art` key names in 3.30.
+    if !is_poe2 {
+        for (group, art) in &mastery_art {
+            let Some(entry) = mastery_group_table.get_mut(group) else { continue };
+            for (field, value) in [
+                (&mut entry.inactive_icon, &art.inactive_icon),
+                (&mut entry.active_icon, &art.active_icon),
+                (&mut entry.active_effect_image, &art.active_effect_image),
+            ] {
+                if field.is_empty() {
+                    if let Some(value) = value {
+                        field.clone_from(value);
+                    }
+                }
+            }
+        }
+    }
     // A node can also grant a buff, whose own stats the tree prints beside its
     // own — worded as what the buff does to whoever it reaches.
     let aura_lookup = match aura_descriptions.and_then(|s| csd::parse_csd(&s.bytes, &s.path).ok()) {
