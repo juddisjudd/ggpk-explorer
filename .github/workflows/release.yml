@@ -64,7 +64,8 @@ jobs:
   build-linux:
     name: Build Linux
     needs: verify
-    runs-on: ubuntu-latest
+    # The binary needs the glibc it was built against, so build on the oldest Ubuntu still supported.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -92,7 +93,7 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
         with:
-          shared-key: "release-build-linux"
+          shared-key: "release-build-linux-ubuntu-24.04"
 
       - name: Test
         run: cargo test --release --locked
