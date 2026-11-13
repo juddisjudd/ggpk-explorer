@@ -22,6 +22,7 @@ pub struct ChromeActions {
     pub open_diff: bool,
     pub export_data: bool,
     pub export_pob: bool,
+    pub export_tree: bool,
     pub export_tables: bool,
     pub open_about: bool,
     pub open_command_palette: bool,
@@ -41,6 +42,7 @@ impl ChromeActions {
             open_diff: false,
             export_data: false,
             export_pob: false,
+            export_tree: false,
             export_tables: false,
             open_about: false,
             open_command_palette: false,
@@ -368,6 +370,7 @@ impl AppChrome {
                         let mut open_steam = false;
                         let mut export_data = false;
                         let mut export_pob = false;
+                        let mut export_tree = false;
                         let mut export_tables = false;
                         let mut toggle_inspector = false;
                         Self::nav_button_menu(ui, "File", |ui| {
@@ -401,6 +404,14 @@ impl AppChrome {
                                 ui.close_menu();
                             }
                             if ui
+                                .button("Export PoB Tree...")
+                                .on_hover_text("Write Path of Building's passive tree folders (src/TreeData) for the open patch")
+                                .clicked()
+                            {
+                                export_tree = true;
+                                ui.close_menu();
+                            }
+                            if ui
                                 .button("Export DAT Tables...")
                                 .on_hover_text("Write every DAT table whole, as JSON and/or CSV, with foreign keys named by their target row's key")
                                 .clicked()
@@ -430,6 +441,9 @@ impl AppChrome {
                         }
                         if export_pob {
                             actions.export_pob = true;
+                        }
+                        if export_tree {
+                            actions.export_tree = true;
                         }
                         if export_tables {
                             actions.export_tables = true;

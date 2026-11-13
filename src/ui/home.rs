@@ -25,6 +25,7 @@ pub struct HomeActions {
     pub open_palette: bool,
     pub export_data: bool,
     pub export_pob: bool,
+    pub export_tree: bool,
     pub export_tables: bool,
     pub open_diff: bool,
     /// A kind of file the user clicked, to filter the tree to.
@@ -104,6 +105,7 @@ pub fn show(ui: &mut egui::Ui, view: &HomeView) -> HomeActions {
                     ui.set_width(ui.available_width());
                     actions.export_data = action(ui, "Game data…", "mods, skills, base items and stat translations as JSON");
                     actions.export_pob = action(ui, "PoB data…", "Path of Building's data files");
+                    actions.export_tree = action(ui, "PoB tree…", "Path of Building's passive tree folders");
                     actions.export_tables = action(ui, "DAT tables…", "every table whole, as JSON or CSV");
                 });
 

@@ -1,6 +1,7 @@
 //! Options for the data exports: which dumps to write, whether to pull the
 //! art with them, and where they land. One dialog serves the RePoE-style
-//! dumps, Path of Building's data files and the whole-table dump.
+//! dumps, Path of Building's data files and passive trees, and the
+//! whole-table dump.
 
 use crate::data_export::DataExportOptions;
 use crate::settings::Game;
@@ -24,6 +25,8 @@ pub enum ExportKind {
     Semantic,
     /// Path of Building's `src/Data` files, as pob-data JSON.
     Pob,
+    /// Path of Building's `src/TreeData` folders.
+    Tree,
     /// Every DAT table, whole.
     Tables,
 }
@@ -33,7 +36,18 @@ impl ExportKind {
         match self {
             ExportKind::Semantic => crate::data_export::registry(),
             ExportKind::Pob => crate::pob_export::registry(),
+            ExportKind::Tree => crate::pob_tree::registry(),
             ExportKind::Tables => Vec::new(),
+        }
+    }
+
+    /// What one entry in the module list is called.
+    fn unit(self, count: usize) -> &'static str {
+        match (self, count) {
+            (ExportKind::Tree, 1) => "tree",
+            (ExportKind::Tree, _) => "trees",
+            (_, 1) => "dump",
+            _ => "dumps",
         }
     }
 }
@@ -117,15 +131,24 @@ impl DataExportWindow {
             },
             images: self.images && self.kind == ExportKind::Semantic,
             trade_stats: self.trade_stats && self.kind == ExportKind::Semantic,
-            version: self.versioned.then(|| self.version.clone()).flatten(),
+            // PoB names a tree's folder after its patch, so the tree export needs it even when flat.
+            version: (self.versioned || self.kind == ExportKind::Tree).then(|| self.version.clone()).flatten(),
             flat: !self.versioned,
-            strip_null: self.strip_null && self.kind != ExportKind::Pob,
+            strip_null: self.strip_null && matches!(self.kind, ExportKind::Semantic | ExportKind::Tables),
             table_formats: self.table_formats,
         }
     }
 
     fn selected(&self) -> usize {
         self.available().filter(|m| m.on).count()
+    }
+
+    fn ready(&self) -> bool {
+        match self.kind {
+            ExportKind::Tables => true,
+            ExportKind::Tree => self.version.is_some() && self.selected() > 0,
+            _ => self.selected() > 0,
+        }
     }
 
     /// Draws the dialog; true means the user asked to export.
@@ -146,6 +169,10 @@ impl DataExportWindow {
                 "Export PoB Data",
                 "Path of Building's data files: bases, skills, gems, mods, minions and stat descriptions, as the JSON repoe-fork publishes as pob-data. Files PoB writes by hand are listed in export_report.json.",
             ),
+            ExportKind::Tree => (
+                "Export PoB Tree",
+                "Path of Building's passive tree folders, as in its src/TreeData. PoE 2 gets 0_X with tree.lua, tree.json, the texture sheets and orbit images. PoE 1 gets 3_X and 3_X_ruthless with tree.lua, sprites.lua and the sheet images.",
+            ),
             ExportKind::Tables => (
                 "Export DAT Tables",
                 "Every table in the install, one file each. A foreign key names its target row by that row's unique key. Tables whose layout no longer matches the schema are left out and listed in export_report.json.",
@@ -164,7 +191,8 @@ impl DataExportWindow {
                 let skipped = self.modules.len() - self.available().count();
                 let reading = match skipped {
                     0 => format!("Reading {}", self.game.label()),
-                    n => format!("Reading {}. {} dumps belong to the other game.", self.game.label(), n),
+                    1 => format!("Reading {}. 1 {} belongs to the other game.", self.game.label(), kind.unit(1)),
+                    n => format!("Reading {}. {} {} belong to the other game.", self.game.label(), n, kind.unit(n)),
                 };
                 ui.label(egui::RichText::new(reading).size(12.0).color(muted));
 
@@ -180,11 +208,11 @@ impl DataExportWindow {
                     }
                     None => {
                         ui.add_enabled(false, egui::Checkbox::new(&mut false, "Patch folder"));
-                        ui.label(
-                            egui::RichText::new("Could not read the patch from the client log")
-                                .size(10.5)
-                                .color(muted),
-                        );
+                        let why = match kind {
+                            ExportKind::Tree => "Could not read the patch from the client log. PoB names each tree folder after its patch, so the tree cannot be exported. Start the game once to write the log.",
+                            _ => "Could not read the patch from the client log",
+                        };
+                        ui.label(egui::RichText::new(why).size(10.5).color(muted));
                     }
                 }
 
@@ -229,7 +257,7 @@ impl DataExportWindow {
 
                 if kind != ExportKind::Tables {
                     ui.horizontal(|ui| {
-                        modal_section(ui, "DUMPS");
+                        modal_section(ui, if kind == ExportKind::Tree { "TREES" } else { "DUMPS" });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("None").clicked() {
                                 self.modules.iter_mut().for_each(|m| m.on = false);
@@ -262,7 +290,7 @@ impl DataExportWindow {
 
             });
             modal::footer(ui, |ui| {
-                let ready = kind == ExportKind::Tables || self.selected() > 0;
+                let ready = self.ready();
                 if action(ui, "Choose folder and export", Kind::Primary, ready).clicked() {
                     confirmed = true;
                     should_close = true;
@@ -339,6 +367,23 @@ mod tests {
         let options = w.options();
         assert!(!options.images && !options.strip_null, "the extras belong to the RePoE export");
         assert!(options.only.is_empty());
+    }
+
+    #[test]
+    fn the_tree_dialog_keeps_the_patch_even_when_flat() {
+        let mut w = DataExportWindow::new(ExportKind::Tree);
+        w.strip_null = true;
+        w.open_with(Some("4.5.5.4".into()), Game::Poe2);
+        assert!(w.modules.iter().any(|m| m.name == "ruthless" && m.skipped.is_some() && !m.on));
+        w.versioned = false;
+        let options = w.options();
+        assert_eq!(options.version.as_deref(), Some("4.5.5.4"), "the tree module names its folder from the patch");
+        assert!(options.flat && !options.strip_null && options.only.is_empty());
+        assert!(w.ready());
+
+        w.open_with(None, Game::Poe1);
+        assert!(!w.ready(), "without a patch the tree has no folder name");
+        assert!(w.modules.iter().all(|m| m.on), "PoE 1 writes both trees");
     }
 
     #[test]

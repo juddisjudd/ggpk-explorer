@@ -56,6 +56,7 @@ pub struct ExplorerApp {
     pub export_window: crate::ui::export_window::ExportWindow,
     pub data_export_window: crate::ui::data_export_window::DataExportWindow,
     pub pob_export_window: crate::ui::data_export_window::DataExportWindow,
+    pub pob_tree_export_window: crate::ui::data_export_window::DataExportWindow,
     pub table_export_window: crate::ui::data_export_window::DataExportWindow,
     pub diff_window: crate::ui::diff_window::DiffWindow,
     pub show_about: bool,
@@ -166,6 +167,9 @@ impl ExplorerApp {
             data_export_window: Default::default(),
             pob_export_window: crate::ui::data_export_window::DataExportWindow::new(
                 crate::ui::data_export_window::ExportKind::Pob,
+            ),
+            pob_tree_export_window: crate::ui::data_export_window::DataExportWindow::new(
+                crate::ui::data_export_window::ExportKind::Tree,
             ),
             table_export_window: crate::ui::data_export_window::DataExportWindow::new(
                 crate::ui::data_export_window::ExportKind::Tables,
@@ -876,6 +880,7 @@ impl ExplorerApp {
         match kind {
             crate::ui::data_export_window::ExportKind::Semantic => self.data_export_window.open_with(version, game),
             crate::ui::data_export_window::ExportKind::Pob => self.pob_export_window.open_with(version, game),
+            crate::ui::data_export_window::ExportKind::Tree => self.pob_tree_export_window.open_with(version, game),
             crate::ui::data_export_window::ExportKind::Tables => self.table_export_window.open_with(version, game),
         }
     }
@@ -900,6 +905,7 @@ impl ExplorerApp {
             .set_title(match kind {
                 crate::ui::data_export_window::ExportKind::Semantic => "Choose a folder for the game data export",
                 crate::ui::data_export_window::ExportKind::Pob => "Choose a folder for the PoB data export",
+                crate::ui::data_export_window::ExportKind::Tree => "Choose a folder for the PoB tree export",
                 crate::ui::data_export_window::ExportKind::Tables => "Choose a folder for the table export",
             })
             .pick_folder()
@@ -924,6 +930,9 @@ impl ExplorerApp {
             }
             crate::ui::data_export_window::ExportKind::Pob => {
                 crate::pob_export::run(files, schema, is_poe2, out_dir, options, tx)
+            }
+            crate::ui::data_export_window::ExportKind::Tree => {
+                crate::pob_tree::run(files, schema, is_poe2, out_dir, options, tx)
             }
             crate::ui::data_export_window::ExportKind::Tables => {
                 crate::table_export::run(files, schema, is_poe2, out_dir, options, tx)
@@ -1344,6 +1353,9 @@ impl eframe::App for ExplorerApp {
         if chrome_actions.export_pob {
             self.open_data_export(crate::ui::data_export_window::ExportKind::Pob);
         }
+        if chrome_actions.export_tree {
+            self.open_data_export(crate::ui::data_export_window::ExportKind::Tree);
+        }
         if chrome_actions.export_tables {
             self.open_data_export(crate::ui::data_export_window::ExportKind::Tables);
         }
@@ -1354,6 +1366,10 @@ impl eframe::App for ExplorerApp {
         if self.pob_export_window.show(ctx) {
             let options = self.pob_export_window.options();
             self.start_data_export(options, crate::ui::data_export_window::ExportKind::Pob);
+        }
+        if self.pob_tree_export_window.show(ctx) {
+            let options = self.pob_tree_export_window.options();
+            self.start_data_export(options, crate::ui::data_export_window::ExportKind::Tree);
         }
         if self.table_export_window.show(ctx) {
             let options = self.table_export_window.options();
@@ -1639,6 +1655,7 @@ impl eframe::App for ExplorerApp {
         for (wanted, kind) in [
             (home_actions.export_data, crate::ui::data_export_window::ExportKind::Semantic),
             (home_actions.export_pob, crate::ui::data_export_window::ExportKind::Pob),
+            (home_actions.export_tree, crate::ui::data_export_window::ExportKind::Tree),
             (home_actions.export_tables, crate::ui::data_export_window::ExportKind::Tables),
         ] {
             if wanted {
