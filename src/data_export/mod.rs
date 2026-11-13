@@ -321,9 +321,14 @@ impl<'a> Ctx<'a> {
 
     /// Where this game keeps its stat description files, and their extension.
     pub fn description_files(&self) -> (&'static str, &'static str) {
+        const POE1_DIR: &str = "Metadata/StatDescriptions/";
         match self.rr.is_poe2 {
             true => ("Data/StatDescriptions/", ".csd"),
-            false => ("Metadata/StatDescriptions/", ".txt"),
+            // PoE 1 ships them as `.csd` from 3.30 on, and as `.txt` before.
+            false => match self.files.exists(&format!("{}stat_descriptions.csd", POE1_DIR)) {
+                true => (POE1_DIR, ".csd"),
+                false => (POE1_DIR, ".txt"),
+            },
         }
     }
 

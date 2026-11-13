@@ -57,7 +57,9 @@ pub fn stat_descriptions(ctx: &Ctx) -> Result<(), String> {
     };
     let mut written = 0;
     for name in names {
-        let Some(text) = read_text(ctx, &format!("{}{}{}", dir, name, ext)) else { continue };
+        let path = format!("{}{}{}", dir, name, ext);
+        let text = read_text(ctx, &path).or_else(|| statdesc::other_format(&path).and_then(|other| read_text(ctx, &other)));
+        let Some(text) = text else { continue };
         write(ctx, &format!("StatDescriptions/{}", name), statdesc::export_file(&text, game))?;
         written += 1;
     }

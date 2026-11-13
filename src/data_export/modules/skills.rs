@@ -753,8 +753,8 @@ fn skill_description_files(ctx: &Ctx) -> HashMap<String, String> {
 }
 
 /// A skill's own description file if it has one, then the generic one. The
-/// name is reported as RePoE reports it, with the PoE 1 `.txt` extension on
-/// the shared files.
+/// name is reported as RePoE reports it; PoE 1's shared files carry the
+/// extension the patch ships them with.
 fn pick_translation_file(
     ctx: &Ctx,
     skill_id: Option<&str>,
@@ -762,9 +762,10 @@ fn pick_translation_file(
     poe1_files: &HashMap<String, String>,
 ) -> (Option<String>, Option<std::rc::Rc<TranslationLookup>>) {
     if !ctx.rr.is_poe2 {
+        let (_, ext) = ctx.description_files();
         let file = match skill_id {
-            None => "gem_stat_descriptions.txt".to_string(),
-            Some(skill) => poe1_files.get(skill).cloned().unwrap_or_else(|| "skill_stat_descriptions.txt".to_string()),
+            None => format!("gem_stat_descriptions{}", ext),
+            Some(skill) => poe1_files.get(skill).cloned().unwrap_or_else(|| format!("skill_stat_descriptions{}", ext)),
         };
         let translations = ctx.translations(&file);
         return (Some(file), Some(translations));

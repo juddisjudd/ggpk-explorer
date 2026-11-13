@@ -401,8 +401,15 @@ fn lang_line(line: &str) -> bool {
 pub fn description_dir(game: Game) -> (&'static str, &'static str) {
     match game {
         Game::Poe2 => ("Data/StatDescriptions/", ".csd"),
-        Game::Poe1 => ("Metadata/StatDescriptions/", ".txt"),
+        Game::Poe1 => ("Metadata/StatDescriptions/", ".csd"),
     }
+}
+
+/// The same description file in the other format: PoE 1 ships `.csd` from 3.30 on and `.txt` before.
+pub fn other_format(path: &str) -> Option<String> {
+    path.strip_suffix(".csd")
+        .map(|stem| format!("{}.txt", stem))
+        .or_else(|| path.strip_suffix(".txt").map(|stem| format!("{}.csd", stem)))
 }
 
 /// A description as the describer holds it.
@@ -544,7 +551,8 @@ impl Descriptors {
 
     fn parse_file(&mut self, name: &str, state: &mut ParseState, fetch: &dyn Fn(&str) -> Option<Vec<u8>>) {
         let (dir, _) = description_dir(self.game);
-        let Some(bytes) = fetch(&format!("{}{}", dir, name)) else { return };
+        let path = format!("{}{}", dir, name);
+        let Some(bytes) = fetch(&path).or_else(|| other_format(&path).and_then(|other| fetch(&other))) else { return };
         let text = decode_utf16(&bytes);
         for line in lines(&text) {
             self.process_line(line, state, fetch);
@@ -960,7 +968,7 @@ pub fn export_file(text: &str, game: Game) -> Table {
     let mut current: Option<i64> = None;
     let mut english = false;
     let mut prepend = String::new();
-    let (dir, ext) = description_dir(game);
+    let (dir, _) = description_dir(game);
     for raw_line in lines(text) {
         let joined;
         let line = if prepend.is_empty() {
@@ -973,7 +981,8 @@ pub fn export_file(text: &str, game: Game) -> Table {
         let include = format!("include \"{}", dir);
         if let Some(at) = line.find(&include) {
             let rest = &line[at + include.len()..];
-            if let Some(parent) = rest.strip_suffix(&format!("{}\"", ext)).filter(|p| !p.is_empty()) {
+            let parent = rest.strip_suffix(".csd\"").or_else(|| rest.strip_suffix(".txt\""));
+            if let Some(parent) = parent.filter(|p| !p.is_empty()) {
                 let parent = match game {
                     Game::Poe2 => parent.replace('\\', "/").replace("/statset", "_statset"),
                     Game::Poe1 => parent.to_string(),
@@ -1106,5 +1115,23 @@ description\r\n\
         // gmatch restarts inside the second pair, as Lua does.
         assert_eq!(split_escaped_lines("a\\n\\nb"), ["a", "nb"]);
         assert_eq!(lua_literal("line one\\nline two"), "line one\nline two");
+    }
+
+    #[test]
+    fn reads_poe1_descriptions_in_either_format() {
+        let bytes: Vec<u8> = SAMPLE.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        for shipped in ["Metadata/StatDescriptions/x.csd", "Metadata/StatDescriptions/x.txt"] {
+            let d = Descriptors::load(Game::Poe1, "x.txt", &|path| (path == shipped).then(|| bytes.clone()));
+            assert!(d.by_stat.contains_key("base_fire_damage_resistance_%"), "{}", shipped);
+        }
+    }
+
+    #[test]
+    fn names_the_parent_in_either_format() {
+        for include in ["stat_descriptions.csd", "stat_descriptions.txt"] {
+            let text = format!("include \"Metadata/StatDescriptions/{}\"\r\n", include);
+            let t = export_file(&text, Game::Poe1);
+            assert_eq!(t.get("parent"), Some(&Lua::from("stat_descriptions")), "{}", include);
+        }
     }
 }
