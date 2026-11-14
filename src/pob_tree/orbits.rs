@@ -66,7 +66,7 @@ pub fn write(ctx: &Ctx, texture: &str, mask: &str, dir: &Path, basename: &str) -
     Ok(())
 }
 
-fn decode(ctx: &Ctx, path: &str) -> Result<RgbaImage, String> {
+pub(super) fn decode(ctx: &Ctx, path: &str) -> Result<RgbaImage, String> {
     let bytes = crate::dat::relational::FileSource::fetch(ctx.files, path).ok_or_else(|| format!("{} is not in this install", path))?;
     let dds = ddsfile::Dds::read(&mut std::io::Cursor::new(&bytes)).map_err(|e| format!("{}: {}", path, e))?;
     image_dds::image_from_dds(&dds, 0).map_err(|e| format!("{}: {}", path, e))

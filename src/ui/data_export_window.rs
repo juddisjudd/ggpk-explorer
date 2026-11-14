@@ -171,7 +171,7 @@ impl DataExportWindow {
             ),
             ExportKind::Tree => (
                 "Export PoB Tree",
-                "Path of Building's passive tree folders, as in its src/TreeData. PoE 2 gets 0_X with tree.lua, tree.json, the texture sheets and orbit images. PoE 1 gets 3_X and 3_X_ruthless with tree.lua, sprites.lua and the sheet images.",
+                "Path of Building's passive tree folders, as in its src/TreeData. PoE 2 gets 0_X with tree.lua, tree.json, the texture sheets and orbit images. PoE 1 gets 3_X and 3_X_ruthless with tree.lua, sprites.lua and the sheet images. Assets adds what PoB keeps beside those folders: legion sheets, class backgrounds, jewel circles and the Assets rings.",
             ),
             ExportKind::Tables => (
                 "Export DAT Tables",

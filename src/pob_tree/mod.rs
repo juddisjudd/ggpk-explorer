@@ -8,10 +8,13 @@
 //! game (the same builder as the tree viewer's export) and then put through
 //! the two steps PoB's release process runs on it.
 
+mod assets;
 mod dds;
 mod format;
+mod legion;
 mod luajit;
 mod orbits;
+mod pixels;
 mod poe1;
 mod poe2;
 
@@ -26,6 +29,7 @@ pub fn registry() -> Vec<Module> {
     vec![
         module("tree", "The character tree: PoE 2's 0_X, PoE 1's 3_X", tree),
         poe1_only("ruthless", "PoE 1's Ruthless tree, 3_X_ruthless", ruthless, "PoE 2 has no Ruthless tree"),
+        module("assets", "Images PoB keeps beside the tree folders: legion sheets, class backgrounds, jewel radius art, rings", assets::write),
     ]
 }
 
@@ -41,7 +45,7 @@ pub fn run(
     options: DataExportOptions,
     tx: Sender<ExportStatus>,
 ) {
-    let kind = RunKind { file_suffix: "", unit: "passive trees", extra_report: Vec::<(String, json::J)>::new() };
+    let kind = RunKind { file_suffix: "", unit: "passive tree parts", extra_report: Vec::<(String, json::J)>::new() };
     crate::data_export::run_with(registry(), kind, files, schema, is_poe2, out, options, tx);
 }
 
