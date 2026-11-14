@@ -48,6 +48,8 @@ pub struct ExtraTables {
     pub granted_effects: HashMap<usize, GrantedEffect>,
     /// Jewel radius ring textures (`PassiveJewelRadiiArt`), deduplicated.
     pub jewel_radius_art: Vec<String>,
+    /// What a tattoo or other override draws behind its node (`PassiveSkillOverrides.PassiveBG`), and whether any of them sits behind a notable or keystone (PoE 1).
+    pub tattoo_backgrounds: Vec<(String, bool)>,
     /// Graph ids of the passives a cluster jewel can add, which sit in no
     /// group because the jewel places them (PoE 1).
     pub expansion_pool: Vec<u32>,
@@ -470,6 +472,31 @@ pub fn load(source: &TreeExportSource, db: &SkillGraphDatabase, psg_path: &str) 
                         unsupported: effects.flag(&effect, "CannotBeSupported"),
                     },
                 );
+            }
+        }
+    }
+
+    if let Some(t) = open(source, db, "PassiveSkillOverrides").filter(|_| !db.is_poe2) {
+        let small_targets: Vec<usize> = match (open(source, db, "PassiveSkillTattoos"), open(source, db, "PassiveSkillTattooTargetSets")) {
+            (Some(tattoos), Some(sets)) => tattoos
+                .rows()
+                .filter(|row| {
+                    let set = tattoos.row_ref(row, "Set").and_then(|s| sets.row(s)).map(|s| sets.string(&s, "Id")).unwrap_or_default();
+                    set.starts_with("Small") || set == "Mastery"
+                })
+                .filter_map(|row| tattoos.row_ref(&row, "Override"))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (i, row) in t.rows().enumerate() {
+            let path = t.string(&row, "PassiveBG");
+            if path.is_empty() {
+                continue;
+            }
+            let large = !small_targets.contains(&i);
+            match out.tattoo_backgrounds.iter_mut().find(|(p, _)| p.eq_ignore_ascii_case(&path)) {
+                Some(seen) => seen.1 |= large,
+                None => out.tattoo_backgrounds.push((path, large)),
             }
         }
     }

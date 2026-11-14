@@ -178,7 +178,7 @@ const EXTRA_IMAGES: [(f64, f64, &str); 6] = [
 /// Every table the web export reads. It reads them without the fit check, so
 /// they are checked here first: a patch that moved one stops the run rather
 /// than letting it read the wrong bytes.
-const TABLES: [&str; 37] = [
+const TABLES: [&str; 40] = [
     "ActiveSkills",
     "Ascendancy",
     "AscendancyPassiveSkillOverrides",
@@ -199,7 +199,10 @@ const TABLES: [&str; 37] = [
     "PassiveJewelSlots",
     "PassiveSkillMasteryEffects",
     "PassiveSkillMasteryGroups",
+    "PassiveSkillOverrides",
     "PassiveSkills",
+    "PassiveSkillTattoos",
+    "PassiveSkillTattooTargetSets",
     "PassiveSkillTreeConnectionArt",
     "PassiveSkillTreeGroupBackgroundArt",
     "PassiveSkillTreeMasteryArt",

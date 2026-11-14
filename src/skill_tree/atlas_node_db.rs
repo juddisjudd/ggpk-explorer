@@ -72,7 +72,7 @@ pub struct SkillGraphNodeInfo {
     pub granted_skill: Option<usize>,
     /// `GrantedEffectsPerLevel` row index (PoE 1).
     pub granted_effect: Option<usize>,
-    /// Unnamed column before `VariantType`: 1 to 6 names the Blightcore socket that grows this passive.
+    /// `BlightcoreSocket`, unnamed before `VariantType` in older schemas: 1 to 6 names the Blightcore socket that grows this passive.
     pub blightcore_socket: i32,
     pub stat_ids: Vec<String>,
     pub stat_values: Vec<i32>,
@@ -915,7 +915,9 @@ pub fn build(
     let visible_for_col = col_index(ps_table, "VisibleForAscendancy");
     let granted_skill_col = col_index(ps_table, "GrantedSkill");
     let granted_effect_col = col_index(ps_table, "GrantedEffectsPerLevel");
-    let blightcore_col = unnamed_col_near(ps_table, "VariantType", -1, "i32").filter(|_| !is_poe2);
+    let blightcore_col = col_index(ps_table, "BlightcoreSocket")
+        .or_else(|| unnamed_col_near(ps_table, "VariantType", -1, "i32"))
+        .filter(|_| !is_poe2);
     // PoE 1's Ruthless ("hardmode") keeps its own name, stats, points and
     // buffs beside the normal ones, for the nodes it changes.
     let hardmode_col = col_index(ps_table, "HasHardmodeAlternate").filter(|_| hardmode);

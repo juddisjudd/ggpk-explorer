@@ -366,6 +366,17 @@ pub(crate) fn export_tree(
     files += write("mastery-effect-active", &mastery_active, sheets::square_width(&mastery_active), &mut sheet_jsons, &mut sprite_jsons)?;
     files += write("mastery-effect-disabled", &mastery_inactive, sheets::square_width(&mastery_inactive), &mut sheet_jsons, &mut sprite_jsons)?;
 
+    progress("Tattoo backgrounds");
+    let tattoos: Vec<(String, RgbaImage)> = tree
+        .tattoo_effects
+        .iter()
+        .filter_map(|(key, path, large)| {
+            let (w, h) = TATTOO_EFFECT_SIZES[*large as usize];
+            store.get(path).map(|img| (key.clone(), sheets::resize(img, w / 2, h / 2)))
+        })
+        .collect();
+    files += write("tattoo-active-effect", &tattoos, sheets::square_width(&tattoos), &mut sheet_jsons, &mut sprite_jsons)?;
+
     progress("Atlas backdrops");
     let backdrops: Vec<(String, String)> =
         tree.atlas_backdrops.iter().map(|b| (b.sprite.clone(), b.path.clone())).collect();
@@ -456,6 +467,8 @@ pub struct TreeBuild {
     /// `(sprite key, texture path)` for the centre ring sheet.
     group_backgrounds: Vec<(String, String)>,
     jewel_radius: Vec<(String, String)>,
+    /// `(sprite key, art name, drawn large)` for what PoE 1 draws behind a tattooed node.
+    tattoo_effects: Vec<(String, String, bool)>,
     /// Mastery `ActiveEffectImage` paths used by this tree.
     mastery_images: Vec<String>,
     class_sheets: Vec<ClassSheet>,
@@ -712,6 +725,9 @@ const INTELLIGENCE_STATS: [&str; 7] = [
     "additional_dexterity_and_intelligence",
     "additional_all_attributes",
 ];
+
+/// GGG's export draws a tattoo's background, in game pixels, as large as the tribe art behind small passives and masteries and as the keystone art behind the rest.
+const TATTOO_EFFECT_SIZES: [(u32, u32); 2] = [(364, 360), (753, 758)];
 
 /// Stat lines plus the ones the client synthesises from other columns.
 fn stat_lines(info: &SkillGraphNodeInfo, ctx: &NodeContext) -> Vec<String> {
@@ -1334,6 +1350,12 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
         jewel_radius.push((format!("jewelRadius:{}", name), path.to_string()));
     }
 
+    let tattoo_effects: Vec<(String, String, bool)> = tables
+        .tattoo_backgrounds
+        .iter()
+        .map(|(p, large)| (format!("tattooActiveEffect:{}", png_path(p)), p.clone(), *large))
+        .collect();
+
     let mut texture_paths: Vec<String> = Vec::new();
     texture_paths.extend(icons.iter().map(|(_, p)| p.clone()));
     texture_paths.extend(frames.iter().map(|(_, p)| p.clone()));
@@ -1343,6 +1365,7 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
     texture_paths.extend(JEWEL_SOCKET_ART.iter().map(|(_, f)| format!("Art/2DArt/UIImages/InGame/{}", f)));
     texture_paths.extend(jewel_radius.iter().map(|(_, p)| p.clone()));
     texture_paths.extend(mastery_images.iter().cloned());
+    texture_paths.extend(tattoo_effects.iter().map(|(_, p, _)| p.clone()));
     for c in &class_sheets {
         texture_paths.extend(c.images.iter().map(|(_, p)| p.clone()));
     }
@@ -1380,6 +1403,7 @@ pub fn build_tree(psg: &PsgFile, db: &SkillGraphDatabase, tables: &tables::Extra
         group_backgrounds,
         jewel_radius,
         mastery_images,
+        tattoo_effects,
         class_sheets,
         atlas_backdrops: backdrops,
         texture_paths,
