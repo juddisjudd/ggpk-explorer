@@ -62,9 +62,11 @@ fn main() -> eframe::Result<()> {
     
 
     let args: Vec<String> = std::env::args().collect();
-    // Only a plain GUI start applies an update downloaded earlier, never a CLI command.
+    // Velopack logs an error for any copy its installer did not set up, and only a plain GUI start applies a downloaded update.
     #[cfg(windows)]
-    velopack::VelopackApp::build().set_auto_apply_on_startup(args.len() == 1).run();
+    if velopack::locator::auto_locate_app_manifest(velopack::locator::LocationContext::FromCurrentExe).is_ok() {
+        velopack::VelopackApp::build().set_auto_apply_on_startup(args.len() == 1).run();
+    }
     match args.get(1).map(String::as_str) {
         Some("inspect") => {
             if let Err(e) = cli::run_inspect() {
