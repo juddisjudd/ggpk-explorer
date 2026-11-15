@@ -13,6 +13,7 @@ use super::lua::{Lua, Table};
 use super::text::{escape_ggg_string, format_number, round, sanitise_text};
 use crate::settings::Game;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 /// `convertUTF16to8`: little-endian UTF-16 to UTF-8, stopping at a NUL. The
 /// byte-order mark is dropped; PoB keeps it but only ever on a line its
@@ -293,7 +294,8 @@ fn parse_limit(token: &str) -> (Limit, Limit) {
             return (Limit::Not, Limit::Num(lua_tonumber(rest).unwrap_or(0.0)));
         }
     }
-    // `([%d%-#]+)|([%d%-#]+)`, searched anywhere in the token.
+    // `([%d%-#]+)|([%d%-#]+)` anywhere in the token, after PoB's `gsub("(%d)#", "%1")` for 3.30's "1|99#".
+    let token = &strip_hash_after_digit(token);
     let side = |c: char| c.is_ascii_digit() || c == '-' || c == '#';
     if let Some(bar) = token.find('|') {
         let left: String = token[..bar].chars().rev().take_while(|&c| side(c)).collect::<Vec<_>>().into_iter().rev().collect();
@@ -303,6 +305,20 @@ fn parse_limit(token: &str) -> (Limit, Limit) {
         }
     }
     (Limit::Str(String::new()), Limit::Str(String::new()))
+}
+
+fn strip_hash_after_digit(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut prev_digit = false;
+    for c in token.chars() {
+        if c == '#' && prev_digit {
+            prev_digit = false;
+            continue;
+        }
+        prev_digit = c.is_ascii_digit();
+        out.push(c);
+    }
+    out
 }
 
 /// Lua's `line:match("%d+%s+([%w_%+%-%% ]+)")`: the stat ids after a count.
@@ -508,7 +524,11 @@ pub struct Descriptors {
     pub game: Game,
     pub descriptors: Vec<Descriptor>,
     pub by_stat: HashMap<String, usize>,
+    /// PoE 1's formatter functions (3.30 on): the names a value picks by row.
+    pub formatters: Rc<FormatterNames>,
 }
+
+pub type FormatterNames = HashMap<String, Vec<String>>;
 
 impl Descriptors {
     /// `loadStatFile(name)`. `fetch` reads a game file's bytes; `name` is the
@@ -666,7 +686,10 @@ impl Descriptors {
                 let SpecValue::Num(n) = arg else { continue };
                 let Some(slot) = slots.get_mut((*n as usize).wrapping_sub(1)) else { continue };
                 let v = slot.get_mut(stats, &mut locals);
-                apply_handler(self.game, key, v);
+                match self.formatters.get(key) {
+                    Some(names) => apply_formatter(names, v),
+                    None => apply_handler(self.game, key, v),
+                }
             }
             let values: Vec<StatValue> = slots.iter_mut().map(|s| s.get_mut(stats, &mut locals).clone()).collect();
             let text = fill_placeholders(&wording.text, &values, self.game);
@@ -809,7 +832,7 @@ fn apply_handler(game: Game, key: &str, v: &mut StatValue) {
         }
         "deciseconds_to_seconds" => {
             set(v, min / 10.0, max / 10.0);
-            v.fmt = ".2f".into();
+            v.fmt = if poe2 { ".2f" } else { "g" }.into();
         }
         "locations_to_metres" if !poe2 => g(v, min / 10.0, max / 10.0),
         "30%_of_value" => set(v, min * 0.3, max * 0.3),
@@ -828,6 +851,18 @@ fn apply_handler(game: Game, key: &str, v: &mut StatValue) {
         "plus_two_hundred" => set(v, min + 200.0, max + 200.0),
         _ => {}
     }
+}
+
+/// A formatter function: the value names a row, and a range shows its lowest, as PoE 1's per-value descriptions did.
+fn apply_formatter(names: &[String], v: &mut StatValue) {
+    let min = v.min.num();
+    if min >= 1.0 && min.fract() == 0.0 {
+        if let Some(name) = names.get(min as usize - 1) {
+            v.min = Val::Str(name.clone());
+        }
+    }
+    v.max = v.min.clone();
+    v.fmt = "s".into();
 }
 
 fn g(v: &mut StatValue, min: f64, max: f64) {
@@ -1045,6 +1080,19 @@ fn descriptor_mut(out: &mut Table, index: i64) -> &mut Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_drop_a_hash_after_a_digit_and_formatters_name_rows() {
+        assert!(matches!(parse_limit("1|99#"), (Limit::Num(a), Limit::Num(b)) if a == 1.0 && b == 99.0));
+        assert!(matches!(parse_limit("#|-1"), (Limit::Any, Limit::Num(b)) if b == -1.0));
+        let names = vec!["Small".to_string(), "Medium".to_string()];
+        let mut v = StatValue::new(2.0, 3.0);
+        apply_formatter(&names, &mut v);
+        assert_eq!((v.min.clone(), v.max.clone(), v.fmt()), (Val::Str("Medium".into()), Val::Str("Medium".into()), "s"));
+        let mut out_of_range = StatValue::new(9.0, 9.0);
+        apply_formatter(&names, &mut out_of_range);
+        assert_eq!(out_of_range.min, Val::Num(9.0));
+    }
 
     const SAMPLE: &str = "no_description dummy_stat\r\n\
 description\r\n\

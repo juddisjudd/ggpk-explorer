@@ -102,6 +102,8 @@ pub fn not_game_data(game: Game) -> &'static [(&'static str, &'static str)] {
 #[derive(Default)]
 pub struct Caches {
     describers: RefCell<HashMap<String, Rc<statdesc::Descriptors>>>,
+    formatters: RefCell<Option<Rc<statdesc::FormatterNames>>>,
+    granted: RefCell<Option<Rc<modules::mods::GrantedNames>>>,
 }
 
 /// `loadStatFile(first, …)`: the describer for one description file, with any
@@ -118,6 +120,9 @@ pub fn describer(ctx: &Ctx, names: &[&str]) -> Rc<statdesc::Descriptors> {
     let mut descriptors = statdesc::Descriptors::load(game, names[0], &fetch);
     for extra in &names[1..] {
         descriptors.append(extra, &fetch);
+    }
+    if game == Game::Poe1 {
+        descriptors.formatters = modules::stat_descriptions::formatter_names(ctx);
     }
     let descriptors = Rc::new(descriptors);
     ctx.pob.describers.borrow_mut().insert(key, Rc::clone(&descriptors));

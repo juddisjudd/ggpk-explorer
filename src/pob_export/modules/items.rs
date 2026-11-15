@@ -723,7 +723,7 @@ impl<'c, 'a> Bases<'c, 'a> {
         }
         let flask_like = match game {
             Game::Poe2 => rule.kind == "Flask" || rule.kind == "Charm",
-            Game::Poe1 => flask.is_some(),
+            Game::Poe1 => flask.is_some() || self.tincture.row(row.index).is_some(),
         };
         if flask_like && drop_level > 2 {
             level = drop_level;

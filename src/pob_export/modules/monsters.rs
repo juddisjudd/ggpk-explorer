@@ -1575,8 +1575,27 @@ pub fn misc(ctx: &Ctx) -> Result<(), String> {
     write(ctx, "CurrencyNames", currency_names(ctx)?)?;
     if game == Game::Poe2 {
         write(ctx, "CharacterMeleeSkills", character_melee_skills(ctx)?)?;
+        write(ctx, "VerisiumCrafts", verisium_crafts(ctx)?)?;
     }
     Ok(())
+}
+
+/// `VerisiumCrafts.lua` (PoE 2): the bases runeforging and runemastering turn each base into.
+fn verisium_crafts(ctx: &Ctx) -> Result<Table, String> {
+    let table = ctx.table("Expedition2VerisiumCrafts")?;
+    let original = table.require(&["OriginalBaseType"])?;
+    let new = table.require(&["NewBaseType"])?;
+    let mut out = Table::new();
+    for row in table.rows() {
+        let (Some(from), Some(to)) = (ctx.rr.deref(row, original), ctx.rr.deref(row, new)) else {
+            return Err(format!("Expedition2VerisiumCrafts row {} names no base", row.index));
+        };
+        let crafted = Table::new()
+            .with("baseTypeId", saved_string(to.row().id()))
+            .with("name", saved_string(to.row().str("Name")));
+        out.table_mut(saved_string(from.row().str("Name"))).push(crafted);
+    }
+    Ok(out)
 }
 
 /// A number column as Lua reads it back after `..` wrote it with `tostring`.

@@ -340,6 +340,19 @@ impl<'a> RelationalReader<'a> {
         loaded
     }
 
+    /// Loads a table under a layout the caller gives, for tables the community schema lacks or names too little of.
+    pub fn table_as(&self, name: &str, def: Table) -> Option<Rc<LoadedTable>> {
+        let key = format!("{}\u{0}given", name);
+        if let Some(hit) = self.tables.borrow().get(&key) {
+            return hit.clone();
+        }
+        let loaded = fetch_table(self.source, name)
+            .and_then(|(path, bytes)| DatReader::new(bytes, &path).ok())
+            .map(|reader| Rc::new(LoadedTable::new(name, def, reader)));
+        self.tables.borrow_mut().insert(key, loaded.clone());
+        loaded
+    }
+
     fn load(&self, name: &str) -> Option<LoadedTable> {
         let def = self.schema.find_table(name, self.is_poe2)?.clone();
         let (path, bytes) = fetch_table(self.source, name)?;

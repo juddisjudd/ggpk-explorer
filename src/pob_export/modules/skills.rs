@@ -52,14 +52,15 @@ pub fn skills(ctx: &Ctx) -> Result<(), String> {
 /// data, and are not written.
 pub fn assets(ctx: &Ctx) -> Result<(), String> {
     let ui_images = parse_ui_images(&read_text(ctx, "Art/UIImages1.txt").unwrap_or_default());
-    let mut icons = Sheet::new("gem-icons");
+    let rects = Rc::new(ui_image_rects(&ui_images));
+    let mut icons = Sheet::new("gem-icons").with_rects(&rects);
     for skill in ctx.table("ActiveSkills")?.rows() {
         let icon = skill.str("Icon_DDSFile");
         if !icon.is_empty() && valid_skill_name(skill.str("DisplayedName")) {
             icons.add(&icon.to_lowercase(), Meta::alias(icon));
         }
     }
-    let mut backgrounds = Sheet::new("gem-backgrounds");
+    let mut backgrounds = Sheet::new("gem-backgrounds").with_rects(&rects);
     let gems = ctx.table("SkillGems")?;
     let effects_col = gems.require(&["GemEffects", "GemVariants"])?;
     let hover_col = gems.require(&["UI_Image", "HoverImage"])?;
@@ -91,7 +92,7 @@ pub fn assets(ctx: &Ctx) -> Result<(), String> {
     }
     write(ctx, "Skills/SkillAssets", Table::new().with("ddsCoords", skill_coords))?;
 
-    let mut categories = Sheet::new("monster-categories");
+    let mut categories = Sheet::new("monster-categories").with_rects(&rects);
     for category in ctx.table("MonsterCategories")?.rows() {
         let kind = category.str("Name");
         if kind.starts_with("[DNT") {
@@ -167,21 +168,49 @@ impl Meta {
     }
 }
 
+/// `assetSheets.uiImageRects`: each texture's rectangle, or `None` when its UI images disagree.
+fn ui_image_rects(images: &HashMap<String, UiImage>) -> HashMap<String, Option<UiImage>> {
+    let mut out: HashMap<String, Option<UiImage>> = HashMap::new();
+    for image in images.values() {
+        match out.get(&image.path) {
+            None => {
+                out.insert(image.path.clone(), Some(image.clone()));
+            }
+            Some(Some(r)) if (r.x, r.y, r.width, r.height) != (image.x, image.y, image.width, image.height) => {
+                out.insert(image.path.clone(), None);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// `assetSheets.newSheet`: the pictures one sheet stacks, by texture path.
 struct Sheet {
     name: &'static str,
     files: BTreeMap<String, Vec<Meta>>,
+    rects: Rc<HashMap<String, Option<UiImage>>>,
 }
 
 impl Sheet {
     fn new(name: &'static str) -> Self {
-        Self { name, files: BTreeMap::new() }
+        Self { name, files: BTreeMap::new(), rects: Rc::default() }
+    }
+
+    fn with_rects(mut self, rects: &Rc<HashMap<String, Option<UiImage>>>) -> Self {
+        self.rects = Rc::clone(rects);
+        self
     }
 
     /// `assetSheets.addToSheet`: one entry per alias for each texture.
-    fn add(&mut self, path: &str, meta: Meta) {
+    fn add(&mut self, path: &str, mut meta: Meta) {
         if path.is_empty() {
             return;
+        }
+        if meta.rect.is_none() {
+            if let Some(Some(image)) = self.rects.get(&path.to_lowercase()) {
+                meta.rect = Some((image.x, image.y, image.width, image.height));
+            }
         }
         let list = self.files.entry(path.to_string()).or_default();
         if !list.iter().any(|m| m.alias == meta.alias) {
@@ -321,8 +350,12 @@ impl<'a, 'c> Planner<'a, 'c> {
             Game::Poe1 => &POE1_NAMES,
         };
         let name = names.iter().find(|(e, _)| *e == id).map(|(_, n)| n.to_string());
-        let sets = match self.db.game {
-            Game::Poe2 => shown_sets(self.db, row),
+        let db = self.db;
+        let is_gem = db.gem_effect_by_primary.contains_key(&effect)
+            || db.gem_effect_by_secondary.contains_key(&effect)
+            || db.gem_effects_by_additional.contains_key(&effect);
+        let sets = match db.game {
+            Game::Poe2 => shown_sets(db, row, is_gem),
             Game::Poe1 => Vec::new(),
         };
         let entry = Entry {
@@ -338,14 +371,13 @@ impl<'a, 'c> Planner<'a, 'c> {
     }
 }
 
-/// The stat sets `skillGemList.lua` lists for an effect: its own, then the
-/// additional ones, leaving out those labelled `Hidden`.
-fn shown_sets(db: &Db, effect: Row<'_>) -> Vec<String> {
+/// An effect's stat sets; only gems drop the `Hidden` ones, as `skillGemList.lua` does.
+fn shown_sets(db: &Db, effect: Row<'_>, gem: bool) -> Vec<String> {
     let ctx = db.ctx;
     let mut sets: Vec<crate::dat::relational::Ref> = ctx.rr.deref(effect, db.col.primary_set).into_iter().collect();
     sets.extend(ctx.rr.deref_list(effect, db.col.extra_sets));
     sets.iter()
-        .filter(|s| ctx.rr.deref_id(s.row(), "Label").as_deref() != Some("Hidden"))
+        .filter(|s| !gem || ctx.rr.deref_id(s.row(), "Label").as_deref() != Some("Hidden"))
         .map(|s| s.id())
         .collect()
 }
@@ -866,7 +898,8 @@ fn skill_stat_scopes(text: &str) -> HashMap<String, String> {
         let name = &before[before.rfind(|c: char| !word(c)).map(|i| i + 1).unwrap_or(0)..];
         let after = &text[at + prefix.len()..];
         let stem = &after[..after.find(|c: char| !word(c)).unwrap_or(after.len())];
-        if !name.is_empty() && !stem.is_empty() && after[stem.len()..].starts_with(".txt\"") {
+        let ext = &after[stem.len()..];
+        if !name.is_empty() && !stem.is_empty() && (ext.starts_with(".txt\"") || ext.starts_with(".csd\"")) {
             out.insert(name.to_string(), stem.to_string());
         }
         from = at + prefix.len();
@@ -2688,6 +2721,8 @@ mod tests {
         assert_eq!(scopes.get("skill_a").map(String::as_str), Some("aura_skill_stat_descriptions"));
         assert_eq!(scopes.get("skill_c").map(String::as_str), Some("aura_skill_stat_descriptions"));
         assert_eq!(scopes.get("skill_b"), None, "copying from a skill with no entry clears it");
+        let csd = skill_stat_scopes("skill_d \"Metadata/StatDescriptions/curse_skill_stat_descriptions.csd\"\n");
+        assert_eq!(csd.get("skill_d").map(String::as_str), Some("curse_skill_stat_descriptions"));
     }
 
     #[test]
@@ -2739,6 +2774,21 @@ mod tests {
         sheet.add("", Meta::alias("C"));
         assert_eq!(sheet.files.len(), 1);
         assert_eq!(sheet.files["a.dds"].len(), 2);
+    }
+
+    #[test]
+    fn sheets_crop_textures_their_ui_images_agree_on() {
+        let images = parse_ui_images(
+            "\"Art/A\" \"Art/a.dds\" 0 0 699 369\n\"Art/B\" \"Art/b.dds\" 0 0 10 10\n\"Art/C\" \"Art/b.dds\" 5 5 10 10\n",
+        );
+        let rects = Rc::new(ui_image_rects(&images));
+        let mut sheet = Sheet::new("gem-backgrounds").with_rects(&rects);
+        sheet.add("art/a.dds", Meta::alias("A"));
+        sheet.add("art/b.dds", Meta::alias("B"));
+        sheet.add("art/c.dds", Meta::alias("C"));
+        assert_eq!(sheet.files["art/a.dds"][0].rect, Some((Some(0.0), Some(0.0), Some(699.0), Some(369.0))));
+        assert_eq!(sheet.files["art/b.dds"][0].rect, None);
+        assert_eq!(sheet.files["art/c.dds"][0].rect, None);
     }
 
     #[test]
