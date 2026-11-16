@@ -208,7 +208,7 @@ impl CsdViewer {
                                     ui.horizontal_wrapped(|ui| {
                                         ui.add_space(18.0);
                                         for p in &sub.parameters {
-                                            ui.label(RichText::new(format!("{} {}", p.name, p.value)).weak().size(11.0));
+                                            ui.label(RichText::new(p.to_string()).weak().size(11.0));
                                         }
                                     });
                                 }
@@ -298,7 +298,7 @@ impl CsdViewer {
                             row.col(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
                                 for p in &sub.parameters {
-                                    ui.label(RichText::new(format!("{} {}", p.name, p.value)).weak().size(11.0));
+                                    ui.label(RichText::new(p.to_string()).weak().size(11.0));
                                 }
                             });
                         }

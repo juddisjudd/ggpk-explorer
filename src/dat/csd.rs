@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use std::collections::HashSet;
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CsdFile {
@@ -33,9 +34,25 @@ pub struct CsdParameter {
     /// 1-based index of the value the handler applies to; zero when the
     /// handler takes a name instead (`reminderstring`).
     pub value: i32,
+    /// Further value indexes the handler reads but does not format, as in `alternate_tree_version_keystone 3 1 4`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<i32>,
     /// The name a non-numeric handler was given.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+}
+
+impl fmt::Display for CsdParameter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(&self.name)?;
+        if let Some(text) = &self.text {
+            return write!(f, " {text}");
+        }
+        if self.value != 0 {
+            write!(f, " {}", self.value)?;
+        }
+        self.inputs.iter().try_for_each(|input| write!(f, " {input}"))
+    }
 }
 
 pub fn parse_csd(data: &[u8], file_path: &str) -> Result<CsdFile, String> {
@@ -166,31 +183,27 @@ pub fn parse_csd(data: &[u8], file_path: &str) -> Result<CsdFile, String> {
                         
                         let mut p_idx = 0;
                         while p_idx < param_parts.len() {
-                            if param_parts[p_idx] == "canonical_line" {
+                            let name = param_parts[p_idx];
+                            p_idx += 1;
+                            if name == "canonical_line" {
                                 is_canonical = true;
-                                p_idx += 1;
-                            } else if p_idx + 1 < param_parts.len() {
-                                let name = param_parts[p_idx].to_string();
-                                let arg = param_parts[p_idx + 1];
-                                match arg.parse::<i32>() {
-                                    Ok(val) => parameters.push(CsdParameter { name, value: val, text: None }),
-                                    // A handler whose argument names something
-                                    // (`reminderstring ReminderTextX`).
-                                    Err(_) => parameters.push(CsdParameter {
-                                        name,
-                                        value: 0,
-                                        text: Some(arg.to_string()),
-                                    }),
-                                }
-                                p_idx += 2;
-                            } else {
-                                parameters.push(CsdParameter {
-                                    name: param_parts[p_idx].to_string(),
-                                    value: 0,
-                                    text: None,
-                                });
+                                continue;
+                            }
+                            let mut indexes = Vec::new();
+                            while let Some(Ok(index)) = param_parts.get(p_idx).map(|t| t.parse::<i32>()) {
+                                indexes.push(index);
                                 p_idx += 1;
                             }
+                            let mut param = CsdParameter { name: name.to_string(), value: 0, inputs: Vec::new(), text: None };
+                            if let Some((&first, rest)) = indexes.split_first() {
+                                param.value = first;
+                                param.inputs = rest.to_vec();
+                            } else if let Some(arg) = param_parts.get(p_idx) {
+                                // A handler whose argument names something (`reminderstring ReminderTextX`).
+                                param.text = Some(arg.to_string());
+                                p_idx += 1;
+                            }
+                            parameters.push(param);
                         }
                     }
 
@@ -281,5 +294,30 @@ lang \"Japanese\"
         assert!(result.languages.contains(&"Traditional Chinese".to_string()));
         assert!(result.languages.contains(&"Japanese".to_string()));
         assert!(result.languages.contains(&"English".to_string()));
+    }
+
+    #[test]
+    fn handlers_take_several_value_indexes() {
+        let text = "description
+4 version seed keystone revision
+1
+1 # # # \"{1} sacrificed in the name of {2}\\nConquered by the {0}\" alternate_tree_version_name 1 alternate_tree_version_keystone 3 1 4 reminderstring ReminderTextConqueredPassives
+description
+3 slot gem level
+1
+# # # \"Skills granted by your {0} are Supported by level {2} {1}\" pelagic_pearl_slot 1 display_indexable_non_active_support 2 3";
+        let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let result = parse_csd(&bytes, "test.csd").expect("Failed to parse");
+        let params = |entry: usize| -> Vec<String> {
+            result.entries[entry].descriptions[0].parameters.iter().map(|p| p.to_string()).collect()
+        };
+
+        assert_eq!(
+            params(0),
+            ["alternate_tree_version_name 1", "alternate_tree_version_keystone 3 1 4", "reminderstring ReminderTextConqueredPassives"]
+        );
+        assert_eq!(params(1), ["pelagic_pearl_slot 1", "display_indexable_non_active_support 2 3"]);
+        let keystone = &result.entries[0].descriptions[0].parameters[1];
+        assert_eq!((keystone.value, keystone.inputs.as_slice()), (3, [1, 4].as_slice()));
     }
 }
