@@ -313,8 +313,11 @@ impl<'a> Ctx<'a> {
         }
         let mut chain = Vec::new();
         self.collect_csd(file, &mut chain, &mut std::collections::HashSet::new());
-        let lookup =
-            std::rc::Rc::new(crate::dat::stat_translation::TranslationLookup::build_shared(&chain));
+        let mut lookup = crate::dat::stat_translation::TranslationLookup::build_shared(&chain);
+        if !self.rr.is_poe2 {
+            lookup = lookup.with_formatters(crate::pob_export::modules::stat_descriptions::formatter_names(self));
+        }
+        let lookup = std::rc::Rc::new(lookup);
         self.translations.borrow_mut().insert(file.to_string(), std::rc::Rc::clone(&lookup));
         lookup
     }

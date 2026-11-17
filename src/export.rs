@@ -782,8 +782,8 @@ fn export_single_file(
                 }
 
                 let raw_bundle_data = raw_bundle_data.ok_or_else(|| match &cdn_error {
-                    Some(e) => format!("Failed to load bundle data (local, Steam, or CDN): {}", e),
-                    None => "Failed to load bundle data (local, Steam, or CDN)".to_string(),
+                    Some(e) => format!("Failed to load bundle {} (local, Steam, or CDN): {}", bundle_info.name, e),
+                    None => format!("Failed to load bundle {} (local, Steam, or CDN)", bundle_info.name),
                 })?;
                 let data = raw_bundle_data.as_slice();
                 let mut cursor = std::io::Cursor::new(data);

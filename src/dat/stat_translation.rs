@@ -14,7 +14,12 @@ pub struct TranslationLookup {
     /// are given generic first (`stat_descriptions.csd`) and tree-specific
     /// last, so the specific text wins.
     superseded: Vec<bool>,
+    /// PoE 1's formatter functions (3.30 on): the names a value picks, by row.
+    formatters: std::rc::Rc<Formatters>,
 }
+
+/// Formatter function name to the names its values pick, the first for value 1.
+pub type Formatters = HashMap<String, Vec<String>>;
 
 impl TranslationLookup {
     pub fn build(csd_files: &[&CsdFile]) -> Self {
@@ -50,7 +55,11 @@ impl TranslationLookup {
                 superseded.push(last.get(entry.ids.as_slice()) != Some(&i));
             }
         }
-        Self { entries, by_id, superseded }
+        Self { entries, by_id, superseded, formatters: Default::default() }
+    }
+
+    pub fn with_formatters(self, formatters: std::rc::Rc<Formatters>) -> Self {
+        Self { formatters, ..self }
     }
 
     fn entry(&self, index: usize) -> &CsdEntry {
@@ -158,7 +167,7 @@ impl TranslationLookup {
                     first,
                     Line {
                         ids: entry.ids.clone(),
-                        text: sub.map(|s| render(s, &vals)).unwrap_or_default(),
+                        text: sub.map(|s| render(s, &vals, &self.formatters)).unwrap_or_default(),
                         template: sub.map(|s| template(s, &entry.ids)).unwrap_or_default(),
                         reminders: sub.map(reminder_names).unwrap_or_default(),
                         index: idx,
@@ -304,7 +313,7 @@ pub fn preview(entry: &CsdEntry, language: Option<&str>, values: &[i32]) -> Opti
             .descriptions
             .iter()
             .find(|s| s.language.as_deref() == lang && ranges_match(&s.operator, n, &values))
-            .map(|s| render(s, &values))
+            .map(|s| render(s, &values, &Formatters::new()))
     };
     pick(language).or_else(|| if language.is_some() { pick(None) } else { None })
 }
@@ -368,7 +377,7 @@ impl ValueFmt {
     }
 
     fn format(&self) -> String {
-        if self.min == self.max {
+        if self.one(self.min) == self.one(self.max) {
             return self.one(self.min);
         }
         // A range that is negative throughout shows the sign once, in front.
@@ -393,18 +402,22 @@ fn apply_function(name: &str, fmt: ValueFmt) -> ValueFmt {
     }
 }
 
-fn render(sub: &CsdSubEntry, raw_values: &[(i32, i32)]) -> String {
+fn render(sub: &CsdSubEntry, raw_values: &[(i32, i32)], formatters: &Formatters) -> String {
     let mut fmts: Vec<ValueFmt> = raw_values.iter().map(|&(a, b)| ValueFmt::from_range(a, b)).collect();
+    let mut names: Vec<Option<String>> = vec![None; fmts.len()];
     for param in &sub.parameters {
         let idx = (param.value as usize).saturating_sub(1);
-        if let Some(f) = fmts.get_mut(idx) {
-            *f = apply_function(&param.name, *f);
+        let Some(f) = fmts.get_mut(idx) else { continue };
+        match formatters.get(&param.name) {
+            // A range shows its lowest, as PoE 1's per-value descriptions did.
+            Some(rows) => names[idx] = (f.min >= 1.0).then(|| rows.get(f.min as usize - 1).cloned()).flatten(),
+            None => *f = apply_function(&param.name, *f),
         }
     }
-    substitute(&sub.description, &fmts)
+    substitute(&sub.description, &fmts, &names)
 }
 
-fn substitute(template: &str, values: &[ValueFmt]) -> String {
+fn substitute(template: &str, values: &[ValueFmt], names: &[Option<String>]) -> String {
     let mut out = String::with_capacity(template.len());
     let chars: Vec<char> = template.chars().collect();
     let mut i = 0;
@@ -426,6 +439,11 @@ fn substitute(template: &str, values: &[ValueFmt]) -> String {
                     idx_str.parse::<usize>()
                 };
                 if let Ok(idx) = idx {
+                    if let Some(name) = names.get(idx).and_then(|n| n.as_deref()) {
+                        out.push_str(name);
+                        i = end + 1;
+                        continue;
+                    }
                     if let Some(v) = values.get(idx) {
                         let mut s = v.format();
                         if spec == Some("+d") && v.value() >= 0.0 {
@@ -577,5 +595,22 @@ mod tests {
             lookup.translate(&["test_pct".to_string()], &[1200]),
             Some("12% increased Effect".to_string())
         );
+    }
+
+    #[test]
+    fn range_that_prints_one_number_prints_it_once() {
+        let file = parse("description\n\t1 test_ms\n\t1\n\t\t# \"{0}% increased Effect\" divide_by_ten_0dp 1");
+        let lookup = TranslationLookup::build(&[&file]);
+        assert_eq!(lookup.translate_ranges(&["test_ms".to_string()], &[(80, 81)]), vec!["8% increased Effect".to_string()]);
+    }
+
+    #[test]
+    fn formatter_names_a_row_and_a_range_shows_its_lowest() {
+        let file = parse("description\n\t1 lure\n\t1\n\t\t# \"Fishing with {0}\" fishing_lure_type 1");
+        let names = Formatters::from([("fishing_lure_type".to_string(), vec!["Rhoa Feather Lure".to_string(), "Siren Worm Bait".to_string()])]);
+        let lookup = TranslationLookup::build(&[&file]).with_formatters(std::rc::Rc::new(names));
+        let ids = ["lure".to_string()];
+        assert_eq!(lookup.translate_ranges(&ids, &[(2, 2)]), vec!["Fishing with Siren Worm Bait".to_string()]);
+        assert_eq!(lookup.translate_ranges(&ids, &[(1, 3)]), vec!["Fishing with Rhoa Feather Lure".to_string()]);
     }
 }
