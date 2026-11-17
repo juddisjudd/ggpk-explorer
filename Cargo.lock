@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "ggpk-explorer"
-version = "1.14.9"
+version = "1.14.10"
 dependencies = [
  "anyhow",
  "bincode",
