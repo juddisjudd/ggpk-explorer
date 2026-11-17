@@ -5,6 +5,7 @@
 use crate::data_export::json::{self, int, text, Obj, J};
 use crate::data_export::Ctx;
 use crate::dat::relational::{LoadedTable, Row};
+use crate::pob_export::modules::mods::{granted_effect_lines, granted_lines};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// How many `StatN` columns a mod can carry. The schema currently declares
@@ -189,15 +190,27 @@ impl ModText {
             false => buff_template_stats(ctx, row),
         };
         // A stat pinned to zero grants nothing, so it contributes no line.
-        let described: Vec<&Stat> =
-            stats.iter().filter(|s| (s.min != 0 || s.max != 0) && !aura_stats.contains(&s.id)).collect();
-        let ids: Vec<String> = described.iter().map(|s| s.id.clone()).collect();
-        let ranges: Vec<(i32, i32)> = described.iter().map(|s| (s.min as i32, s.max as i32)).collect();
+        let described: Vec<(usize, &Stat)> =
+            stats.iter().enumerate().filter(|(_, s)| (s.min != 0 || s.max != 0) && !aura_stats.contains(&s.id)).collect();
+        let ids: Vec<String> = described.iter().map(|(_, s)| s.id.clone()).collect();
+        let ranges: Vec<(i32, i32)> = described.iter().map(|(_, s)| (s.min as i32, s.max as i32)).collect();
         let file = match ctx.rr.is_poe2 {
             true => translation_file(row.int("Domain")),
             false => poe1_translation_file(&domain_label(ctx, row).unwrap_or_default()),
         };
-        ctx.translations(file).translate_ranges(&ids, &ranges)
+        let mut lines: Vec<(usize, String)> = ctx
+            .translations(file)
+            .translate_ranges_at(&ids, &ranges)
+            .into_iter()
+            .map(|(at, line)| (described.get(at).map_or(usize::MAX, |(i, _)| *i), line))
+            .collect();
+        if !ctx.rr.is_poe2 {
+            // 3.30 draws these where the zeroed display stat stood.
+            let at = stats.iter().position(|s| s.id.starts_with("local_display_") && s.min == 0 && s.max == 0).unwrap_or(0);
+            let insert = lines.iter().position(|(i, _)| *i > at).unwrap_or(lines.len());
+            lines.splice(insert..insert, granted_lines(ctx, row).into_iter().map(|g| (at, g.text)));
+        }
+        lines.into_iter().map(|(_, line)| line).collect()
     }
 
     /// The lines one mod shows, as the client draws them.
@@ -325,13 +338,20 @@ fn weights(ctx: &Ctx, row: Row<'_>, tags: &str, values: &str) -> J {
 
 fn granted_effects(ctx: &Ctx, row: Row<'_>) -> J {
     let column = column(row, &["GrantedEffectsPerLevel", "GrantedEffectsPerLevelKeys"]);
+    let mut lines = match ctx.rr.is_poe2 {
+        true => Vec::new(),
+        false => granted_effect_lines(ctx, row),
+    }
+    .into_iter();
     let entries = ctx.rr.deref_list(row, column).into_iter().filter_map(|per_level| {
+        let line = lines.next().flatten();
         let level_row = per_level.row();
         let effect = ctx.rr.deref_id(level_row, "GrantedEffect")?;
         Some(
             Obj::new()
                 .set("granted_effect_id", text(effect))
                 .set("level", int(level_row.int("Level")))
+                .or_null("text", line.map(|(_, line)| text(line.text)))
                 .build(),
         )
     });

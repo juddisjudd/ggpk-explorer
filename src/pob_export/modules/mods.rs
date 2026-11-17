@@ -45,11 +45,11 @@ pub struct GrantedLine {
     pub support: bool,
 }
 
-/// What `describeGrantedEffects` looks up: gem names by granted effect, level counts and the client's templates.
+/// What `describeGrantedEffects` looks up: gem names by granted effect, the client's templates and each mod's `ShowGrantedEffects`.
 pub struct GrantedNames {
     gems: HashMap<String, String>,
-    level_counts: HashMap<String, usize>,
     templates: HashMap<&'static str, String>,
+    shown: Vec<bool>,
 }
 
 impl GrantedNames {
@@ -72,18 +72,21 @@ impl GrantedNames {
                 }
             }
         }
-        let mut level_counts = HashMap::new();
-        for row in ctx.rr.table("GrantedEffectsPerLevel")?.rows() {
-            if let Some(id) = ctx.rr.deref_id(row, "GrantedEffect") {
-                *level_counts.entry(id).or_insert(0) += 1;
-            }
-        }
         let strings = ctx.rr.table("ClientStrings")?;
         let templates = ["ModGrantsSupportEffect", "ModGrantsSupportEffectWithLevel", "ModGrantsEffect", "ModGrantsEffectWithLevel"]
             .into_iter()
             .filter_map(|id| strings.by_id(id).map(|row| (id, row.string("Text"))))
             .collect();
-        Some(Self { gems, level_counts, templates })
+        Some(Self { gems, templates, shown: show_granted_flags(ctx) })
+    }
+}
+
+/// `Mods.ShowGrantedEffects` by row: dat-schema leaves it unnamed, after two lists past `IsUnscalable`, as PoB's spec has it.
+fn show_granted_flags(ctx: &Ctx) -> Vec<bool> {
+    let Some(mods) = ctx.rr.table("Mods") else { return Vec::new() };
+    match mods.column_or_after(&["ShowGrantedEffects"], "IsUnscalable", 3).filter(|&at| mods.def.columns[at].r#type == "bool") {
+        Some(at) => mods.rows().map(|row| row.bool_at(at)).collect(),
+        None => Vec::new(),
     }
 }
 
@@ -96,46 +99,57 @@ fn granted_names(ctx: &Ctx) -> Option<Rc<GrantedNames>> {
     Some(names)
 }
 
-/// `describeGrantedEffects`' lines for one mod row, each name once, with a level when the effect has more than one.
-fn granted_lines(ctx: &Ctx, row: Row<'_>) -> Vec<GrantedLine> {
+/// Whether the client draws a PoE 1 mod's granted effects: for a display stat 3.30 zeroed, or for a mod with no stats flagged to show them.
+fn shows_granted(ctx: &Ctx, names: &GrantedNames, row: Row<'_>) -> bool {
+    let mut has_stats = false;
+    for i in 1..=6 {
+        let Some(stat) = ctx.rr.deref_id(row, &format!("StatsKey{i}")) else { break };
+        has_stats = true;
+        if stat.starts_with("local_display_") && row.int(&format!("Stat{i}Min")) == 0 && row.int(&format!("Stat{i}Max")) == 0 {
+            return true;
+        }
+    }
+    !has_stats && row.table.name == "Mods" && names.shown.get(row.index).copied().unwrap_or(false)
+}
+
+/// The line one granted effect draws, with its name: a level unless the skill cannot be supported.
+fn granted_line(ctx: &Ctx, names: &GrantedNames, level: Row<'_>) -> Option<(String, GrantedLine)> {
+    let effect = ctx.rr.deref(level, "GrantedEffect")?;
+    let effect = effect.row();
+    let support = effect.bool("IsSupport");
+    let name = match support {
+        true => names.gems.get(effect.id()).cloned(),
+        false => ctx.rr.deref(effect, "ActiveSkill").map(|a| {
+            let col = a.table.pick(&["DisplayName", "DisplayedName"]).unwrap_or("DisplayedName");
+            a.row().string(col)
+        }),
+    };
+    let name = name.filter(|n| !n.is_empty())?;
+    let level_text = (support || !effect.bool("CannotBeSupported")).then(|| level.int("Level").to_string());
+    let template = match (support, level_text.is_some()) {
+        (true, true) => "ModGrantsSupportEffectWithLevel",
+        (true, false) => "ModGrantsSupportEffect",
+        (false, true) => "ModGrantsEffectWithLevel",
+        (false, false) => "ModGrantsEffect",
+    };
+    let text = names.templates.get(template)?.replace("{0}", &name).replace("{1}", level_text.as_deref().unwrap_or(""));
+    Some((name, GrantedLine { text, support }))
+}
+
+/// Each entry of a PoE 1 mod's granted effect column with the line the client draws for it, if any.
+pub fn granted_effect_lines(ctx: &Ctx, row: Row<'_>) -> Vec<Option<(String, GrantedLine)>> {
     let Some(col) = row.table.pick(&["GrantedEffect", "GrantedEffectsPerLevelKeys", "GrantedEffectsPerLevel"]) else {
         return Vec::new();
     };
     let levels = ctx.rr.deref_list(row, col);
-    if levels.is_empty() {
-        return Vec::new();
-    }
-    let Some(names) = granted_names(ctx) else { return Vec::new() };
-    let mut out = Vec::new();
+    let names = (!levels.is_empty()).then(|| granted_names(ctx)).flatten().filter(|names| shows_granted(ctx, names, row));
+    levels.iter().map(|level| names.as_ref().and_then(|names| granted_line(ctx, names, level.row()))).collect()
+}
+
+/// `describeGrantedEffects`' lines for one mod row, each name once.
+pub fn granted_lines(ctx: &Ctx, row: Row<'_>) -> Vec<GrantedLine> {
     let mut seen = HashSet::new();
-    for level in &levels {
-        let level = level.row();
-        let Some(effect) = ctx.rr.deref(level, "GrantedEffect") else { continue };
-        let effect = effect.row();
-        let support = effect.bool("IsSupport");
-        let name = match support {
-            true => names.gems.get(effect.id()).cloned(),
-            false => ctx.rr.deref(effect, "ActiveSkill").map(|a| {
-                let col = a.table.pick(&["DisplayName", "DisplayedName"]).unwrap_or("DisplayedName");
-                a.row().string(col)
-            }),
-        };
-        let Some(name) = name.filter(|n| !n.is_empty()) else { continue };
-        if !seen.insert(name.clone()) {
-            continue;
-        }
-        let level_text = (names.level_counts.get(effect.id()).copied().unwrap_or(0) > 1).then(|| level.int("Level").to_string());
-        let template = match (support, level_text.is_some()) {
-            (true, true) => "ModGrantsSupportEffectWithLevel",
-            (true, false) => "ModGrantsSupportEffect",
-            (false, true) => "ModGrantsEffectWithLevel",
-            (false, false) => "ModGrantsEffect",
-        };
-        let Some(template) = names.templates.get(template) else { continue };
-        let text = template.replace("{0}", &name).replace("{1}", level_text.as_deref().unwrap_or(""));
-        out.push(GrantedLine { text, support });
-    }
-    out
+    granted_effect_lines(ctx, row).into_iter().flatten().filter(|(name, _)| seen.insert(name.clone())).map(|(_, line)| line).collect()
 }
 
 /// Reads mods the way PoB's spec lays them out, whichever game's columns the
@@ -227,15 +241,12 @@ impl ModReader {
 /// stats its buff template applies.
 pub fn describe_mod(game: Game, descriptors: &Descriptors, m: &PobMod) -> crate::pob_export::statdesc::Described {
     let mut out = describe_mod_stats(game, descriptors, &m.stats, &m.buff_stats);
-    let zeroed_display = m.stats.iter().any(|(id, min, max, _)| id.starts_with("local_display_") && *min == 0.0 && *max == 0.0);
-    if zeroed_display {
-        for line in &m.granted {
-            let order_stat = if line.support { "local_random_support_gem_level" } else { "local_display_grants_skill_frostbite_level" };
-            let order = descriptors.by_stat.get(order_stat).map(|&d| descriptors.descriptors[d].order).unwrap_or(0.0);
-            let at = out.orders.iter().position(|&o| o > order).unwrap_or(out.orders.len());
-            out.lines.insert(at, line.text.clone());
-            out.orders.insert(at, order);
-        }
+    for line in &m.granted {
+        let order_stat = if line.support { "local_random_support_gem_level" } else { "local_display_grants_skill_frostbite_level" };
+        let order = descriptors.by_stat.get(order_stat).map(|&d| descriptors.descriptors[d].order).unwrap_or(0.0);
+        let at = out.orders.iter().position(|&o| o > order).unwrap_or(out.orders.len());
+        out.lines.insert(at, line.text.clone());
+        out.orders.insert(at, order);
     }
     out
 }

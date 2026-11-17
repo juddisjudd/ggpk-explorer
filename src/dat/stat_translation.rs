@@ -74,7 +74,17 @@ impl TranslationLookup {
     /// text on an unrolled mod does. Lines follow the order the stats were
     /// given in, which is how a mod lists them.
     pub fn translate_ranges(&self, stat_ids: &[String], values: &[(i32, i32)]) -> Vec<String> {
-        self.resolve(stat_ids, values, Order::Stat).into_iter().map(|line| line.text).filter(|t| !t.is_empty()).collect()
+        self.translate_ranges_at(stat_ids, values).into_iter().map(|(_, text)| text).collect()
+    }
+
+    /// [`translate_ranges`](Self::translate_ranges) with the index in `stat_ids` of each line's first stat.
+    pub fn translate_ranges_at(&self, stat_ids: &[String], values: &[(i32, i32)]) -> Vec<(usize, String)> {
+        let position = |id: &String| stat_ids.iter().position(|s| s == id);
+        self.resolve(stat_ids, values, Order::Stat)
+            .into_iter()
+            .filter(|line| !line.text.is_empty())
+            .map(|line| (line.ids.iter().filter_map(position).min().unwrap_or(usize::MAX), line.text))
+            .collect()
     }
 
     /// Like [`translate_grouped`](Self::translate_grouped) but reporting which
