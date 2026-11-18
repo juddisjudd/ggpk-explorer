@@ -235,8 +235,8 @@ impl<'a> Ctx<'a> {
     pub fn table(&self, name: &str) -> Result<std::rc::Rc<crate::dat::relational::LoadedTable>, String> {
         let Some(table) = self.rr.table(name) else {
             let (status, detail) = self.absent(name);
-            self.note(name, status, detail);
-            return Err(format!("table {} is missing from this install", name));
+            self.note(name, status, detail.clone());
+            return Err(format!("table {}: {}", name, detail));
         };
         if table.fit.is_broken() {
             self.note(name, "refused", table.fit.summary());
@@ -269,12 +269,23 @@ impl<'a> Ctx<'a> {
 
     /// Why a table is not here: the other game owns it, or it is a real gap.
     fn absent(&self, name: &str) -> (&'static str, String) {
-        match self.rr.schema.belongs_to_other_game(name, self.rr.is_poe2) {
-            true => {
-                let other = crate::settings::Game::from_is_poe2(!self.rr.is_poe2);
-                ("other game", format!("a {} table", other.label()))
-            }
-            false => ("missing", "not in this install or schema".to_string()),
+        if self.rr.schema.belongs_to_other_game(name, self.rr.is_poe2) {
+            let other = crate::settings::Game::from_is_poe2(!self.rr.is_poe2);
+            return ("other game", format!("a {} table", other.label()));
+        }
+        let lower = name.to_ascii_lowercase();
+        let indexed = crate::dat::relational::DAT_DIRS
+            .iter()
+            .any(|dir| self.files.exists(&format!("{}{}{}", dir, lower, crate::dat::relational::DAT_EXT)));
+        if !indexed || self.rr.schema.find_table(name, self.rr.is_poe2).is_none() {
+            return ("missing", "not in this install or schema".to_string());
+        }
+        match &self.files.cdn {
+            Some(cdn) => (
+                "unreadable",
+                format!("the patch CDN did not serve its bundle for {}; the CDN keeps only the live patch's bundles", cdn.patch_version()),
+            ),
+            None => ("unreadable", "the index lists it, but its bundle could not be read".to_string()),
         }
     }
 
@@ -506,7 +517,7 @@ pub fn run_with(
             .collect();
         let _ = std::fs::write(&log, lines.join("\n"));
     }
-    let unusable = ctx.table_notes().iter().filter(|n| n.status != "missing" && n.status != "other game").count();
+    let unusable = ctx.table_notes().iter().filter(|n| n.status == "skipped" || n.status == "refused").count();
     let mut message = if failures.is_empty() {
         format!("Wrote {} {} to {}.", total, unit, out.display())
     } else {
