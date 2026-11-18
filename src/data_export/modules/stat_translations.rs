@@ -4,9 +4,12 @@
 
 use crate::dat::csd::{parse_csd, CsdEntry, CsdSubEntry};
 use crate::dat::stat_handlers::{self, Kind};
+use crate::dat::stat_translation::Formatters;
 use crate::data_export::json::{self, int, text, Obj, J};
 use crate::data_export::Ctx;
-use std::collections::HashMap;
+use crate::pob_export::modules::stat_descriptions::formatter_names;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
 /// The languages RePoE lists on every entry. Only English is filled in; the
 /// rest are declared so consumers see the same keys.
@@ -502,10 +505,40 @@ fn implied_stats(parsed: &Parsed, ids: &[String]) -> Vec<(String, i64)> {
     out
 }
 
+/// PoE 1's formatter functions: PoB's, plus the timeless jewel names PoB writes into its uniques by hand.
+pub fn formatters(ctx: &Ctx) -> Rc<Formatters> {
+    let mut out = (*formatter_names(ctx)).clone();
+    if let Some(versions) = ctx.optional_table("AlternateTreeVersions") {
+        // A version's value is its row, and row 0 is `None`.
+        out.insert("alternate_tree_version_name".into(), versions.rows().skip(1).map(|row| row.string("Name")).collect());
+    }
+    if let Some(keystones) = ctx.optional_table("AlternateTreeVersionKeystones") {
+        let rows: Vec<(usize, i64, i64, String)> = keystones
+            .rows()
+            .filter_map(|row| Some((row.key("Version")?, row.int("StatValue"), row.int("InternalVersion"), row.string("Conqueror"))))
+            .collect();
+        let top = rows.iter().map(|r| r.1).max().unwrap_or(0);
+        let last_revision = rows.iter().map(|r| r.2).max().unwrap_or(0);
+        for version in rows.iter().map(|r| r.0).collect::<BTreeSet<_>>() {
+            for revision in 0..=last_revision {
+                // A keystone a revision did not rename keeps its earlier conqueror.
+                let names = (1..=top)
+                    .map(|value| {
+                        let named = rows.iter().filter(|r| r.0 == version && r.1 == value && r.2 <= revision);
+                        named.max_by_key(|r| r.2).map(|r| r.3.clone()).unwrap_or_default()
+                    })
+                    .collect();
+                out.insert(format!("alternate_tree_version_keystone/{version}/{revision}"), names);
+            }
+        }
+    }
+    Rc::new(out)
+}
+
 /// `stat_value_handlers.json`, with the relational handlers' lookup tables
 /// read out of the game rather than hard-coded.
 fn value_handlers(ctx: &Ctx) -> J {
-    let fields = stat_handlers::HANDLERS
+    let mut fields = stat_handlers::HANDLERS
         .iter()
         .map(|handler| {
             let value = match &handler.kind {
@@ -535,8 +568,29 @@ fn value_handlers(ctx: &Ctx) -> J {
             };
             (handler.name.to_string(), value)
         })
-        .collect();
+        .collect::<Vec<_>>();
+    if ctx.rr.is_poe2 {
+        return J::Obj(fields);
+    }
+    // Keyed by value, after the further values a formatter reads: `version/revision/keystone`.
+    let mut by_name: BTreeMap<String, Vec<(String, J)>> = BTreeMap::new();
+    for (key, names) in formatters(ctx).iter() {
+        let (name, inputs) = key.split_once('/').map_or((key.as_str(), None), |(n, rest)| (n, Some(rest)));
+        let values = by_name.entry(name.to_string()).or_default();
+        for (i, label) in names.iter().enumerate().filter(|(_, label)| !label.is_empty()) {
+            let value = inputs.map_or((i + 1).to_string(), |rest| format!("{rest}/{}", i + 1));
+            values.push((value, text(label)));
+        }
+    }
+    fields.extend(by_name.into_iter().map(|(name, mut values)| {
+        values.sort_by(|a, b| natural_key(&a.0).cmp(&natural_key(&b.0)));
+        (name, Obj::new().set("type", text("formatter")).set("values", J::Obj(values)).build())
+    }));
     J::Obj(fields)
+}
+
+fn natural_key(key: &str) -> Vec<i64> {
+    key.split('/').map(|part| part.parse().unwrap_or(0)).collect()
 }
 
 fn relational_values(

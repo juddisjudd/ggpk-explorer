@@ -1,4 +1,4 @@
-use crate::dat::csd::{CsdEntry, CsdFile, CsdSubEntry};
+use crate::dat::csd::{CsdEntry, CsdFile, CsdParameter, CsdSubEntry};
 use std::collections::HashMap;
 
 /// Resolves (stat id, numeric value) pairs from a DAT row into the rendered
@@ -18,7 +18,7 @@ pub struct TranslationLookup {
     formatters: std::rc::Rc<Formatters>,
 }
 
-/// Formatter function name to the names its values pick, the first for value 1.
+/// Formatter name (then `/<value>` per further value it reads) to the names its values pick, the first for value 1.
 pub type Formatters = HashMap<String, Vec<String>>;
 
 impl TranslationLookup {
@@ -408,13 +408,23 @@ fn render(sub: &CsdSubEntry, raw_values: &[(i32, i32)], formatters: &Formatters)
     for param in &sub.parameters {
         let idx = (param.value as usize).saturating_sub(1);
         let Some(f) = fmts.get_mut(idx) else { continue };
-        match formatters.get(&param.name) {
+        match formatter_names(formatters, param, raw_values) {
             // A range shows its lowest, as PoE 1's per-value descriptions did.
-            Some(rows) => names[idx] = (f.min >= 1.0).then(|| rows.get(f.min as usize - 1).cloned()).flatten(),
+            Some(rows) => names[idx] = (f.min >= 1.0).then(|| rows.get(f.min as usize - 1).filter(|n| !n.is_empty()).cloned()).flatten(),
             None => *f = apply_function(&param.name, *f),
         }
     }
     substitute(&sub.description, &fmts, &names)
+}
+
+/// A formatter's names, under its handler name and then the lowest of each further value it reads.
+fn formatter_names<'f>(formatters: &'f Formatters, param: &CsdParameter, raw_values: &[(i32, i32)]) -> Option<&'f Vec<String>> {
+    let mut key = param.name.clone();
+    for input in &param.inputs {
+        let (min, _) = raw_values.get((*input as usize).checked_sub(1)?)?;
+        key.push_str(&format!("/{min}"));
+    }
+    formatters.get(&key)
 }
 
 fn substitute(template: &str, values: &[ValueFmt], names: &[Option<String>]) -> String {
@@ -612,5 +622,15 @@ mod tests {
         let ids = ["lure".to_string()];
         assert_eq!(lookup.translate_ranges(&ids, &[(2, 2)]), vec!["Fishing with Siren Worm Bait".to_string()]);
         assert_eq!(lookup.translate_ranges(&ids, &[(1, 3)]), vec!["Fishing with Rhoa Feather Lure".to_string()]);
+    }
+
+    #[test]
+    fn formatter_keys_the_further_values_it_reads() {
+        let file = parse("description\n\t3 version keystone revision\n\t1\n\t\t# # # \"in the name of {1}\" alternate_tree_version_keystone 2 1 3");
+        let names = Formatters::from([("alternate_tree_version_keystone/1/1".to_string(), vec!["Xibaqua".to_string(), "Mazcotl".to_string()])]);
+        let lookup = TranslationLookup::build(&[&file]).with_formatters(std::rc::Rc::new(names));
+        let ids = ["version".to_string(), "keystone".to_string(), "revision".to_string()];
+        assert_eq!(lookup.translate_ranges(&ids, &[(1, 1), (2, 2), (1, 1)]), vec!["in the name of Mazcotl".to_string()]);
+        assert_eq!(lookup.translate_ranges(&ids, &[(1, 1), (2, 2), (0, 0)]), vec!["in the name of 2".to_string()]);
     }
 }

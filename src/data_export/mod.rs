@@ -315,7 +315,7 @@ impl<'a> Ctx<'a> {
         self.collect_csd(file, &mut chain, &mut std::collections::HashSet::new());
         let mut lookup = crate::dat::stat_translation::TranslationLookup::build_shared(&chain);
         if !self.rr.is_poe2 {
-            lookup = lookup.with_formatters(crate::pob_export::modules::stat_descriptions::formatter_names(self));
+            lookup = lookup.with_formatters(modules::stat_translations::formatters(self));
         }
         let lookup = std::rc::Rc::new(lookup);
         self.translations.borrow_mut().insert(file.to_string(), std::rc::Rc::clone(&lookup));
