@@ -103,7 +103,7 @@ EXPORT-DATA OPTIONS:
     -o, --out <DIR>        Output folder (default: ./data)
         --ggpk <FILE>      Content.ggpk to read (default: saved setting)
         --steam <DIR>      Bundles2 folder to read (default: saved setting)
-        --cdn [<VERSION>]  Read from the patch CDN, no install needed
+        --cdn [<VERSION>]  Read from the patch CDN, no install needed (no version: the live one)
         --schema <FILE>    dat-schema JSON (default: the cached schema.min.json)
         --only <A,B,...>   Run only these modules
         --images           Also export item, skill and buff icons as png + webp
@@ -634,16 +634,26 @@ fn resolve_game(requested: Option<Game>, ggpk: Option<&str>, steam: Option<&str>
         .unwrap_or_default()
 }
 
-/// The patch `--cdn` reads: the one named, else the one saved for the game, else the one live now.
+/// The patch `--cdn` reads: the one named, else the live one (the CDN drops older patches' bundles), else the saved one.
 fn cdn_patch_version(explicit: Option<String>, settings: &AppSettings, game: Game) -> Result<String, String> {
+    pick_cdn_version(explicit, settings.patch_version(game), || {
+        crate::patch_server::live(game, settings.patch_protocol(game))
+            .map(|patch| patch.version)
+            .map_err(|e| format!("Could not ask which {} patch is live: {}", game.label(), e))
+    })
+}
+
+fn pick_cdn_version(explicit: Option<String>, saved: &str, live: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
     if let Some(version) = explicit {
         return Ok(version);
     }
-    match settings.patch_version(game) {
-        "" => crate::patch_server::live(game, settings.patch_protocol(game))
-            .map(|patch| patch.version)
-            .map_err(|e| format!("Could not ask which {} patch is live: {}", game.label(), e)),
-        saved => Ok(saved.to_string()),
+    match live() {
+        Ok(version) => Ok(version),
+        Err(why) if !saved.is_empty() => {
+            println!("{}; reading the saved patch {}", why, saved);
+            Ok(saved.to_string())
+        }
+        Err(why) => Err(why),
     }
 }
 
@@ -1410,5 +1420,15 @@ mod tests {
         assert_eq!(resolve_game(None, None, None, Some("4.5.5.4")), Game::Poe2);
         assert_eq!(resolve_game(None, None, None, Some("0.5.5.4")), Game::Poe2);
         assert_eq!(resolve_game(None, None, None, Some("1.0.0.1")), Game::Poe2);
+    }
+
+    #[test]
+    fn bare_cdn_reads_the_live_patch_before_the_saved_one() {
+        let live = || Ok("3.30.0.3".to_string());
+        let offline = || Err("no answer".to_string());
+        assert_eq!(pick_cdn_version(Some("3.29.3.3".into()), "3.30.0.1.2", live), Ok("3.29.3.3".into()));
+        assert_eq!(pick_cdn_version(None, "3.30.0.1.2", live), Ok("3.30.0.3".into()));
+        assert_eq!(pick_cdn_version(None, "3.30.0.1.2", offline), Ok("3.30.0.1.2".into()));
+        assert_eq!(pick_cdn_version(None, "", offline), Err("no answer".into()));
     }
 }
