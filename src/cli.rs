@@ -548,7 +548,7 @@ pub fn run_file_export(args: &[String]) -> Result<(), String> {
     if settings.psg_format == PsgFormat::Tree && hashes.len() == 1 {
         let Some(schema) = schema else { return Err("A tree export needs a schema; pass --schema".to_string()) };
         let info = index.files.get(&hashes[0]).cloned().ok_or("that file is not in the index")?;
-        let source = crate::skill_tree_export::TreeExportSource::new(reader, index, steam_loader, schema);
+        let source = crate::skill_tree_export::TreeExportSource::with_cdn(reader, index, steam_loader, cdn.clone(), schema);
         let bytes = source.fetch(&info.path).ok_or_else(|| format!("Could not read {}", info.path))?;
         let psg = crate::dat::psg::parse_psg(&bytes).map_err(|e| format!("Could not parse {}: {}", info.path, e))?;
         std::thread::spawn(move || {

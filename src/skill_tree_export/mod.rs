@@ -21,7 +21,6 @@ use crate::export::ExportStatus;
 use crate::ggpk::reader::GgpkReader;
 use crate::skill_tree::atlas_node_db::{tree_context_for_graph_type, SkillGraphDatabase, SkillGraphNodeInfo, ATLAS_MAIN_TREE_BG_PATH};
 use crate::bundles::extract::{dds_path_candidates, decompress_bundle, extract_bundle_file_sync};
-use crate::skill_tree::build_skill_graph_db;
 use crate::skill_tree::art::{FrameArt, NodeFrameKind};
 use crate::skill_tree::layout::{self as skill_tree_layout, ASCENDANCY_PLATE_SIZE, CLASS_ILLUSTRATION_SIZE, CLASS_START_MOUNT_RADIUS, CLASS_START_RING_RADIUS, MAIN_CIRCLE_SIZE};
 use image::RgbaImage;
@@ -247,7 +246,10 @@ pub(crate) fn export_tree(
     progress("Resolving passive skill data");
     let db = match db {
         Some(db) => db,
-        None => Arc::new(build_skill_graph_db(source.reader.as_deref(), &source.index, source.steam.as_ref(), &source.schema)?),
+        None => {
+            let is_poe2 = crate::data_export::game_from_index(&source.index).map(|g| g.is_poe2()).unwrap_or(true);
+            Arc::new(crate::skill_tree::build_skill_graph_db_from(&|p| source.fetch(p), &source.schema, is_poe2, false)?)
+        }
     };
     let tables = tables::load(source, &db, psg_path);
 
@@ -1817,6 +1819,7 @@ mod tests {
 mod real_data_tests {
     use super::*;
     use crate::bundles::index::Index as BundleIndex;
+    use crate::skill_tree::build_skill_graph_db;
 
     /// Dumps the DAT tables named in `TREE_TABLES` (comma separated) as JSON
     /// into `TREE_EXPORT_OUT`, for checking a column by hand.
