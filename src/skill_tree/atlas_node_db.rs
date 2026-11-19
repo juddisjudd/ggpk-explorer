@@ -81,6 +81,10 @@ pub struct SkillGraphNodeInfo {
     pub stat_texts: Vec<String>,
     /// `PassiveSkills` row index.
     pub row: usize,
+    /// `IsAtlasWormhole`: a Cryptic Gateway, which links to its twin elsewhere on the atlas.
+    pub is_wormhole: bool,
+    /// `AtlasGroup` (PoE 1) or `Group` (PoE 2): the `AtlasPassiveSkillTreeGroupType` row.
+    pub atlas_group: Option<usize>,
 }
 
 #[allow(dead_code)]
@@ -727,6 +731,14 @@ pub fn mastery_art_table(schema: &Schema, is_poe2: bool) -> Option<String> {
     art.references.as_ref().map(|r| r.table.clone())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildOptions {
+    /// PoE 1's Ruthless values, for the rows that have their own.
+    pub hardmode: bool,
+    /// The description files are an include chain, base first, rather than a pool.
+    pub include_chain: bool,
+}
+
 pub fn build(
     passiveskills_bytes: Vec<u8>,
     stats_bytes: Vec<u8>,
@@ -734,8 +746,9 @@ pub fn build(
     extra: ExtraTables,
     schema: &Schema,
     is_poe2: bool,
-    hardmode: bool,
+    options: BuildOptions,
 ) -> Result<SkillGraphDatabase, String> {
+    let hardmode = options.hardmode;
     let ExtraTables {
         ascendancy: ascendancy_bytes,
         descendancy: descendancy_bytes,
@@ -774,7 +787,10 @@ pub fn build(
         .map(|s| csd::parse_csd(&s.bytes, &s.path))
         .collect::<Result<Vec<_>, _>>()?;
     let csd_refs: Vec<&CsdFile> = csd_files.iter().collect();
-    let lookup = TranslationLookup::build(&csd_refs);
+    let lookup = match options.include_chain {
+        true => TranslationLookup::build_layered(&csd_refs),
+        false => TranslationLookup::build(&csd_refs),
+    };
 
     // Ascendancy row index -> PassiveTreeImage, needed only for the (few)
     // nodes that are an ascendancy's starting node. Positioning is resolved
@@ -909,6 +925,8 @@ pub fn build(
     let anoint_col = col_index(ps_table, "IsAnointmentOnly");
     let is_free_col = col_index(ps_table, "IsFree");
     let hide_connection_col = unnamed_col_near(ps_table, "IsFree", 1, "bool");
+    let wormhole_col = col_index(ps_table, "IsAtlasWormhole");
+    let atlas_group_col = col_index(ps_table, "AtlasGroup").or_else(|| col_index(ps_table, "Group"));
     let points_col = col_index(ps_table, "SkillPointsGranted");
     let weapon_points_col = col_index(ps_table, "WeaponPointsGranted");
     let unlocked_by_col = col_index(ps_table, "UnlockedBy");
@@ -1092,6 +1110,8 @@ pub fn build(
             stat_values,
             stat_texts,
             row: i as usize,
+            is_wormhole: flag(wormhole_col),
+            atlas_group: atlas_group_col.and_then(|c| row.get(c)).and_then(as_foreign_row),
         };
 
         nodes.insert(graph_id as u32, info);

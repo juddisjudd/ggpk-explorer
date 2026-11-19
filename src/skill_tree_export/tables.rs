@@ -30,6 +30,14 @@ pub struct GrantedEffect {
 pub struct ExtraTables {
     /// `PassiveSkillTrees.Id` of the tree whose graph is being exported.
     pub tree_name: String,
+    /// Every `PassiveSkillTrees.Id` that draws this graph, in table order (PoE 1's atlas has two).
+    pub tree_names: Vec<String>,
+    /// An atlas notable's graph id -> the graph ids of the content choices it offers.
+    pub variant_effects: HashMap<u32, Vec<u32>>,
+    /// `AtlasPassiveSkillTreeGroupType.Id` by row.
+    pub atlas_group_types: Vec<String>,
+    /// `PassiveSkillTreeConnectionArt.Id` -> its active, normal and intermediate curves sheets.
+    pub connection_art: HashMap<String, [String; 3]>,
     /// `(Characters row, skill graph id, override graph id)`.
     pub class_overrides: Vec<(usize, u32, u32)>,
     /// `(Ascendancy row, skill graph id, override graph id)`.
@@ -291,8 +299,21 @@ pub fn load(source: &TreeExportSource, db: &SkillGraphDatabase, psg_path: &str) 
         for row in trees.rows() {
             let graph = trees.string(&row, "PassiveSkillGraph").to_ascii_lowercase();
             if !graph.is_empty() && graph == wanted {
-                out.tree_name = trees.string(&row, "Id");
+                out.tree_names.push(trees.string(&row, "Id"));
             }
+        }
+        if let Some(first) = out.tree_names.first() {
+            out.tree_name.clone_from(first);
+        }
+    }
+    if let Some(types) = open(source, db, "AtlasPassiveSkillTreeGroupType") {
+        out.atlas_group_types = types.rows().map(|row| types.string(&row, "Id")).collect();
+    }
+    if let Some(art) = open(source, db, "PassiveSkillTreeConnectionArt") {
+        for row in art.rows() {
+            // PoE 1's schema swaps Active and Mask; the active curves are the sheet under PassiveTree, the mask is a UI effect.
+            let active = ["Active", "Mask"].iter().map(|c| art.string(&row, c)).find(|p| p.starts_with("Art/2DArt/PassiveTree/")).unwrap_or_default();
+            out.connection_art.insert(art.string(&row, "Id"), [active, art.string(&row, "Normal"), art.string(&row, "Intermediate")]);
         }
     }
 
@@ -330,11 +351,17 @@ pub fn load(source: &TreeExportSource, db: &SkillGraphDatabase, psg_path: &str) 
                 .map(|v| matches!(v, DatValue::Bool(true)))
                 .unwrap_or(false)
         };
+        // An atlas notable that offers a choice shares its `Id` with the variant type listing the choices.
+        let graph_of_id: HashMap<&str, u32> = db.nodes.iter().map(|(g, n)| (n.id.as_str(), *g)).collect();
         for row in variants.rows() {
-            if variants.row_ref(&row, "Type").map(is_choice).unwrap_or(false) {
-                if let Some(g) = variants.row_ref(&row, "Variant").and_then(gid) {
-                    out.variants.push(g);
-                }
+            let kind = variants.row_ref(&row, "Type");
+            let Some(g) = variants.row_ref(&row, "Variant").and_then(gid) else { continue };
+            if kind.map(is_choice).unwrap_or(false) {
+                out.variants.push(g);
+            }
+            let parent = kind.and_then(|k| types.row(k)).and_then(|k| graph_of_id.get(types.string(&k, "Id").as_str()).copied());
+            if let Some(parent) = parent {
+                out.variant_effects.entry(parent).or_default().push(g);
             }
         }
     }

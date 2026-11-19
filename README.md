@@ -60,7 +60,7 @@ The **Diff** button records a snapshot of the current bundle index and compares 
 - Right-click any file or folder in the tree to export it.
 - Convert while exporting: textures to PNG or WebP, audio to WAV, DAT tables and stat descriptions to JSON, and any file with a parser (`.ao`, `.mat`, `.fmt`, `.dgr`, `.pet`, ...) to JSON beside its path as `<file>.json`.
 - Progress tracking with per-file status for large folder exports.
-- **Skill trees**: The PSG viewer's **Export tree…** button writes a tree in GGG's official web export layout: `data.json`, WebP sprite sheets, and a standalone `index.html` viewer.
+- **Skill trees**: The PSG viewer's **Export tree…** button writes a tree in GGG's official web export layout: `data.json`, WebP sprite sheets, and a standalone `index.html` viewer. PoE 1's atlas comes out the way GGG's atlastree-export lays it out: `data.json` and `league.json`, their Ruthless versions, and the `atlas-*` sheets at all five zoom levels.
 - **Game data**: **File → Export Game Data…** writes RePoE-style JSON, one file per game concept rather than one per DAT table: `mods.json`, `skills.json`, `base_items.json`, `unique_details.json`, `stat_translations/`, and 27 others. A table whose layout no longer matches the schema is refused instead of exported wrong, and the run reports what it left out.
 - **DAT tables**: **File → Export DAT Tables…** (or `export-tables`) writes every table whole, one file each, as JSON, CSV or both. A foreign key names its target row by that row's unique key (`{"TableName": "Stats", "Id": "additional_strength"}`), so a reference still reads right after a patch reorders the target. Tables whose layout no longer matches the schema are left out and listed in `export_report.json`.
 - **Path of Building data**: **File → Export PoB Data…** writes Path of Building's data files — bases, skills and gems, mods, minions and spectres, stat descriptions and the rest — as the JSON repoe-fork publishes as pob-data, for either game. They are built from the installed patch by ports of PoB's own export scripts, so they do not wait for a PoB release. Files PoB writes by hand (ModCache, SkillStatMap, uniques, trade data) are listed in the report instead.
@@ -76,6 +76,7 @@ The same binary runs without the GUI:
 | `ggpk-explorer export-data -o data` | Write the RePoE-style JSON dumps. |
 | `ggpk-explorer export-pob -o pob-data` | Write Path of Building's data files as pob-data JSON. |
 | `ggpk-explorer export-tree -o pob-tree` | Write Path of Building's passive tree folders (`src/TreeData`). |
+| `ggpk-explorer export metadata/atlasskillgraphs/atlasskillgraph.psg --poe1 --cdn --psg tree -o atlas` | Write PoE 1's atlas tree as GGG's atlastree-export does. |
 | `ggpk-explorer export-tables -o tables --format both` | Write every DAT table whole as JSON and CSV, each foreign key named by the key of the row it points at. |
 | `ggpk-explorer refit --old 4.5.4.11 --write` | Rebuild the table layouts a patch broke, using the patch before it. |
 | `ggpk-explorer lint` | Check the schema's foreign keys and enum indices against the game files. |

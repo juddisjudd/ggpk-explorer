@@ -58,6 +58,25 @@ impl TranslationLookup {
         Self { entries, by_id, superseded, formatters: Default::default() }
     }
 
+    /// [`build`](Self::build) for an include chain given base first: the client never looks a stat up in a file once a later one mentions it.
+    pub fn build_layered(csd_files: &[&CsdFile]) -> Self {
+        let mut lookup = Self::build(csd_files);
+        let mut later: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut end = lookup.entries.len();
+        for file in csd_files.iter().rev() {
+            let entries: Vec<&CsdEntry> = file.entries.iter().filter(|e| !e.ids.is_empty()).collect();
+            let start = end - entries.len();
+            for (offset, entry) in entries.iter().enumerate() {
+                if entry.ids.iter().any(|id| later.contains(id.as_str())) {
+                    lookup.superseded[start + offset] = true;
+                }
+            }
+            later.extend(entries.iter().flat_map(|e| e.ids.iter().map(String::as_str)));
+            end = start;
+        }
+        lookup
+    }
+
     pub fn with_formatters(self, formatters: std::rc::Rc<Formatters>) -> Self {
         Self { formatters, ..self }
     }
@@ -494,6 +513,15 @@ mod tests {
     fn parse(text: &str) -> CsdFile {
         let bytes: Vec<u8> = text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         parse_csd(&bytes, "test.csd").expect("parse failed")
+    }
+
+    #[test]
+    fn a_later_file_in_an_include_chain_hides_every_earlier_entry_for_its_stats() {
+        let base = parse("description\n\t1 map_rarity\n\t1\n\t\t# \"{0}% increased Rarity in Area\"");
+        let atlas = parse("description\n\t2 map_rarity chart_stat\n\t1\n\t\t1|# # \"{0}% increased Rarity in your Maps\"");
+        let ids = ["map_rarity".to_string()];
+        assert_eq!(TranslationLookup::build(&[&base, &atlas]).translate(&ids, &[1]), Some("1% increased Rarity in Area".to_string()));
+        assert_eq!(TranslationLookup::build_layered(&[&base, &atlas]).translate(&ids, &[1]), Some("1% increased Rarity in your Maps".to_string()));
     }
 
     #[test]

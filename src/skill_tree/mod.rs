@@ -124,16 +124,17 @@ pub fn build_skill_graph_db(
     let fetch = |path: &str| {
         find_file_info_by_path(index, path).and_then(|info| extract_bundle_file_sync(info, index, reader, steam_loader))
     };
-    build_skill_graph_db_from(&fetch, schema, is_poe2, false)
+    build_skill_graph_db_from(&fetch, schema, is_poe2, false, false)
 }
 
-/// `build_skill_graph_db` over any source of game files. `hardmode` reads
-/// PoE 1's passives as Ruthless has them.
+/// `build_skill_graph_db` over any source of game files. `hardmode` reads PoE 1's
+/// Ruthless values; `atlas_wording` the atlas screen's own description chain.
 pub fn build_skill_graph_db_from(
     fetch_file: &dyn Fn(&str) -> Option<Vec<u8>>,
     schema: &Schema,
     is_poe2: bool,
     hardmode: bool,
+    atlas_wording: bool,
 ) -> Result<atlas_node_db::SkillGraphDatabase, String> {
     let fetch = |path: &str| -> Result<Vec<u8>, String> {
         fetch_file(path).ok_or_else(|| format!("Could not read {}", path))
@@ -159,18 +160,17 @@ pub fn build_skill_graph_db_from(
     // Brequel (Chayula league tree). Later files redefine earlier entries,
     // so the generic `stat_descriptions.csd` goes before the passive-tree
     // files; the atlas files come first so they never shadow passive text.
-    let csd_paths: Vec<String> = match is_poe2 {
-        true => ["atlas_stat_descriptions", "atlas_variant_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions", "passive_skill_variant_stat_descriptions"]
-            .iter()
-            .map(|n| format!("data/statdescriptions/{}.csd", n))
-            .collect(),
+    let include_chain = atlas_wording && !is_poe2;
+    let csd_names: &[&str] = match (is_poe2, include_chain) {
+        (true, _) => &["atlas_stat_descriptions", "atlas_variant_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions", "passive_skill_variant_stat_descriptions"],
         // A node states what it grants you; the aura file rewords the same
         // stats as what nearby enemies or allies get, and belongs to buffs.
-        false => ["atlas_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions"]
-            .iter()
-            .map(|n| format!("metadata/statdescriptions/{}.csd", n))
-            .collect(),
+        (false, false) => &["atlas_stat_descriptions", "stat_descriptions", "passive_skill_stat_descriptions"],
+        // Each file includes the one before it.
+        (false, true) => &["stat_descriptions", "map_stat_descriptions", "atlas_stat_descriptions", "atlas_variant_stat_descriptions"],
     };
+    let folder = if is_poe2 { "data" } else { "metadata" };
+    let csd_paths: Vec<String> = csd_names.iter().map(|n| format!("{}/statdescriptions/{}.csd", folder, n)).collect();
     let mut stat_csd_sources = Vec::new();
     for path in csd_paths {
         // A tree file one game does not ship simply adds nothing.
@@ -204,7 +204,7 @@ pub fn build_skill_graph_db_from(
         extra,
         schema,
         is_poe2,
-        hardmode,
+        atlas_node_db::BuildOptions { hardmode, include_chain },
     )?;
 
     let node_frames = match fetch_optional(&table("passiveskilltreenodeframeart")) {
