@@ -106,6 +106,12 @@ pub fn escape_ggg_string(text: &str) -> String {
     String::from_utf8(s).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+/// `escape_ggg_string` without its link steps, so `[Link|Text]` survives.
+pub fn strip_tags(text: &str) -> String {
+    let s = gsub_tagged_braces(text.as_bytes());
+    String::from_utf8(s).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
 /// `gsub("<[^>]+>{([^}]+)}", "%1")`.
 fn gsub_tagged_braces(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());

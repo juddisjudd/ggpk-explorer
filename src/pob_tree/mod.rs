@@ -11,6 +11,7 @@
 mod assets;
 mod dds;
 mod format;
+mod keywords;
 mod legion;
 mod luajit;
 mod orbits;

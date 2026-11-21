@@ -111,13 +111,22 @@ pub struct Caches {
 /// carry the game's extension (`stat_descriptions.csd`,
 /// `stat_descriptions.txt`). Cached for the run.
 pub fn describer(ctx: &Ctx, names: &[&str]) -> Rc<statdesc::Descriptors> {
-    let key = names.join("|").to_ascii_lowercase();
+    describer_with(ctx, names, false)
+}
+
+/// `describer`, with the client's keyword links left in the text.
+pub fn linked_describer(ctx: &Ctx, names: &[&str]) -> Rc<statdesc::Descriptors> {
+    describer_with(ctx, names, true)
+}
+
+fn describer_with(ctx: &Ctx, names: &[&str], keep_links: bool) -> Rc<statdesc::Descriptors> {
+    let key = format!("{}{}", names.join("|").to_ascii_lowercase(), if keep_links { "+links" } else { "" });
     if let Some(hit) = ctx.pob.describers.borrow().get(&key) {
         return Rc::clone(hit);
     }
     let game = game(ctx);
     let fetch = |path: &str| crate::dat::relational::FileSource::fetch(ctx.files, path);
-    let mut descriptors = statdesc::Descriptors::load(game, names[0], &fetch);
+    let mut descriptors = statdesc::Descriptors::load_with(game, names[0], &fetch, keep_links);
     for extra in &names[1..] {
         descriptors.append(extra, &fetch);
     }

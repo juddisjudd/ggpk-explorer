@@ -7,7 +7,7 @@
 //! in LuaJIT's `pairs` order, `min_x`/`min_y` start from 0, and ascendancy
 //! clusters are moved onto a ring around the tree by its arithmetic.
 
-use super::{dds, format, luajit, orbits};
+use super::{dds, format, keywords, luajit, orbits};
 use crate::dat::relational::{LoadedTable, Ref, Row};
 use crate::data_export::Ctx;
 use crate::pob_export::lua::{Lua, Table};
@@ -204,6 +204,9 @@ struct Builder<'c, 'a> {
     rects: HashMap<String, Option<[f64; 4]>>,
     sheets: std::cell::RefCell<Vec<Sheet>>,
     describer: Rc<Descriptors>,
+    linked: Rc<Descriptors>,
+    links: std::cell::RefCell<keywords::Lines>,
+    unmatched: std::cell::Cell<usize>,
     passives: Rc<LoadedTable>,
     cols: Cols,
     by_graph_id: HashMap<i64, usize>,
@@ -231,12 +234,25 @@ impl<'c, 'a> Builder<'c, 'a> {
 
     /// `describeStats` over a PassiveSkills row's stats, each at its value.
     fn describe(&self, row: Row<'_>) -> Vec<String> {
+        let lines = self.describer.describe_stats(&mut self.stats(row)).lines;
+        let linked = self.linked.describe_stats(&mut self.stats(row)).lines;
+        let mut links = self.links.borrow_mut();
+        let unmatched = if linked.len() == lines.len() {
+            lines.iter().zip(&linked).filter(|(plain, raw)| !keywords::record(&mut links, plain, raw)).count()
+        } else {
+            lines.len()
+        };
+        self.unmatched.set(self.unmatched.get() + unmatched);
+        lines
+    }
+
+    fn stats(&self, row: Row<'_>) -> Stats {
         let mut stats = Stats::new();
         for (k, stat) in self.ctx.rr.deref_list(row, self.cols.stats).iter().enumerate() {
             let value = self.cols.stat_values.get(k).map(|c| row.int(c)).unwrap_or(0) as f64;
             stats.set(&stat.id(), value, value);
         }
-        self.describer.describe_stats(&mut stats).lines
+        stats
     }
 
     /// The three frames of a PassiveSkillTreeNodeFrameArt row, as uiimage
@@ -258,7 +274,7 @@ impl<'c, 'a> Builder<'c, 'a> {
 pub fn write(ctx: &Ctx, version: &str) -> Result<(), String> {
     let dir = ctx.out.join(version);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
-    let Built { mut tree, sheets, orbit_art, rects } = build(ctx)?;
+    let Built { mut tree, sheets, orbit_art, rects, links, unmatched } = build(ctx)?;
     let mut coords = Table::new();
     for sheet in &sheets {
         for (file, entries) in pack(ctx, sheet, &rects, &dir)? {
@@ -278,7 +294,10 @@ pub fn write(ctx: &Ctx, version: &str) -> Result<(), String> {
     }
     tree.set("assets", assets);
     write_file(&dir.join("tree.lua"), format::lua_source(&tree).as_bytes())?;
-    write_file(&dir.join("tree.json"), format::json(&Lua::Table(tree)).as_bytes())
+    write_file(&dir.join("tree.json"), format::json(&Lua::Table(tree)).as_bytes())?;
+    let (lines, keywords) = keywords::write(ctx, &dir, &links)?;
+    eprintln!("pob tree: keywords.json with {} linked lines and {} keywords ({} lines kept plain)", lines, keywords, unmatched);
+    Ok(())
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
@@ -290,6 +309,8 @@ struct Built {
     sheets: Vec<Sheet>,
     orbit_art: Vec<(&'static str, Ref)>,
     rects: HashMap<String, Option<[f64; 4]>>,
+    links: keywords::Lines,
+    unmatched: usize,
 }
 
 fn build(ctx: &Ctx) -> Result<Built, String> {
@@ -329,11 +350,12 @@ fn build(ctx: &Ctx) -> Result<Built, String> {
         by_graph_id.entry(row.int(cols.graph_id)).or_insert(row.index);
     }
     let describer = crate::pob_export::describer(ctx, &["passive_skill_stat_descriptions.csd"]);
+    let linked = crate::pob_export::linked_describer(ctx, &["passive_skill_stat_descriptions.csd"]);
     let sheets: Vec<Sheet> = ["skills", "skills-disabled", "group-background", "mastery-active-effect", "ascendancy-background", "oils", "lines", "jewel-sockets", "legion"]
         .into_iter()
         .map(Sheet::new)
         .collect();
-    let b = Builder { ctx, ui, rects, sheets: std::cell::RefCell::new(sheets), describer, passives: Rc::clone(&passives), cols, by_graph_id };
+    let b = Builder { ctx, ui, rects, sheets: std::cell::RefCell::new(sheets), describer, linked, links: Default::default(), unmatched: Default::default(), passives: Rc::clone(&passives), cols, by_graph_id };
 
     let connection_art = ctx.table("PassiveSkillTreeConnectionArt")?;
     let orbit_art: Vec<(&'static str, Ref)> = ORBIT_ART
@@ -719,7 +741,7 @@ fn build(ctx: &Ctx) -> Result<Built, String> {
     let mut connection = Table::new();
     connection.set("default", "Character").set("ascendancy", "CharacterAscendancy");
     tree.set("connectionArt", connection);
-    Ok(Built { tree, sheets: b.sheets.into_inner(), orbit_art, rects: b.rects })
+    Ok(Built { tree, sheets: b.sheets.into_inner(), orbit_art, rects: b.rects, links: b.links.into_inner(), unmatched: b.unmatched.get() })
 }
 
 fn size_table(width: f64, height: f64) -> Table {

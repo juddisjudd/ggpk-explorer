@@ -10,6 +10,7 @@
 //! and points where the game gives it some. The positions, retired nodes and
 //! class illustrations are PoB's own choices, kept as tables below.
 
+use super::keywords;
 use crate::data_export::Ctx;
 use crate::skill_tree_export::json::J;
 use crate::skill_tree_export::{export_tree, TreeExportOptions, TreeExportSource};
@@ -362,7 +363,8 @@ fn build(ctx: &Ctx, dir: &Path, staging: &Path, ruthless: bool) -> Result<(), St
 
     let mut data = Py::from_j(&data);
     strip_viewer_fields(&mut data);
-    fix_ascendancy_positions(&mut data)?;
+    let mut links = keywords::Lines::new();
+    let unmatched = fix_ascendancy_positions(&mut data, &mut links)?;
     let mut sprites = data.remove("sprites").ok_or("the export has no sprite sheets")?;
     data.remove("extraImages");
     data.remove("imageZoomLevels");
@@ -388,19 +390,23 @@ fn build(ctx: &Ctx, dir: &Path, staging: &Path, ruthless: bool) -> Result<(), St
     }
     let sprite_file = Py::Dict(vec![("extraImages".to_string(), Py::Dict(extra)), ("sprites".to_string(), sprites)]);
     write_lua(&dir.join("tree.lua"), &data)?;
-    write_lua(&dir.join("sprites.lua"), &sprite_file)
+    write_lua(&dir.join("sprites.lua"), &sprite_file)?;
+    let (lines, keywords) = keywords::write(ctx, dir, &links)?;
+    eprintln!("pob tree: keywords.json with {} linked lines and {} keywords ({} lines kept plain)", lines, keywords, unmatched);
+    Ok(())
 }
 
 /// The script's edits to `data.json`, in its order: GGG's link markup taken
 /// out of stat and reminder lines, each ascendancy moved so its start group
 /// sits where PoB wants it, and the retired nodes added in their own groups.
-fn fix_ascendancy_positions(data: &mut Py) -> Result<(), String> {
+fn fix_ascendancy_positions(data: &mut Py, links: &mut keywords::Lines) -> Result<usize, String> {
+    let mut unmatched = 0;
     if let Some(Py::Dict(nodes)) = data.get_mut("nodes") {
         for (_, node) in nodes.iter_mut() {
-            strip_links(node);
+            unmatched += strip_links(node, links);
             // GGG links words in mastery effects from 3.30 on, which PoB's script does not strip yet.
             if let Some(Py::List(effects)) = node.get_mut("masteryEffects") {
-                effects.iter_mut().for_each(strip_links);
+                unmatched += effects.iter_mut().map(|effect| strip_links(effect, links)).sum::<usize>();
             }
         }
     }
@@ -476,19 +482,25 @@ fn fix_ascendancy_positions(data: &mut Py) -> Result<(), String> {
         ]);
         data.get_mut("nodes").ok_or("data.json has no nodes")?.set(&retired.skill.to_string(), Py::Dict(fields));
     }
-    Ok(())
+    Ok(unmatched)
 }
 
-fn strip_links(entry: &mut Py) {
+fn strip_links(entry: &mut Py, links: &mut keywords::Lines) -> usize {
+    let mut unmatched = 0;
     for field in ["stats", "reminderText"] {
         if let Some(Py::List(lines)) = entry.get_mut(field) {
             for line in lines.iter_mut() {
                 if let Py::Str(s) = line {
-                    *s = strip_markup(s);
+                    let plain = strip_markup(s);
+                    if !keywords::record(links, &plain, s) {
+                        unmatched += 1;
+                    }
+                    *s = plain;
                 }
             }
         }
     }
+    unmatched
 }
 
 /// `[Id|Label]`, `[Id::10|Label]` and `[Id<gemlevel 20>|Label]` show the label, `[Id]` the id, `<tag>{text}` the text.

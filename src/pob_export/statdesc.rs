@@ -10,7 +10,7 @@
 //! here rather than reusing `dat::csd`, whose job is the client's rules.
 
 use super::lua::{Lua, Table};
-use super::text::{escape_ggg_string, format_number, round, sanitise_text};
+use super::text::{escape_ggg_string, format_number, round, sanitise_text, strip_tags};
 use crate::settings::Game;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -151,7 +151,7 @@ fn lua_tonumber(s: &str) -> Option<f64> {
 
 /// Parses the part of a line after the description header:
 /// `([%d%-#| !]+)%s*([%w_]*)%s*"(.-)"%s*(.*)`, searched anywhere in the line.
-fn parse_wording(line: &str, game: Game, for_export: bool) -> Option<Wording> {
+fn parse_wording(line: &str, game: Game, for_export: bool, links: bool) -> Option<Wording> {
     let b = line.as_bytes();
     let in_limits = |c: u8| c.is_ascii_digit() || matches!(c, b'-' | b'#' | b'|' | b' ' | b'!');
     let is_space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c);
@@ -169,7 +169,7 @@ fn parse_wording(line: &str, game: Game, for_export: bool) -> Option<Wording> {
         // word here, so trying the full run and then shorter ones suffices.
         for end in (start + 1..=i).rev() {
             if let Some(w) = wording_after(b, start, end, &is_space, &is_word) {
-                return Some(finish_wording(w, game, for_export));
+                return Some(finish_wording(w, game, for_export, links));
             }
         }
     }
@@ -220,8 +220,8 @@ fn wording_after<'a>(
     })
 }
 
-fn finish_wording(raw: RawWording, game: Game, for_export: bool) -> Wording {
-    let mut text = escape_ggg_string(raw.text);
+fn finish_wording(raw: RawWording, game: Game, for_export: bool, links: bool) -> Wording {
+    let mut text = if links { strip_tags(raw.text) } else { escape_ggg_string(raw.text) };
     if game == Game::Poe2 {
         if for_export {
             text = sanitise_text(&text, game);
@@ -526,6 +526,8 @@ pub struct Descriptors {
     pub by_stat: HashMap<String, usize>,
     /// PoE 1's formatter functions (3.30 on): the names a value picks by row.
     pub formatters: Rc<FormatterNames>,
+    /// Keeps the client's keyword links (`[Fire]`) in the text it renders.
+    pub keep_links: bool,
 }
 
 pub type FormatterNames = HashMap<String, Vec<String>>;
@@ -534,7 +536,11 @@ impl Descriptors {
     /// `loadStatFile(name)`. `fetch` reads a game file's bytes; `name` is the
     /// file name under the game's description folder, extension included.
     pub fn load(game: Game, name: &str, fetch: &dyn Fn(&str) -> Option<Vec<u8>>) -> Self {
-        let mut out = Descriptors { game, ..Default::default() };
+        Self::load_with(game, name, fetch, false)
+    }
+
+    pub fn load_with(game: Game, name: &str, fetch: &dyn Fn(&str) -> Option<Vec<u8>>, keep_links: bool) -> Self {
+        let mut out = Descriptors { game, keep_links, ..Default::default() };
         out.parse_into(name, 1.0, fetch);
         out
     }
@@ -549,7 +555,7 @@ impl Descriptors {
             .filter(|d| d.order > 0.0)
             .map(|d| d.order + 1.0)
             .fold(1.0, f64::max);
-        let mut extra = Descriptors { game: self.game, ..Default::default() };
+        let mut extra = Descriptors { game: self.game, keep_links: self.keep_links, ..Default::default() };
         extra.parse_into(name, start, fetch);
         let offset = self.descriptors.len();
         for mut d in extra.descriptors {
@@ -610,7 +616,7 @@ impl Descriptors {
             if lang_line(line) {
                 state.english = false;
             } else if !line.contains("table_only") && state.english {
-                if let Some(w) = parse_wording(line, self.game, false) {
+                if let Some(w) = parse_wording(line, self.game, false, self.keep_links) {
                     let current = state.current.expect("checked above");
                     self.descriptors[current].wordings.push(w);
                 }
@@ -1052,7 +1058,7 @@ pub fn export_file(text: &str, game: Game) -> Table {
         } else if lang_line(line) {
             english = false;
         } else if english && !line.contains("table_only") {
-            if let (Some(c), Some(w)) = (current, parse_wording(line, game, true)) {
+            if let (Some(c), Some(w)) = (current, parse_wording(line, game, true, false)) {
                 let mut desc = Table::new()
                     .with("text", lua_literal(&w.text))
                     .with("limit", Table::list(w.limits.iter().map(|(a, b)| Table::list([a.to_lua(), b.to_lua()]))));

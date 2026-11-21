@@ -128,6 +128,8 @@ EXPORT-TREE OPTIONS:
     3_X and 3_X_ruthless for PoE 1 (tree.lua, sprites.lua, sheet images), and
     beside them what PoB keeps outside those folders: legion/, the class
     backgrounds and jewel circles (PoE 1), and Assets/ with the jewel rings.
+    Each version folder also gets keywords.json: the stat lines with the
+    game's keyword links and the keyword popups they reach.
     -o, --out <DIR>        Output folder (default: ./pob-tree)
         --only <A,B,...>   Run only these modules (tree, ruthless, assets)
     -l, --list             List module names and exit
